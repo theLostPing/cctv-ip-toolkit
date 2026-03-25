@@ -7054,41 +7054,24 @@ https://buymeacoffee.com/thelostping""")
                         cam['mac'] = pinned_mac
                 self.arp_unpin(camera_ip)
 
-                # Check if target IP is on the same subnet as this PC
-                local_ip = getattr(self, '_detected_local_ip', None) or '0.0.0.0'
-                same_subnet = False
-                try:
-                    local_parts = [int(x) for x in local_ip.split('.')]
-                    target_parts = [int(x) for x in static_ip.split('.')]
-                    mask_parts = [int(x) for x in subnet.split('.')]
-                    same_subnet = all((a & m) == (b & m) for a, b, m in
-                                      zip(local_parts, target_parts, mask_parts))
-                except:
-                    same_subnet = False
-
+                # Wait for camera to come back at new IP
                 camera_reachable = False
-                if same_subnet:
-                    # Same subnet — wait for camera to come back at new IP
-                    self.log(f"Waiting for camera at new IP ({static_ip})...")
-                    wait_count = 0
-                    while not self.ping_camera(static_ip, timeout_ms=1000) and not self.cancel_flag and wait_count < 30:
-                        time.sleep(1)
-                        wait_count += 1
+                self.log(f"Waiting for camera at new IP ({static_ip})...")
+                wait_count = 0
+                while not self.ping_camera(static_ip, timeout_ms=1000) and not self.cancel_flag and wait_count < 30:
+                    time.sleep(1)
+                    wait_count += 1
 
-                    if self.cancel_flag:
-                        break
+                if self.cancel_flag:
+                    break
 
-                    if wait_count >= 30:
-                        self.log(f"✗ Camera not responding at {static_ip} after 30s")
-                        errors.append("unreachable")
-                    else:
-                        self.log(f"Camera online at {static_ip}")
-                        camera_reachable = True
-                        time.sleep(1)
+                if wait_count >= 30:
+                    self.log(f"✗ Camera not responding at {static_ip} after 30s")
+                    errors.append("unreachable")
                 else:
-                    # Different subnet — camera was programmed but we can't verify
-                    self.log(f"Target IP ({static_ip}) is on a different subnet than this PC ({local_ip})")
-                    self.log(f"Camera programmed — skipping ping verification")
+                    self.log(f"Camera online at {static_ip}")
+                    camera_reachable = True
+                    time.sleep(1)
 
                 # Get serial/MAC if camera is reachable
                 serial = 'UNKNOWN'
@@ -7149,8 +7132,7 @@ https://buymeacoffee.com/thelostping""")
                     idx = self.camera_data.get_all().index(cam)
                     self.camera_data.mark_processed(idx)
                     total_ok += 1
-                    verified = "verified" if camera_reachable else "unverified — different subnet"
-                    self.log(f"\n*** CAMERA {cam_name} COMPLETE ({verified}) ***")
+                    self.log(f"\n*** CAMERA {cam_name} COMPLETE ***")
                     self.log(f"    IP: {static_ip}, DHCP: DISABLED, Serial: {serial}, MAC: {cam_mac}")
                 
                 # Remove from remaining list
