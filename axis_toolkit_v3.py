@@ -91,7 +91,8 @@ DEFAULT_SETTINGS = {
         'username': 'root',
         'android_ip': '',
         'first_run': 'true',
-        'brand': 'axis'
+        'brand': 'axis',
+        'interface_index': ''
     },
     'warnings': {
         'show_incomplete_camera_warning': 'true',
@@ -6706,10 +6707,12 @@ https://buymeacoffee.com/thelostping""")
         add_additional_users = prog_opts.result.get('add_additional_users', False)
         selected_iface = prog_opts.result.get('interface')
 
-        # Override detected interface if user selected one
+        # Override detected interface if user selected one — persist in settings
         if selected_iface:
             self._detected_iface_index = selected_iface['index']
             self._detected_local_ip = selected_iface['ip']
+            self.settings.set('general', 'interface_index', str(selected_iface['index']))
+            self.log(f"Using interface: {selected_iface['label']}")
 
         # Start programming
         self.notebook.select(self.log_tab)  # Switch to log tab
@@ -6952,16 +6955,99 @@ https://buymeacoffee.com/thelostping""")
                     self.log(f"Model match: expected {expected_model}, got {actual_model} ✓")
                 
                 # Program via protocol — brand-agnostic steps
+                # Network change MUST be last — after that the camera may be unreachable
                 cam['_program_ip'] = camera_ip  # Tell protocol which IP to program from
                 steps = self.protocol.get_programming_steps(cam, password)
-                for i, (desc, step_fn) in enumerate(steps, 1):
-                    self.log(f"[{i}/{len(steps)}] {desc}")
+
+                # Split: auth steps first, network change last
+                # Convention: "Setting gateway" / "Setting network" / "Setting password" are
+                # identified by looking for network-change keywords
+                network_keywords = ('gateway', 'network', 'ip', 'dhcp')
+                auth_steps = []
+                network_steps = []
+                for desc, fn in steps:
+                    desc_lower = desc.lower()
+                    if any(kw in desc_lower for kw in network_keywords):
+                        network_steps.append((desc, fn))
+                    else:
+                        auth_steps.append((desc, fn))
+
+                # Phase 1: Auth steps (create user, set password)
+                total_steps = len(auth_steps) + len(network_steps)
+                extra_count = 0
+                if add_additional_users and self.additional_users_data.get_all():
+                    extra_count += len(self.additional_users_data.get_all())
+                if set_hostname:
+                    extra_count += 1
+                total_steps += extra_count
+                step_num = 0
+
+                for desc, step_fn in auth_steps:
+                    step_num += 1
+                    self.log(f"[{step_num}/{total_steps}] {desc}")
                     if step_fn():
                         self.log("      ✓ Done.")
                     else:
                         self.log(f"      ✗ {desc} failed")
                         errors.append(desc.lower().split()[0])
-                
+
+                # Phase 2: Additional users + hostname at CURRENT IP (before network change)
+                if add_additional_users:
+                    extra_users = self.additional_users_data.get_all()
+                    if extra_users:
+                        for eu in extra_users:
+                            step_num += 1
+                            eu_name = eu['username']
+                            eu_pwd = eu['password']
+                            eu_role = eu['role']
+                            self.log(f"[{step_num}/{total_steps}] Creating user '{eu_name}' ({eu_role})")
+                            result = self.protocol.add_user(camera_ip, password, eu_name, eu_pwd, eu_role)
+                            if result:
+                                self.log(f"      ✓ Done.")
+                            else:
+                                self.log(f"      ✗ Failed (may not be supported for {self.protocol.BRAND_NAME})")
+                                errors.append(f"user:{eu_name}")
+
+                # Try to get serial while still at factory IP
+                try:
+                    pre_serial = self.protocol.get_serial(camera_ip, password)
+                    if pre_serial and pre_serial != 'UNKNOWN':
+                        cam['serial'] = pre_serial
+                        if len(pre_serial) == 12:
+                            cam['mac'] = ':'.join(pre_serial[j:j+2] for j in range(0, 12, 2))
+                        self.log(f"Serial (pre-network): {pre_serial}")
+                except:
+                    pass
+
+                if set_hostname:
+                    step_num += 1
+                    brand_prefix = self.protocol.BRAND_KEY
+                    cam_number = cam.get('number', str(programmed_count))
+                    s = cam.get('serial', 'unknown')
+                    if s and s != 'UNKNOWN':
+                        hostname = f"{cam_number}-{brand_prefix}-{s.lower()}"
+                    else:
+                        hostname = f"{cam_number}-{brand_prefix}-unknown"
+                    self.log(f"[{step_num}/{total_steps}] Setting hostname: {hostname}")
+                    result = self.protocol.set_hostname(camera_ip, password, hostname)
+                    if result:
+                        self.log("      ✓ Done.")
+                        cam['hostname'] = hostname
+                        cam['name'] = hostname
+                    else:
+                        self.log("      ✗ Hostname failed")
+                        errors.append("hostname")
+
+                # Phase 3: Network change — LAST (camera may become unreachable)
+                for desc, step_fn in network_steps:
+                    step_num += 1
+                    self.log(f"[{step_num}/{total_steps}] {desc}")
+                    if step_fn():
+                        self.log("      ✓ Done.")
+                    else:
+                        self.log(f"      ✗ {desc} failed")
+                        errors.append(desc.lower().split()[0])
+
                 # Track this MAC as programmed and release ARP pin
                 if pinned_mac:
                     seen_macs.add(pinned_mac.upper().replace(':', '').replace('-', ''))
@@ -7033,66 +7119,11 @@ https://buymeacoffee.com/thelostping""")
                 if actual_model and not expected_model:
                     cam['model'] = actual_model
 
-                # --- Post-programming steps (only if camera is reachable) ---
+                # Post-network: try to get image if reachable
                 if camera_reachable:
-                    # Set hostname if enabled
-                    if set_hostname:
-                        brand_prefix = self.protocol.BRAND_KEY
-                        cam_number = cam.get('number', str(programmed_count))
-                        if serial and serial != 'UNKNOWN':
-                            hostname = f"{cam_number}-{brand_prefix}-{serial.lower()}"
-                        else:
-                            hostname = f"{cam_number}-{brand_prefix}-unknown"
-
-                        self.log(f"Setting hostname: {hostname}")
-                        result = self.protocol.set_hostname(static_ip, password, hostname)
-                        if result:
-                            self.log("      ✓ Hostname set.")
-                            cam['hostname'] = hostname
-                            cam['name'] = hostname
-                        else:
-                            self.log("      Hostname failed, retrying in 3s...")
-                            time.sleep(3)
-                            result = self.protocol.set_hostname(static_ip, password, hostname)
-                            if result:
-                                self.log("      ✓ Hostname set on retry.")
-                                cam['hostname'] = hostname
-                                cam['name'] = hostname
-                            else:
-                                self.log("      ✗ Hostname set failed")
-                                errors.append("hostname")
-                    else:
-                        self.log("Hostname: skipped (not enabled)")
-
-                    # Create additional users if enabled
-                    if add_additional_users:
-                        extra_users = self.additional_users_data.get_all()
-                        if extra_users:
-                            self.log(f"Creating {len(extra_users)} additional user(s)...")
-                            for eu in extra_users:
-                                eu_name = eu['username']
-                                eu_pwd = eu['password']
-                                eu_role = eu['role']
-                                result = self.protocol.add_user(static_ip, password, eu_name, eu_pwd, eu_role)
-                                if result:
-                                    self.log(f"      + User '{eu_name}' ({eu_role}) created")
-                                else:
-                                    self.log(f"      x User '{eu_name}' failed (may not be supported for {self.protocol.BRAND_NAME})")
-                                    errors.append(f"user:{eu_name}")
-                        else:
-                            self.log("Additional users: none defined")
-                    else:
-                        self.log("Additional users: skipped (not enabled)")
-
                     img = self.protocol.get_image(static_ip, username, password)
                     if img:
                         self.root.after(0, lambda d=img: self.update_preview(d))
-                else:
-                    # Camera on different subnet — skip post-programming ops
-                    if set_hostname:
-                        self.log("Hostname: skipped (camera on different subnet)")
-                    if add_additional_users and self.additional_users_data.get_all():
-                        self.log("Additional users: skipped (camera on different subnet)")
 
                 # Save updated camera data
                 self.camera_data.save()
@@ -7713,11 +7744,18 @@ https://buymeacoffee.com/thelostping""")
 
     def _get_interface_index(self):
         """Get the interface index for the active network adapter.
-        Returns an integer or None. Uses cached value from get_local_network_info()
-        or detects it fresh."""
+        Returns an integer or None. Checks: cached value, saved setting, then auto-detect."""
         idx = getattr(self, '_detected_iface_index', None)
         if idx is not None:
             return idx
+        # Check saved preference from settings
+        try:
+            saved = self.settings.get('general', 'interface_index')
+            if saved:
+                self._detected_iface_index = int(saved)
+                return self._detected_iface_index
+        except:
+            pass
         local_ip, _, _ = self.get_local_network_info()
         return getattr(self, '_detected_iface_index', None)
 
