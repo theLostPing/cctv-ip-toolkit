@@ -5092,14 +5092,12 @@ class CCTVToolkitApp:
         if not quiet and not discovered_cameras:
             self.log("    No cameras found in Phase 1")
 
-        # If we found link-local cameras, add route so we can reach them via HTTP
+        # If we found link-local cameras, try targeted mDNS to resolve IPs
+        # NOTE: do NOT add link-local route here — that modifies network adapters
+        # and should only happen during programming when the user explicitly chooses
         has_linklocal = any(c.get('ip', '').startswith('169.254.') for c in discovered_cameras.values())
         has_dhcp_only = any(not c.get('ip') for c in discovered_cameras.values())
         if has_linklocal or has_dhcp_only:
-            if not quiet:
-                self.log("  Link-local camera(s) detected — adding route...")
-            self.add_linklocal_route()
-
             # Phase 1c: Targeted mDNS on correct interface for DHCP-only cameras
             # This resolves IPs that regular mDNS missed (multi-adapter issue)
             if has_dhcp_only and getattr(self, '_linklocal_route_active', False):
