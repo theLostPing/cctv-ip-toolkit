@@ -1037,9 +1037,13 @@ class AxisProtocol(CameraProtocol):
         return True
 
     def set_network(self, ip, password, new_ip, subnet, gateway):
-        """Set gateway + static IP + disable DHCP via ONVIF SOAP."""
+        """Set gateway + static IP + disable DHCP.
+        Tries ONVIF SOAP first, falls back to VAPIX param.cgi."""
+        auth = HTTPDigestAuth("root", password)
         cidr = sum(bin(int(x)).count('1') for x in subnet.split('.')) if subnet else 24
 
+        # ---- Method 1: ONVIF SOAP ----
+        onvif_ok = False
         # Set gateway first
         gw_soap = (f'<?xml version="1.0"?>'
                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
@@ -1049,7 +1053,7 @@ class AxisProtocol(CameraProtocol):
         try:
             requests.post(f"http://{ip}/vapix/services", data=gw_soap,
                 headers={"Content-Type": "application/soap+xml"},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+                auth=auth, timeout=TIMEOUT)
         except:
             pass
 
@@ -1069,8 +1073,36 @@ class AxisProtocol(CameraProtocol):
         try:
             r = requests.post(f"http://{ip}/vapix/services", data=ip_soap,
                 headers={"Content-Type": "application/soap+xml"},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+                auth=auth, timeout=TIMEOUT)
+            if r.status_code == 200 and 'Fault' not in r.text:
+                onvif_ok = True
+        except:
+            pass
+
+        if onvif_ok:
+            return True
+
+        # ---- Method 2: VAPIX param.cgi fallback ----
+        try:
+            # Disable DHCP first
+            requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.IPv4.DHCP": "no"},
+                auth=auth, timeout=TIMEOUT)
+            # Set gateway
+            requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.DefaultRouter": gateway},
+                auth=auth, timeout=TIMEOUT)
+            # Set subnet
+            requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.SubnetMask": subnet},
+                auth=auth, timeout=TIMEOUT)
+            # Set IP last (changes connectivity)
+            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.IPAddress": new_ip},
+                auth=auth, timeout=TIMEOUT)
             return r.status_code == 200
+        except requests.exceptions.ConnectionError:
+            return True  # Camera likely rebooting on IP change
         except:
             return False
 
