@@ -3199,6 +3199,39 @@ class ContinueDialog(tk.Toplevel):
 # ============================================================================
 class ProgramOptionsDialog(tk.Toplevel):
     """Dialog to set factory IP and programming options before starting"""
+
+    @staticmethod
+    def _get_network_interfaces():
+        """Get list of network interfaces with IP addresses for the dropdown."""
+        import subprocess
+        interfaces = []
+        try:
+            cmd = ("Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+                   "Where-Object { $_.IPAddress -ne '127.0.0.1' -and "
+                   "-not $_.IPAddress.StartsWith('169.254.') } | "
+                   "Select-Object IPAddress,InterfaceIndex,InterfaceAlias | "
+                   "ConvertTo-Json -Compress")
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            if result.returncode == 0 and result.stdout.strip():
+                entries = json.loads(result.stdout)
+                if isinstance(entries, dict):
+                    entries = [entries]
+                for e in entries:
+                    ip = e.get('IPAddress', '')
+                    idx = e.get('InterfaceIndex', '')
+                    alias = e.get('InterfaceAlias', '')
+                    if ip:
+                        interfaces.append({
+                            'ip': ip, 'index': idx,
+                            'label': f"{alias} ({ip})",
+                        })
+        except:
+            pass
+        return interfaces
+
     def __init__(self, parent, factory_ip='192.168.0.90', additional_users_count=0):
         super().__init__(parent)
         self.title("Programming Options")
@@ -3210,47 +3243,79 @@ class ProgramOptionsDialog(tk.Toplevel):
         frame = ttk.Frame(self, padding="15")
         frame.pack(fill=tk.BOTH, expand=True)
 
+        # Network interface selector
+        self._interfaces = self._get_network_interfaces()
+        if self._interfaces:
+            ttk.Label(frame, text="Programming Interface:", font=('Helvetica', 10, 'bold')).grid(
+                row=0, column=0, columnspan=2, sticky='w', pady=(0, 5))
+            iface_labels = [i['label'] for i in self._interfaces]
+            iface_labels.insert(0, "Auto-detect (default)")
+            self.iface_var = tk.StringVar(value=iface_labels[0])
+            iface_combo = ttk.Combobox(frame, textvariable=self.iface_var,
+                                       values=iface_labels, state='readonly', width=40)
+            iface_combo.grid(row=1, column=0, columnspan=2, sticky='w', padx=(10, 0), pady=(0, 5))
+            ttk.Label(frame, text="Select which NIC is connected to the cameras",
+                     foreground='gray', font=('Helvetica', 8)).grid(
+                row=2, column=0, columnspan=2, sticky='w', padx=(10, 0))
+            sep_row = 3
+        else:
+            self.iface_var = tk.StringVar(value='')
+            sep_row = 0
+
+        # Separator before discovery
+        ttk.Separator(frame, orient='horizontal').grid(
+            row=sep_row, column=0, columnspan=2, sticky='ew', pady=8)
+
         # Discovery method section
+        base_row = sep_row + 1
         ttk.Label(frame, text="Camera Discovery Method:", font=('Helvetica', 10, 'bold')).grid(
-            row=0, column=0, columnspan=2, sticky='w', pady=(0, 5))
+            row=base_row, column=0, columnspan=2, sticky='w', pady=(0, 5))
 
         self.discovery_var = tk.StringVar(value='both')
+        r = base_row + 1  # running row counter
 
         # DHCP/mDNS only (for firmware 12.0+ link-local cameras)
         ttk.Radiobutton(frame, text="DHCP/mDNS only (firmware 12.0+ link-local)",
             variable=self.discovery_var, value='mdns',
-            command=self._update_ip_state).grid(row=1, column=0, columnspan=2, sticky='w', padx=(10, 0))
+            command=self._update_ip_state).grid(row=r, column=0, columnspan=2, sticky='w', padx=(10, 0))
+        r += 1
 
         # Factory IP only (legacy)
         ttk.Radiobutton(frame, text="Factory IP only",
             variable=self.discovery_var, value='factory',
-            command=self._update_ip_state).grid(row=2, column=0, columnspan=2, sticky='w', padx=(10, 0))
+            command=self._update_ip_state).grid(row=r, column=0, columnspan=2, sticky='w', padx=(10, 0))
+        r += 1
 
         # Both (recommended)
         ttk.Radiobutton(frame, text="Both DHCP/mDNS + Factory IP (recommended)",
             variable=self.discovery_var, value='both',
-            command=self._update_ip_state).grid(row=3, column=0, columnspan=2, sticky='w', padx=(10, 0))
+            command=self._update_ip_state).grid(row=r, column=0, columnspan=2, sticky='w', padx=(10, 0))
+        r += 1
 
         # Factory IP entry
         self.ip_label = ttk.Label(frame, text="Factory Default IP:", font=('Helvetica', 10))
-        self.ip_label.grid(row=4, column=0, sticky='w', pady=(10, 5))
+        self.ip_label.grid(row=r, column=0, sticky='w', pady=(10, 5))
         self.ip_entry = ttk.Entry(frame, width=20)
         self.ip_entry.insert(0, factory_ip)
-        self.ip_entry.grid(row=4, column=1, sticky='w', pady=(10, 5), padx=(10, 0))
+        self.ip_entry.grid(row=r, column=1, sticky='w', pady=(10, 5), padx=(10, 0))
+        r += 1
 
         # Separator
         ttk.Separator(frame, orient='horizontal').grid(
-            row=5, column=0, columnspan=2, sticky='ew', pady=10)
+            row=r, column=0, columnspan=2, sticky='ew', pady=10)
+        r += 1
 
         # Hostname checkbox
         self.hostname_var = tk.BooleanVar(value=False)
         self.hostname_check = ttk.Checkbutton(frame,
             text="Change network hostname",
             variable=self.hostname_var)
-        self.hostname_check.grid(row=6, column=0, columnspan=2, sticky='w', pady=2)
+        self.hostname_check.grid(row=r, column=0, columnspan=2, sticky='w', pady=2)
+        r += 1
         ttk.Label(frame, text="Sets hostname to <number>-<brand>-<serial> (lowercase)",
                  foreground='gray', font=('Helvetica', 8)).grid(
-            row=7, column=0, columnspan=2, sticky='w', padx=(22, 0))
+            row=r, column=0, columnspan=2, sticky='w', padx=(22, 0))
+        r += 1
 
         # Additional users checkbox
         self.additional_users_var = tk.BooleanVar(value=False)
@@ -3260,16 +3325,18 @@ class ProgramOptionsDialog(tk.Toplevel):
         self.additional_users_check = ttk.Checkbutton(frame,
             text=user_label,
             variable=self.additional_users_var)
-        self.additional_users_check.grid(row=8, column=0, columnspan=2, sticky='w', pady=2)
+        self.additional_users_check.grid(row=r, column=0, columnspan=2, sticky='w', pady=2)
         if additional_users_count == 0:
             self.additional_users_check.configure(state='disabled')
+        r += 1
         ttk.Label(frame, text="Add users in the Passwords tab before programming",
                  foreground='gray', font=('Helvetica', 8)).grid(
-            row=9, column=0, columnspan=2, sticky='w', padx=(22, 0))
+            row=r, column=0, columnspan=2, sticky='w', padx=(22, 0))
+        r += 1
 
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=10, column=0, columnspan=2, pady=(15, 0))
+        btn_frame.grid(row=r, column=0, columnspan=2, pady=(15, 0))
         ttk.Button(btn_frame, text="Start Programming", command=self.ok).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=self.cancel).pack(side=tk.LEFT, padx=5)
         
@@ -3297,11 +3364,21 @@ class ProgramOptionsDialog(tk.Toplevel):
             messagebox.showwarning("Required", "Factory IP is required for this mode", parent=self)
             return
         
+        # Resolve selected interface
+        selected_iface = None
+        iface_selection = self.iface_var.get()
+        if iface_selection and iface_selection != 'Auto-detect (default)':
+            for iface in self._interfaces:
+                if iface['label'] == iface_selection:
+                    selected_iface = iface
+                    break
+
         self.result = {
             'factory_ip': ip if discovery != 'mdns' else None,
             'discovery_mode': discovery,  # 'mdns', 'factory', or 'both'
             'set_hostname': self.hostname_var.get(),
-            'add_additional_users': self.additional_users_var.get()
+            'add_additional_users': self.additional_users_var.get(),
+            'interface': selected_iface,  # {'ip': ..., 'index': ..., 'label': ...} or None
         }
         self.destroy()
     
@@ -6627,12 +6704,18 @@ https://buymeacoffee.com/thelostping""")
         discovery_mode = prog_opts.result.get('discovery_mode', 'both')
         set_hostname = prog_opts.result['set_hostname']
         add_additional_users = prog_opts.result.get('add_additional_users', False)
-        
+        selected_iface = prog_opts.result.get('interface')
+
+        # Override detected interface if user selected one
+        if selected_iface:
+            self._detected_iface_index = selected_iface['index']
+            self._detected_local_ip = selected_iface['ip']
+
         # Start programming
         self.notebook.select(self.log_tab)  # Switch to log tab
         self.cancel_flag = False
         self.enable_cancel(True)
-        
+
         def run():
             username = self.protocol.DEFAULT_USER
             total_ok = total_fail = 0
@@ -6882,124 +6965,153 @@ https://buymeacoffee.com/thelostping""")
                 # Track this MAC as programmed and release ARP pin
                 if pinned_mac:
                     seen_macs.add(pinned_mac.upper().replace(':', '').replace('-', ''))
+                    # Always save MAC from ARP immediately
+                    if not cam.get('mac'):
+                        cam['mac'] = pinned_mac
                 self.arp_unpin(camera_ip)
-                
-                # Wait for camera to come back at new IP
-                self.log(f"Waiting for camera at new IP ({static_ip})...")
-                wait_count = 0
-                while not self.ping_camera(static_ip, timeout_ms=1000) and not self.cancel_flag and wait_count < 30:
-                    time.sleep(1)
-                    wait_count += 1
-                
-                if self.cancel_flag:
-                    break
-                
-                if wait_count >= 30:
-                    self.log(f"✗ Camera not responding at {static_ip} after 30s")
-                    errors.append("unreachable")
-                    self._mark_cam_failed(cam, "unreachable at new IP")
-                    total_fail += 1
-                    self.log(f"\n*** CAMERA {cam_name} FAILED ***")
-                    remaining.pop(cam_idx)
-                    
-                    if remaining:
-                        result = [None]
-                        def show_fail():
-                            result[0] = ContinueDialog(self.root, f"Camera {cam_name} FAILED (unreachable)",
-                                                       remaining[0]['name'], remaining[0].get('model', ''), None).result
-                        self.root.after(0, show_fail)
-                        while result[0] is None and not self.cancel_flag:
-                            time.sleep(0.1)
-                        if not result[0]:
-                            self.cancel_flag = True
-                            break
-                    continue
+
+                # Check if target IP is on the same subnet as this PC
+                local_ip = getattr(self, '_detected_local_ip', None) or '0.0.0.0'
+                same_subnet = False
+                try:
+                    local_parts = [int(x) for x in local_ip.split('.')]
+                    target_parts = [int(x) for x in static_ip.split('.')]
+                    mask_parts = [int(x) for x in subnet.split('.')]
+                    same_subnet = all((a & m) == (b & m) for a, b, m in
+                                      zip(local_parts, target_parts, mask_parts))
+                except:
+                    same_subnet = False
+
+                camera_reachable = False
+                if same_subnet:
+                    # Same subnet — wait for camera to come back at new IP
+                    self.log(f"Waiting for camera at new IP ({static_ip})...")
+                    wait_count = 0
+                    while not self.ping_camera(static_ip, timeout_ms=1000) and not self.cancel_flag and wait_count < 30:
+                        time.sleep(1)
+                        wait_count += 1
+
+                    if self.cancel_flag:
+                        break
+
+                    if wait_count >= 30:
+                        self.log(f"✗ Camera not responding at {static_ip} after 30s")
+                        errors.append("unreachable")
+                    else:
+                        self.log(f"Camera online at {static_ip}")
+                        camera_reachable = True
+                        time.sleep(1)
                 else:
-                    self.log(f"Camera online at {static_ip}")
-                    time.sleep(1)
-                
-                serial = self.protocol.get_serial(static_ip, password)
-                self.log(f"Serial: {serial}")
-                
-                if serial:
-                    cam['serial'] = serial
-                    if len(serial) == 12:
-                        cam['mac'] = ':'.join(serial[j:j+2] for j in range(0, 12, 2))
-                        self.log(f"MAC: {cam['mac']}")
-                elif pinned_mac:
-                    cam['mac'] = pinned_mac
-                    self.log(f"MAC (from ARP): {pinned_mac}")
+                    # Different subnet — camera was programmed but we can't verify
+                    self.log(f"Target IP ({static_ip}) is on a different subnet than this PC ({local_ip})")
+                    self.log(f"Camera programmed — skipping ping verification")
+
+                # Get serial/MAC if camera is reachable
+                serial = 'UNKNOWN'
+                if camera_reachable:
+                    serial = self.protocol.get_serial(static_ip, password)
+                    self.log(f"Serial: {serial}")
+
+                    if serial and serial != 'UNKNOWN':
+                        cam['serial'] = serial
+                        if len(serial) == 12:
+                            cam['mac'] = ':'.join(serial[j:j+2] for j in range(0, 12, 2))
+                            self.log(f"MAC: {cam['mac']}")
+                    elif pinned_mac:
+                        cam['mac'] = pinned_mac
+                        self.log(f"MAC (from ARP): {pinned_mac}")
+                else:
+                    # Not reachable (different subnet or timed out) — use ARP MAC
+                    if pinned_mac:
+                        cam['mac'] = pinned_mac
+                        mac_clean = pinned_mac.upper().replace(':', '').replace('-', '')
+                        cam['serial'] = mac_clean
+                        self.log(f"MAC (from ARP): {pinned_mac}")
+                        serial = mac_clean
                 
                 # Update model from actual if entry had none
                 if actual_model and not expected_model:
                     cam['model'] = actual_model
-                
-                # Set hostname if enabled
-                if set_hostname:
-                    brand_prefix = self.protocol.BRAND_KEY
-                    cam_number = cam.get('number', str(programmed_count))
-                    if serial and serial != 'UNKNOWN':
-                        hostname = f"{cam_number}-{brand_prefix}-{serial.lower()}"
-                    else:
-                        hostname = f"{cam_number}-{brand_prefix}-unknown"
 
-                    self.log(f"Setting hostname: {hostname}")
-                    result = self.protocol.set_hostname(static_ip, password, hostname)
-                    if result:
-                        self.log("      ✓ Hostname set.")
-                        cam['hostname'] = hostname
-                        cam['name'] = hostname
-                    else:
-                        self.log("      Hostname failed, retrying in 3s...")
-                        time.sleep(3)
+                # --- Post-programming steps (only if camera is reachable) ---
+                if camera_reachable:
+                    # Set hostname if enabled
+                    if set_hostname:
+                        brand_prefix = self.protocol.BRAND_KEY
+                        cam_number = cam.get('number', str(programmed_count))
+                        if serial and serial != 'UNKNOWN':
+                            hostname = f"{cam_number}-{brand_prefix}-{serial.lower()}"
+                        else:
+                            hostname = f"{cam_number}-{brand_prefix}-unknown"
+
+                        self.log(f"Setting hostname: {hostname}")
                         result = self.protocol.set_hostname(static_ip, password, hostname)
                         if result:
-                            self.log("      ✓ Hostname set on retry.")
+                            self.log("      ✓ Hostname set.")
                             cam['hostname'] = hostname
                             cam['name'] = hostname
                         else:
-                            self.log("      ✗ Hostname set failed")
-                            errors.append("hostname")
-                else:
-                    self.log("Hostname: skipped (not enabled)")
-
-                # Create additional users if enabled
-                if add_additional_users:
-                    extra_users = self.additional_users_data.get_all()
-                    if extra_users:
-                        self.log(f"Creating {len(extra_users)} additional user(s)...")
-                        for eu in extra_users:
-                            eu_name = eu['username']
-                            eu_pwd = eu['password']
-                            eu_role = eu['role']
-                            result = self.protocol.add_user(static_ip, password, eu_name, eu_pwd, eu_role)
+                            self.log("      Hostname failed, retrying in 3s...")
+                            time.sleep(3)
+                            result = self.protocol.set_hostname(static_ip, password, hostname)
                             if result:
-                                self.log(f"      + User '{eu_name}' ({eu_role}) created")
+                                self.log("      ✓ Hostname set on retry.")
+                                cam['hostname'] = hostname
+                                cam['name'] = hostname
                             else:
-                                self.log(f"      x User '{eu_name}' failed (may not be supported for {self.protocol.BRAND_NAME})")
-                                errors.append(f"user:{eu_name}")
+                                self.log("      ✗ Hostname set failed")
+                                errors.append("hostname")
                     else:
-                        self.log("Additional users: none defined")
+                        self.log("Hostname: skipped (not enabled)")
+
+                    # Create additional users if enabled
+                    if add_additional_users:
+                        extra_users = self.additional_users_data.get_all()
+                        if extra_users:
+                            self.log(f"Creating {len(extra_users)} additional user(s)...")
+                            for eu in extra_users:
+                                eu_name = eu['username']
+                                eu_pwd = eu['password']
+                                eu_role = eu['role']
+                                result = self.protocol.add_user(static_ip, password, eu_name, eu_pwd, eu_role)
+                                if result:
+                                    self.log(f"      + User '{eu_name}' ({eu_role}) created")
+                                else:
+                                    self.log(f"      x User '{eu_name}' failed (may not be supported for {self.protocol.BRAND_NAME})")
+                                    errors.append(f"user:{eu_name}")
+                        else:
+                            self.log("Additional users: none defined")
+                    else:
+                        self.log("Additional users: skipped (not enabled)")
+
+                    img = self.protocol.get_image(static_ip, username, password)
+                    if img:
+                        self.root.after(0, lambda d=img: self.update_preview(d))
                 else:
-                    self.log("Additional users: skipped (not enabled)")
+                    # Camera on different subnet — skip post-programming ops
+                    if set_hostname:
+                        self.log("Hostname: skipped (camera on different subnet)")
+                    if add_additional_users and self.additional_users_data.get_all():
+                        self.log("Additional users: skipped (camera on different subnet)")
 
                 # Save updated camera data
                 self.camera_data.save()
                 self.root.after(0, self.refresh_camera_list)
-                
-                img = self.protocol.get_image(static_ip, username, password)
-                if img:
-                    self.root.after(0, lambda d=img: self.update_preview(d))
-                
-                # Save to output
+
+                # Save to output CSV (always — success or partial fail)
                 cam_mac = cam.get('mac', pinned_mac or '')
                 with open(OUTPUT_CSV, 'a', newline='') as f:
-                    csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac, 
+                    csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac,
                                            actual_model or expected_model, datetime.now().isoformat()])
-                
+
                 # Mark based on results
                 cam_mac = cam.get('mac', pinned_mac or 'unknown')
-                if errors:
+                if 'unreachable' in errors:
+                    self._mark_cam_failed(cam, ', '.join(errors))
+                    total_fail += 1
+                    self.log(f"\n*** CAMERA {cam_name} FAILED: {', '.join(errors)} ***")
+                    self.log(f"    IP: {static_ip}, Serial: {serial}, MAC: {cam_mac}")
+                elif errors:
                     self._mark_cam_failed(cam, ', '.join(errors))
                     total_fail += 1
                     self.log(f"\n*** CAMERA {cam_name} PARTIAL FAIL: {', '.join(errors)} ***")
@@ -7008,7 +7120,8 @@ https://buymeacoffee.com/thelostping""")
                     idx = self.camera_data.get_all().index(cam)
                     self.camera_data.mark_processed(idx)
                     total_ok += 1
-                    self.log(f"\n*** CAMERA {cam_name} COMPLETE ***")
+                    verified = "verified" if camera_reachable else "unverified — different subnet"
+                    self.log(f"\n*** CAMERA {cam_name} COMPLETE ({verified}) ***")
                     self.log(f"    IP: {static_ip}, DHCP: DISABLED, Serial: {serial}, MAC: {cam_mac}")
                 
                 # Remove from remaining list
