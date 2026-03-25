@@ -55,6 +55,7 @@ TRIPLETT_DIR = os.path.join(DATA_FOLDER, "triplett")
 OUTPUT_CSV = os.path.join(DATA_FOLDER, "programmed_cameras.csv")
 PING_RESULTS = os.path.join(DATA_FOLDER, "ping_results.csv")
 SUCCESSFUL_PASSWORDS = os.path.join(DATA_FOLDER, "found_passwords.csv")
+ADDITIONAL_USERS_FILE = os.path.join(DATA_FOLDER, "additional_users.json")
 TIMEOUT = 5
 
 # Bosch camera constants
@@ -427,6 +428,52 @@ class PasswordDataManager:
     
     def get_all(self):
         return self.passwords
+
+
+class AdditionalUsersDataManager:
+    """Manages additional camera users - stored as JSON list of {username, password, role}"""
+    ROLES = ['Administrator', 'Operator', 'Viewer']
+
+    def __init__(self):
+        self.users = []
+        self.load()
+
+    def load(self):
+        if os.path.exists(ADDITIONAL_USERS_FILE):
+            try:
+                with open(ADDITIONAL_USERS_FILE, 'r') as f:
+                    self.users = json.load(f)
+            except:
+                self.users = []
+        return self.users
+
+    def save(self):
+        os.makedirs(DATA_FOLDER, exist_ok=True)
+        with open(ADDITIONAL_USERS_FILE, 'w') as f:
+            json.dump(self.users, f, indent=2)
+
+    def add(self, username, password, role='Operator'):
+        if not username:
+            return False
+        # Don't add duplicate usernames
+        for u in self.users:
+            if u['username'].lower() == username.lower():
+                return False
+        self.users.append({'username': username, 'password': password, 'role': role})
+        self.save()
+        return True
+
+    def delete(self, index):
+        if 0 <= index < len(self.users):
+            del self.users[index]
+            self.save()
+
+    def clear(self):
+        self.users = []
+        self.save()
+
+    def get_all(self):
+        return self.users
 
 
 # ============================================================================
@@ -932,6 +979,11 @@ class CameraProtocol(ABC):
     def factory_reset(self, ip, password):
         """Factory reset camera. Returns True/False."""
 
+    def add_user(self, ip, admin_password, username, user_password, role='Operator'):
+        """Add an additional user account to the camera. Returns True/False.
+        Default implementation returns False (not supported)."""
+        return False
+
     @abstractmethod
     def get_programming_steps(self, cam, password, options=None):
         """Return ordered list of (description, callable) steps for programming a factory-default camera.
@@ -1134,6 +1186,45 @@ class AxisProtocol(CameraProtocol):
                 auth=HTTPDigestAuth(username, old_pwd), timeout=TIMEOUT).status_code == 200
         except:
             return False
+
+    def add_user(self, ip, admin_password, username, user_password, role='Operator'):
+        """Add a user to Axis camera via pwdgrp.cgi + ONVIF CreateUsers."""
+        # Map role to Axis groups
+        role_groups = {
+            'Administrator': 'admin:operator:viewer:ptz',
+            'Operator': 'operator:viewer:ptz',
+            'Viewer': 'viewer',
+        }
+        sgrp = role_groups.get(role, 'operator:viewer:ptz')
+
+        # Step 1: Create system user via pwdgrp.cgi
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
+                params={"action": "add", "user": username, "pwd": user_password,
+                        "grp": "users", "sgrp": sgrp},
+                auth=HTTPDigestAuth("root", admin_password), timeout=TIMEOUT)
+            if r.status_code != 200:
+                return False
+        except:
+            return False
+
+        # Step 2: Create matching ONVIF user (non-critical)
+        onvif_level = role if role in ('Administrator', 'Operator') else 'User'
+        try:
+            soap = (f'<?xml version="1.0"?>'
+                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                    f'<CreateUsers xmlns="http://www.onvif.org/ver10/device/wsdl" '
+                    f'xmlns:tt="http://www.onvif.org/ver10/schema">'
+                    f'<User><tt:Username>{username}</tt:Username>'
+                    f'<tt:Password>{user_password}</tt:Password>'
+                    f'<tt:UserLevel>{onvif_level}</tt:UserLevel>'
+                    f'</User></CreateUsers></Body></Envelope>')
+            requests.post(f"http://{ip}/vapix/services", data=soap,
+                headers={"Content-Type": "application/soap+xml"},
+                auth=HTTPDigestAuth("root", admin_password), timeout=TIMEOUT)
+        except:
+            pass  # ONVIF user creation is non-critical
+        return True
 
     def factory_reset(self, ip, password):
         # Method 1: firmwaremanagement API
@@ -1570,6 +1661,24 @@ class HanwhaProtocol(CameraProtocol):
                 '/stw-cgi/user.cgi?msubmenu=admin&action=set',
                 data={'OldPassword': old_pwd, 'NewPassword': new_pwd, 'ID': 'admin'},
                 auth=('admin', old_pwd))
+            return r.status_code == 200
+        except:
+            return False
+
+    def add_user(self, ip, admin_password, username, user_password, role='Operator'):
+        """Add a user to Hanwha camera via STW-CGI."""
+        # Map role to Hanwha user groups
+        role_map = {
+            'Administrator': 'admin',
+            'Operator': 'manager',
+            'Viewer': 'user',
+        }
+        group = role_map.get(role, 'manager')
+        try:
+            r = self._stw_post(ip,
+                '/stw-cgi/user.cgi?msubmenu=adduser&action=set',
+                data={'UserID': username, 'Password': user_password, 'UserGroup': group},
+                auth=('admin', admin_password))
             return r.status_code == 200
         except:
             return False
@@ -3058,23 +3167,23 @@ class ContinueDialog(tk.Toplevel):
 # ============================================================================
 class ProgramOptionsDialog(tk.Toplevel):
     """Dialog to set factory IP and programming options before starting"""
-    def __init__(self, parent, factory_ip='192.168.0.90'):
+    def __init__(self, parent, factory_ip='192.168.0.90', additional_users_count=0):
         super().__init__(parent)
         self.title("Programming Options")
         self.result = None
         self.transient(parent)
         self.grab_set()
         self.resizable(False, False)
-        
+
         frame = ttk.Frame(self, padding="15")
         frame.pack(fill=tk.BOTH, expand=True)
-        
+
         # Discovery method section
         ttk.Label(frame, text="Camera Discovery Method:", font=('Helvetica', 10, 'bold')).grid(
             row=0, column=0, columnspan=2, sticky='w', pady=(0, 5))
-        
+
         self.discovery_var = tk.StringVar(value='both')
-        
+
         # DHCP/mDNS only (for firmware 12.0+ link-local cameras)
         ttk.Radiobutton(frame, text="DHCP/mDNS only (firmware 12.0+ link-local)",
             variable=self.discovery_var, value='mdns',
@@ -3089,31 +3198,46 @@ class ProgramOptionsDialog(tk.Toplevel):
         ttk.Radiobutton(frame, text="Both DHCP/mDNS + Factory IP (recommended)",
             variable=self.discovery_var, value='both',
             command=self._update_ip_state).grid(row=3, column=0, columnspan=2, sticky='w', padx=(10, 0))
-        
+
         # Factory IP entry
         self.ip_label = ttk.Label(frame, text="Factory Default IP:", font=('Helvetica', 10))
         self.ip_label.grid(row=4, column=0, sticky='w', pady=(10, 5))
         self.ip_entry = ttk.Entry(frame, width=20)
         self.ip_entry.insert(0, factory_ip)
         self.ip_entry.grid(row=4, column=1, sticky='w', pady=(10, 5), padx=(10, 0))
-        
+
         # Separator
         ttk.Separator(frame, orient='horizontal').grid(
             row=5, column=0, columnspan=2, sticky='ew', pady=10)
-        
+
         # Hostname checkbox
         self.hostname_var = tk.BooleanVar(value=False)
-        self.hostname_check = ttk.Checkbutton(frame, 
-            text="Change network hostname", 
+        self.hostname_check = ttk.Checkbutton(frame,
+            text="Change network hostname",
             variable=self.hostname_var)
         self.hostname_check.grid(row=6, column=0, columnspan=2, sticky='w', pady=2)
         ttk.Label(frame, text="Sets hostname to <number>-<brand>-<serial> (lowercase)",
                  foreground='gray', font=('Helvetica', 8)).grid(
             row=7, column=0, columnspan=2, sticky='w', padx=(22, 0))
-        
+
+        # Additional users checkbox
+        self.additional_users_var = tk.BooleanVar(value=False)
+        user_label = f"Create additional users ({additional_users_count} defined)"
+        if additional_users_count == 0:
+            user_label = "Create additional users (none defined)"
+        self.additional_users_check = ttk.Checkbutton(frame,
+            text=user_label,
+            variable=self.additional_users_var)
+        self.additional_users_check.grid(row=8, column=0, columnspan=2, sticky='w', pady=2)
+        if additional_users_count == 0:
+            self.additional_users_check.configure(state='disabled')
+        ttk.Label(frame, text="Add users in the Passwords tab before programming",
+                 foreground='gray', font=('Helvetica', 8)).grid(
+            row=9, column=0, columnspan=2, sticky='w', padx=(22, 0))
+
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=8, column=0, columnspan=2, pady=(15, 0))
+        btn_frame.grid(row=10, column=0, columnspan=2, pady=(15, 0))
         ttk.Button(btn_frame, text="Start Programming", command=self.ok).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=self.cancel).pack(side=tk.LEFT, padx=5)
         
@@ -3144,7 +3268,8 @@ class ProgramOptionsDialog(tk.Toplevel):
         self.result = {
             'factory_ip': ip if discovery != 'mdns' else None,
             'discovery_mode': discovery,  # 'mdns', 'factory', or 'both'
-            'set_hostname': self.hostname_var.get()
+            'set_hostname': self.hostname_var.get(),
+            'add_additional_users': self.additional_users_var.get()
         }
         self.destroy()
     
@@ -3441,6 +3566,7 @@ class CCTVToolkitApp:
         self.settings = SettingsManager()
         self.camera_data = CameraDataManager()
         self.password_data = PasswordDataManager()
+        self.additional_users_data = AdditionalUsersDataManager()
 
         # Initialize protocol from saved brand
         saved_brand = self.settings.get('general', 'brand')
@@ -3991,17 +4117,22 @@ class CCTVToolkitApp:
             pass
 
     def create_passwords_tab(self):
-        """Password list editor tab"""
-        frame = ttk.Frame(self.passwords_tab, padding="10")
-        frame.pack(fill=tk.BOTH, expand=True)
-        
+        """Password list editor tab + additional users section"""
+        # Top/bottom split: passwords on top, additional users on bottom
+        outer_split = ttk.PanedWindow(self.passwords_tab, orient=tk.VERTICAL)
+        outer_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # ---- TOP: Password List ----
+        frame = ttk.Frame(outer_split)
+        outer_split.add(frame, weight=3)
+
         # Header
         header = ttk.Frame(frame)
         header.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(header, text="Password List", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT)
-        ttk.Label(header, text="  •  Used for batch password testing to find unknown camera passwords", 
+        ttk.Label(header, text="  •  Used for batch password testing to find unknown camera passwords",
                  font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
-        
+
         # Split view: list on left, add on right
         split = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
         split.pack(fill=tk.BOTH, expand=True)
@@ -4070,7 +4201,57 @@ class CCTVToolkitApp:
         ttk.Label(left_frame, textvariable=self.password_status, font=('Helvetica', 10)).pack(anchor=tk.W, pady=(5, 0))
         
         self.refresh_password_list()
-    
+
+        # ---- BOTTOM: Additional Users ----
+        users_frame = ttk.LabelFrame(outer_split, text="Additional Users  •  Created on each camera during programming",
+                                     padding="10")
+        outer_split.add(users_frame, weight=2)
+
+        # Users treeview
+        users_top = ttk.Frame(users_frame)
+        users_top.pack(fill=tk.BOTH, expand=True)
+
+        cols = ('username', 'password', 'role')
+        self.users_tree = ttk.Treeview(users_top, columns=cols, show='headings', height=5)
+        self.users_tree.heading('username', text='Username')
+        self.users_tree.heading('password', text='Password')
+        self.users_tree.heading('role', text='Role')
+        self.users_tree.column('username', width=150)
+        self.users_tree.column('password', width=150)
+        self.users_tree.column('role', width=120)
+        users_scroll = ttk.Scrollbar(users_top, orient=tk.VERTICAL, command=self.users_tree.yview)
+        self.users_tree.configure(yscrollcommand=users_scroll.set)
+        self.users_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        users_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Add/remove controls
+        users_controls = ttk.Frame(users_frame)
+        users_controls.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(users_controls, text="Username:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_name_var = tk.StringVar()
+        ttk.Entry(users_controls, textvariable=self.new_user_name_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(users_controls, text="Password:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_pwd_var = tk.StringVar()
+        ttk.Entry(users_controls, textvariable=self.new_user_pwd_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(users_controls, text="Role:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_role_var = tk.StringVar(value='Operator')
+        role_combo = ttk.Combobox(users_controls, textvariable=self.new_user_role_var,
+                                  values=AdditionalUsersDataManager.ROLES, state='readonly', width=12)
+        role_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(users_controls, text="Add User", command=self.add_additional_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(users_controls, text="Delete Selected", command=self.delete_additional_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(users_controls, text="Clear All", command=self.clear_additional_users).pack(side=tk.LEFT, padx=3)
+
+        self.additional_users_status = tk.StringVar(value="0 additional users")
+        ttk.Label(users_controls, textvariable=self.additional_users_status,
+                 font=('Helvetica', 9), foreground='gray').pack(side=tk.RIGHT)
+
+        self.refresh_additional_users_list()
+
     def create_operations_tab(self):
         """Operations tab with big buttons and wizards"""
         frame = ttk.Frame(self.operations_tab, padding="20")
@@ -5959,7 +6140,48 @@ class CCTVToolkitApp:
         if messagebox.askyesno("Confirm", "Delete ALL passwords from the list?"):
             self.password_data.clear()
             self.refresh_password_list()
-    
+
+    # ========================================================================
+    # ADDITIONAL USERS MANAGEMENT
+    # ========================================================================
+    def refresh_additional_users_list(self):
+        for item in self.users_tree.get_children():
+            self.users_tree.delete(item)
+        users = self.additional_users_data.get_all()
+        for u in users:
+            self.users_tree.insert('', tk.END, values=(u['username'], u['password'], u['role']))
+        self.additional_users_status.set(f"{len(users)} additional user{'s' if len(users) != 1 else ''}")
+
+    def add_additional_user(self):
+        name = self.new_user_name_var.get().strip()
+        pwd = self.new_user_pwd_var.get().strip()
+        role = self.new_user_role_var.get()
+        if not name:
+            messagebox.showwarning("Required", "Username is required.")
+            return
+        if not pwd:
+            messagebox.showwarning("Required", "Password is required.")
+            return
+        if self.additional_users_data.add(name, pwd, role):
+            self.new_user_name_var.set("")
+            self.new_user_pwd_var.set("")
+            self.refresh_additional_users_list()
+            self.log(f"Added additional user: {name} ({role})")
+        else:
+            messagebox.showwarning("Duplicate", f"User '{name}' already exists.")
+
+    def delete_additional_user(self):
+        selected = self.users_tree.selection()
+        if selected:
+            idx = self.users_tree.index(selected[0])
+            self.additional_users_data.delete(idx)
+            self.refresh_additional_users_list()
+
+    def clear_additional_users(self):
+        if messagebox.askyesno("Confirm", "Delete ALL additional users?"):
+            self.additional_users_data.clear()
+            self.refresh_additional_users_list()
+
     # ========================================================================
     # LOGGING
     # ========================================================================
@@ -6343,7 +6565,8 @@ https://buymeacoffee.com/thelostping""")
                 "3. Verify model matches (if specified)\n"
                 "4. Create system user with your password\n"
                 "5. Set static IP and disable DHCP\n"
-                "6. Capture serial/MAC after programming\n\n"
+                "6. Capture serial/MAC after programming\n"
+                "7. Optionally create additional users\n\n"
                 "Supports factory default IPs and link-local cameras.\n"
                 "Multiple cameras can be connected simultaneously\n"
                 "- each programmed one at a time.",
@@ -6364,12 +6587,14 @@ https://buymeacoffee.com/thelostping""")
         
         # Get factory IP and hostname option
         prog_opts = ProgramOptionsDialog(self.root,
-            factory_ip=self.protocol.FACTORY_IP)
+            factory_ip=self.protocol.FACTORY_IP,
+            additional_users_count=len(self.additional_users_data.get_all()))
         if not prog_opts.result:
             return
         factory_ip = prog_opts.result['factory_ip']
         discovery_mode = prog_opts.result.get('discovery_mode', 'both')
         set_hostname = prog_opts.result['set_hostname']
+        add_additional_users = prog_opts.result.get('add_additional_users', False)
         
         # Start programming
         self.notebook.select(self.log_tab)  # Switch to log tab
@@ -6705,7 +6930,27 @@ https://buymeacoffee.com/thelostping""")
                             errors.append("hostname")
                 else:
                     self.log("Hostname: skipped (not enabled)")
-                
+
+                # Create additional users if enabled
+                if add_additional_users:
+                    extra_users = self.additional_users_data.get_all()
+                    if extra_users:
+                        self.log(f"Creating {len(extra_users)} additional user(s)...")
+                        for eu in extra_users:
+                            eu_name = eu['username']
+                            eu_pwd = eu['password']
+                            eu_role = eu['role']
+                            result = self.protocol.add_user(static_ip, password, eu_name, eu_pwd, eu_role)
+                            if result:
+                                self.log(f"      + User '{eu_name}' ({eu_role}) created")
+                            else:
+                                self.log(f"      x User '{eu_name}' failed (may not be supported for {self.protocol.BRAND_NAME})")
+                                errors.append(f"user:{eu_name}")
+                    else:
+                        self.log("Additional users: none defined")
+                else:
+                    self.log("Additional users: skipped (not enabled)")
+
                 # Save updated camera data
                 self.camera_data.save()
                 self.root.after(0, self.refresh_camera_list)
