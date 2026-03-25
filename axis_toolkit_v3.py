@@ -3164,46 +3164,47 @@ class ContinueDialog(tk.Toplevel):
         self.result = False
         self.transient(parent)
         self.grab_set()
-        _center_on_parent(self, parent, 800, 550)
         self.preview_image = None
-        
-        frame = ttk.Frame(self, padding="20")
+
+        frame = ttk.Frame(self, padding="15")
         frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Top section with message and image
+
+        # Top section with message and image side by side
         top_frame = ttk.Frame(frame)
-        top_frame.pack(fill=tk.X, pady=(0, 15))
-        
+        top_frame.pack(fill=tk.X, pady=(0, 10))
+
         info_frame = ttk.Frame(top_frame)
         info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(info_frame, text="✓ " + message, font=('Helvetica', 14, 'bold'), foreground='green').pack(anchor=tk.W)
-        
+        ttk.Label(info_frame, text="✓ " + message, font=('Helvetica', 12, 'bold'), foreground='green').pack(anchor=tk.W)
+
         if image_data and HAS_PIL:
             try:
                 img = Image.open(BytesIO(image_data))
-                img.thumbnail((320, 240), Image.Resampling.LANCZOS)
+                img.thumbnail((240, 180), Image.Resampling.LANCZOS)
                 self.preview_image = ImageTk.PhotoImage(img)
-                preview_frame = ttk.LabelFrame(top_frame, text="Camera Preview (Verify Lens)", padding="5")
-                preview_frame.pack(side=tk.RIGHT, padx=(15, 0))
+                preview_frame = ttk.LabelFrame(top_frame, text="Preview", padding="3")
+                preview_frame.pack(side=tk.RIGHT, padx=(10, 0))
                 ttk.Label(preview_frame, image=self.preview_image).pack()
             except: pass
-        
+
         if next_camera:
-            ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=10)
-            ttk.Label(frame, text="NEXT CAMERA:", font=('Helvetica', 12, 'bold')).pack()
-            ttk.Label(frame, text=next_camera, font=('Courier', 36, 'bold')).pack(pady=(5, 5))
+            ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=5)
+            ttk.Label(frame, text="NEXT CAMERA:", font=('Helvetica', 11, 'bold')).pack()
+            ttk.Label(frame, text=next_camera, font=('Courier', 22, 'bold')).pack(pady=(3, 3))
             if next_model:
-                ttk.Label(frame, text=next_model, font=('Courier', 28, 'bold')).pack(pady=(0, 10))
-        
-        ttk.Label(frame, text="Connect next camera and press Continue", font=('Helvetica', 11)).pack(pady=(10, 15))
-        
+                ttk.Label(frame, text=next_model, font=('Courier', 16, 'bold')).pack(pady=(0, 5))
+
+        ttk.Label(frame, text="Connect next camera and press Continue", font=('Helvetica', 10)).pack(pady=(8, 10))
+
         btn_frame = ttk.Frame(frame)
         btn_frame.pack()
         self.continue_btn = ttk.Button(btn_frame, text="Continue (Space/Enter)", command=self.on_continue)
         self.continue_btn.pack(side=tk.LEFT, padx=10)
         ttk.Button(btn_frame, text="Stop", command=self.on_cancel).pack(side=tk.LEFT, padx=10)
-        
+
         self.continue_btn.focus_set()
+        # Auto-size to content then center on parent
+        _center_on_parent(self, parent, 0, 0)
         self.bind("<space>", lambda e: self.on_continue())
         self.bind("<Return>", lambda e: self.on_continue())
         self.bind("<Escape>", lambda e: self.on_cancel())
