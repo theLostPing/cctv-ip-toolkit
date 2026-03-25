@@ -2768,7 +2768,7 @@ class DiscoveryResultsDialog(tk.Toplevel):
         self.result = None
         self.transient(parent)
         self.grab_set()
-        self.geometry("950x600")
+        _center_on_parent(self, parent, 950, 600)
         self.settings = settings
         
         self.cameras = cameras
@@ -3041,6 +3041,29 @@ class ToolTip:
             self.tooltip = None
 
 
+def _center_on_parent(dialog, parent, width, height):
+    """Center a dialog on its parent window, clamped to screen bounds."""
+    parent.update_idletasks()
+    dialog.update_idletasks()
+    # Use requested size if width/height are 0 (auto-sized dialogs)
+    if width <= 0:
+        width = dialog.winfo_reqwidth()
+    if height <= 0:
+        height = dialog.winfo_reqheight()
+    # Clamp to screen size
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    width = min(width, sw - 40)
+    height = min(height, sh - 80)
+    # Center on parent
+    px = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+    py = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+    # Keep on screen
+    px = max(0, min(px, sw - width))
+    py = max(0, min(py, sh - height))
+    dialog.geometry(f"{width}x{height}+{px}+{py}")
+
+
 class PasswordDialog(tk.Toplevel):
     def __init__(self, parent, title="Enter Password", prompt="Password:"):
         super().__init__(parent)
@@ -3048,8 +3071,8 @@ class PasswordDialog(tk.Toplevel):
         self.result = None
         self.transient(parent)
         self.grab_set()
-        self.geometry(f"400x200+{parent.winfo_rootx()+50}+{parent.winfo_rooty()+50}")
-        
+        _center_on_parent(self, parent, 400, 200)
+
         frame = ttk.Frame(self, padding="25")
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text=prompt, font=('Helvetica', 12)).pack(anchor=tk.W)
@@ -3096,7 +3119,7 @@ class WarningDialog(tk.Toplevel):
         self.result = False
         self.transient(parent)
         self.grab_set()
-        self.geometry(f"550x430+{parent.winfo_rootx()+50}+{parent.winfo_rooty()+50}")
+        _center_on_parent(self, parent, 550, 430)
         self.setting_key = setting_key
         self.settings_manager = settings_manager
         
@@ -3141,7 +3164,7 @@ class ContinueDialog(tk.Toplevel):
         self.result = False
         self.transient(parent)
         self.grab_set()
-        self.geometry(f"800x550+{parent.winfo_rootx()+50}+{parent.winfo_rooty()+50}")
+        _center_on_parent(self, parent, 800, 550)
         self.preview_image = None
         
         frame = ttk.Frame(self, padding="20")
@@ -3345,6 +3368,8 @@ class ProgramOptionsDialog(tk.Toplevel):
         self.ip_entry.focus_set()
         self.bind("<Return>", lambda e: self.ok())
         self.bind("<Escape>", lambda e: self.cancel())
+        # Center on parent after content is laid out (auto-size: width=0, height=0)
+        _center_on_parent(self, parent, 0, 0)
         self.wait_window(self)
     
     def _update_ip_state(self):
@@ -3400,11 +3425,7 @@ class BrandSelectionDialog(tk.Toplevel):
         self.grab_set()
         self.resizable(False, False)
 
-        # Center on parent
-        w, h = 500, 350
-        px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
-        py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
-        self.geometry(f"{w}x{h}+{max(px,0)}+{max(py,0)}")
+        _center_on_parent(self, parent, 500, 350)
 
         frame = ttk.Frame(self, padding="25")
         frame.pack(fill=tk.BOTH, expand=True)
@@ -3461,11 +3482,11 @@ class CameraEditorDialog(tk.Toplevel):
         self.settings = settings
         self.transient(parent)
         self.grab_set()
-        self.geometry(f"550x500+{parent.winfo_rootx()+50}+{parent.winfo_rooty()+50}")
-        
+        _center_on_parent(self, parent, 550, 500)
+
         frame = ttk.Frame(self, padding="25")
         frame.pack(fill=tk.BOTH, expand=True)
-        
+
         self.entries = {}
         row = 0
 
