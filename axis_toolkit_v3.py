@@ -7078,20 +7078,26 @@ https://buymeacoffee.com/thelostping""")
                 # Wait for camera to come back at new IP
                 camera_reachable = False
                 self.log(f"Waiting for camera at new IP ({static_ip})...")
+                # Brief delay — camera needs time to apply network changes
+                time.sleep(3)
                 wait_count = 0
-                while not self.ping_camera(static_ip, timeout_ms=1000) and not self.cancel_flag and wait_count < 30:
-                    time.sleep(1)
+                while not self.cancel_flag and wait_count < 45:
+                    if self.ping_camera(static_ip, timeout_ms=2000):
+                        camera_reachable = True
+                        break
                     wait_count += 1
+                    if wait_count % 10 == 0:
+                        self.log(f"  Still waiting... ({wait_count}s)")
+                    time.sleep(1)
 
                 if self.cancel_flag:
                     break
 
-                if wait_count >= 30:
-                    self.log(f"✗ Camera not responding at {static_ip} after 30s")
+                if not camera_reachable:
+                    self.log(f"✗ Camera not responding at {static_ip} after {wait_count}s")
                     errors.append("unreachable")
                 else:
-                    self.log(f"Camera online at {static_ip}")
-                    camera_reachable = True
+                    self.log(f"Camera online at {static_ip} (after {wait_count + 3}s)")
                     time.sleep(1)
 
                 # Get serial/MAC if camera is reachable
@@ -7920,10 +7926,16 @@ https://buymeacoffee.com/thelostping""")
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_HIDE
-            result = subprocess.run(['ping', '-n', '1', '-w', str(timeout_ms), ip],
+            cmd = ['ping', '-n', '1', '-w', str(timeout_ms), ip]
+            result = subprocess.run(cmd,
                 capture_output=True, timeout=(timeout_ms / 1000) + 2, startupinfo=startupinfo,
                 creationflags=subprocess.CREATE_NO_WINDOW)
-            return result.returncode == 0
+            # Check stdout for "Reply from" — returncode alone can be unreliable
+            # when there are multiple adapters or "Destination host unreachable"
+            output = result.stdout.decode('utf-8', errors='ignore') if result.stdout else ''
+            if 'Reply from' in output and 'unreachable' not in output.lower():
+                return True
+            return result.returncode == 0 and 'Reply from' in output
         except:
             return False
     
