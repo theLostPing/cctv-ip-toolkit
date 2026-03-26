@@ -3042,7 +3042,7 @@ class ToolTip:
 
 
 def _center_on_parent(dialog, parent, width, height):
-    """Center a dialog on its parent window, clamped to screen bounds."""
+    """Center a dialog on its parent window. Works across multiple monitors."""
     parent.update_idletasks()
     dialog.update_idletasks()
     # Use requested size if width/height are 0 (auto-sized dialogs)
@@ -3050,17 +3050,11 @@ def _center_on_parent(dialog, parent, width, height):
         width = dialog.winfo_reqwidth()
     if height <= 0:
         height = dialog.winfo_reqheight()
-    # Clamp to screen size
-    sw = dialog.winfo_screenwidth()
-    sh = dialog.winfo_screenheight()
-    width = min(width, sw - 40)
-    height = min(height, sh - 80)
-    # Center on parent
+    # Center on parent — use parent's actual position (works on any monitor)
     px = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
     py = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
-    # Keep on screen
-    px = max(0, min(px, sw - width))
-    py = max(0, min(py, sh - height))
+    # Only prevent going above top of screen
+    py = max(0, py)
     dialog.geometry(f"{width}x{height}+{px}+{py}")
 
 
