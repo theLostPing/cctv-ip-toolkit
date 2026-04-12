@@ -45,7 +45,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "3.3"
+APP_VERSION = "4.0"
 DATA_FOLDER = "data"
 SETTINGS_FILE = os.path.join(DATA_FOLDER, "settings.ini")
 CAMERAS_FILE = os.path.join(DATA_FOLDER, "cameras.json")
@@ -55,6 +55,7 @@ TRIPLETT_DIR = os.path.join(DATA_FOLDER, "triplett")
 OUTPUT_CSV = os.path.join(DATA_FOLDER, "programmed_cameras.csv")
 PING_RESULTS = os.path.join(DATA_FOLDER, "ping_results.csv")
 SUCCESSFUL_PASSWORDS = os.path.join(DATA_FOLDER, "found_passwords.csv")
+ADDITIONAL_USERS_FILE = os.path.join(DATA_FOLDER, "additional_users.json")
 TIMEOUT = 5
 
 # Bosch camera constants
@@ -75,6 +76,13 @@ RCP_CMD = {
     'password':      0x028b,  # P_STRING, num: 1=LIVE, 2=USER, 3=SERVICE
 }
 
+# Hanwha/Wisenet camera constants
+HANWHA_OUIS = [b'\x00\x09\x18', b'\x00\x16\x6c', b'\x00\x09\x12', b'\xc4\xf1\xd1', b'\x9c\xdc\x71']
+HANWHA_DEFAULT_IP = '192.168.1.100'
+HANWHA_DEFAULT_USER = 'admin'
+HANWHA_DEFAULT_PASSWORD = 'admin'  # Factory default before initial setup
+HANWHA_LOCKOUT_COOLDOWN = 35  # seconds after 490 lockout
+
 # Default settings
 DEFAULT_SETTINGS = {
     'general': {
@@ -82,7 +90,9 @@ DEFAULT_SETTINGS = {
         'bosch_factory_ip': '192.168.0.1',
         'username': 'root',
         'android_ip': '',
-        'first_run': 'true'
+        'first_run': 'true',
+        'brand': 'axis',
+        'interface_index': ''
     },
     'warnings': {
         'show_incomplete_camera_warning': 'true',
@@ -93,27 +103,6 @@ DEFAULT_SETTINGS = {
     }
 }
 
-
-def detect_brand_from_mac(mac_str):
-    """Determine camera brand from MAC address OUI prefix.
-    Returns 'bosch', 'axis', or 'unknown'."""
-    if not mac_str:
-        return 'unknown'
-    clean = mac_str.upper().replace(':', '').replace('-', '').strip()
-    if len(clean) < 6:
-        return 'unknown'
-    try:
-        mac_bytes = bytes.fromhex(clean[:6])
-    except ValueError:
-        return 'unknown'
-    oui = mac_bytes[:3]
-    if any(oui == b_oui for b_oui in BOSCH_OUIS):
-        return 'bosch'
-    # Import AXIS_OUIS from AxisDHCPDiscovery when available
-    axis_ouis = [b'\x00\x40\x8c', b'\xac\xcc\x8e', b'\xb8\xa4\x4f']
-    if any(oui == a_oui for a_oui in axis_ouis):
-        return 'axis'
-    return 'unknown'
 
 
 # ============================================================================
@@ -440,6 +429,52 @@ class PasswordDataManager:
     
     def get_all(self):
         return self.passwords
+
+
+class AdditionalUsersDataManager:
+    """Manages additional camera users - stored as JSON list of {username, password, role}"""
+    ROLES = ['Administrator', 'Operator', 'Viewer']
+
+    def __init__(self):
+        self.users = []
+        self.load()
+
+    def load(self):
+        if os.path.exists(ADDITIONAL_USERS_FILE):
+            try:
+                with open(ADDITIONAL_USERS_FILE, 'r') as f:
+                    self.users = json.load(f)
+            except:
+                self.users = []
+        return self.users
+
+    def save(self):
+        os.makedirs(DATA_FOLDER, exist_ok=True)
+        with open(ADDITIONAL_USERS_FILE, 'w') as f:
+            json.dump(self.users, f, indent=2)
+
+    def add(self, username, password, role='Operator'):
+        if not username:
+            return False
+        # Don't add duplicate usernames
+        for u in self.users:
+            if u['username'].lower() == username.lower():
+                return False
+        self.users.append({'username': username, 'password': password, 'role': role})
+        self.save()
+        return True
+
+    def delete(self, index):
+        if 0 <= index < len(self.users):
+            del self.users[index]
+            self.save()
+
+    def clear(self):
+        self.users = []
+        self.save()
+
+    def get_all(self):
+        return self.users
 
 
 # ============================================================================
@@ -872,6 +907,882 @@ class BoschRCP:
             if len(parts) >= 6:
                 config['mac'] = ':'.join(p.upper() for p in parts[:6])
         return config
+
+
+# ============================================================================
+# LOCKOUT ERROR (Hanwha 490 response)
+# ============================================================================
+class LockoutError(Exception):
+    """Raised when a Hanwha camera returns HTTP 490 (lockout)."""
+    pass
+
+
+# ============================================================================
+# CAMERA PROTOCOL ABSTRACTION (ABC)
+# ============================================================================
+from abc import ABC, abstractmethod
+
+
+class CameraProtocol(ABC):
+    """Abstract base class for brand-specific camera operations.
+    Each brand implements this interface so all operations can be
+    brand-agnostic — just call self.protocol.method()."""
+
+    # Subclasses set these
+    BRAND_NAME = ''
+    BRAND_KEY = ''
+    DEFAULT_USER = ''
+    DEFAULT_PASSWORD = ''
+    FACTORY_IP = ''
+    MAC_OUIS = []
+
+    @abstractmethod
+    def create_initial_user(self, ip, password):
+        """Set password on a factory-default camera. Returns True/False."""
+
+    @abstractmethod
+    def set_network(self, ip, password, new_ip, subnet, gateway):
+        """Set static IP, subnet, gateway and disable DHCP. Returns True/False."""
+
+    @abstractmethod
+    def set_hostname(self, ip, password, hostname):
+        """Set network hostname. Returns True/False."""
+
+    @abstractmethod
+    def reboot(self, ip, password):
+        """Reboot camera. Returns True/False."""
+
+    @abstractmethod
+    def get_serial(self, ip, password):
+        """Get serial number (requires auth). Returns string or 'UNKNOWN'."""
+
+    @abstractmethod
+    def get_model_noauth(self, ip):
+        """Query model without authentication. Returns string or None."""
+
+    @abstractmethod
+    def get_image(self, ip, username, password):
+        """Get JPEG snapshot bytes. Returns bytes or None."""
+
+    @abstractmethod
+    def test_password(self, ip, username, password):
+        """Test if credentials work. Returns True/False. May raise LockoutError for Hanwha."""
+
+    @abstractmethod
+    def change_password(self, ip, username, old_pwd, new_pwd):
+        """Change password. Returns True/False."""
+
+    @abstractmethod
+    def set_dhcp(self, ip, password, enable=True):
+        """Enable or disable DHCP. Returns True/False."""
+
+    @abstractmethod
+    def factory_reset(self, ip, password):
+        """Factory reset camera. Returns True/False."""
+
+    def add_user(self, ip, admin_password, username, user_password, role='Operator'):
+        """Add an additional user account to the camera. Returns True/False.
+        Default implementation returns False (not supported)."""
+        return False
+
+    @abstractmethod
+    def get_programming_steps(self, cam, password, options=None):
+        """Return ordered list of (description, callable) steps for programming a factory-default camera.
+        Each callable returns True on success, False on failure."""
+
+    def get_discovery_info(self, ip, timeout=2):
+        """Try to identify this brand's camera at the given IP without auth.
+        Returns a dict with camera info, or None if not this brand."""
+        return None
+
+
+# ============================================================================
+# AXIS PROTOCOL
+# ============================================================================
+class AxisProtocol(CameraProtocol):
+    BRAND_NAME = 'Axis'
+    BRAND_KEY = 'axis'
+    DEFAULT_USER = 'root'
+    DEFAULT_PASSWORD = ''  # No default password on Axis — must be set
+    FACTORY_IP = '192.168.0.90'
+    MAC_OUIS = [b'\x00\x40\x8c', b'\xac\xcc\x8e', b'\xb8\xa4\x4f']
+
+    def create_initial_user(self, ip, password):
+        """Create root user + ONVIF user on factory-default Axis camera."""
+        # Step 1: Create system user via pwdgrp.cgi
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
+                params={"action": "add", "user": "root", "pwd": password,
+                        "grp": "root", "sgrp": "admin:operator:viewer:ptz"},
+                timeout=TIMEOUT)
+            if r.status_code != 200:
+                return False
+        except:
+            return False
+
+        # Step 2: Create ONVIF user (non-critical)
+        try:
+            soap = (f'<?xml version="1.0"?>'
+                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                    f'<CreateUsers xmlns="http://www.onvif.org/ver10/device/wsdl" '
+                    f'xmlns:tt="http://www.onvif.org/ver10/schema">'
+                    f'<User><tt:Username>root</tt:Username>'
+                    f'<tt:Password>{password}</tt:Password>'
+                    f'<tt:UserLevel>Administrator</tt:UserLevel>'
+                    f'</User></CreateUsers></Body></Envelope>')
+            requests.post(f"http://{ip}/vapix/services", data=soap,
+                headers={"Content-Type": "application/soap+xml"},
+                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+        except:
+            pass  # ONVIF user creation is non-critical
+        return True
+
+    def set_network(self, ip, password, new_ip, subnet, gateway):
+        """Set gateway + static IP + disable DHCP.
+        Tries ONVIF SOAP first, falls back to VAPIX param.cgi."""
+        auth = HTTPDigestAuth("root", password)
+        cidr = sum(bin(int(x)).count('1') for x in subnet.split('.')) if subnet else 24
+
+        # ---- Method 1: ONVIF SOAP ----
+        onvif_ok = False
+        # Set gateway first
+        gw_soap = (f'<?xml version="1.0"?>'
+                   f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                   f'<SetNetworkDefaultGateway xmlns="http://www.onvif.org/ver10/device/wsdl">'
+                   f'<IPv4Address>{gateway}</IPv4Address>'
+                   f'</SetNetworkDefaultGateway></Body></Envelope>')
+        try:
+            requests.post(f"http://{ip}/vapix/services", data=gw_soap,
+                headers={"Content-Type": "application/soap+xml"},
+                auth=auth, timeout=TIMEOUT)
+        except:
+            pass
+
+        # Set IP + disable DHCP
+        ip_soap = (f'<?xml version="1.0"?>'
+                   f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope" '
+                   f'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
+                   f'xmlns:tt="http://www.onvif.org/ver10/schema"><Header/><Body>'
+                   f'<tds:SetNetworkInterfaces>'
+                   f'<tds:InterfaceToken>eth0</tds:InterfaceToken>'
+                   f'<tds:NetworkInterface><tt:Enabled>true</tt:Enabled>'
+                   f'<tt:IPv4><tt:Enabled>true</tt:Enabled>'
+                   f'<tt:Manual><tt:Address>{new_ip}</tt:Address>'
+                   f'<tt:PrefixLength>{cidr}</tt:PrefixLength></tt:Manual>'
+                   f'<tt:DHCP>false</tt:DHCP></tt:IPv4></tds:NetworkInterface>'
+                   f'</tds:SetNetworkInterfaces></Body></Envelope>')
+        try:
+            r = requests.post(f"http://{ip}/vapix/services", data=ip_soap,
+                headers={"Content-Type": "application/soap+xml"},
+                auth=auth, timeout=TIMEOUT)
+            if r.status_code == 200 and 'Fault' not in r.text:
+                onvif_ok = True
+        except:
+            pass
+
+        if onvif_ok:
+            return True
+
+        # ---- Method 2: VAPIX param.cgi fallback ----
+        try:
+            # Disable DHCP first
+            requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.IPv4.DHCP": "no"},
+                auth=auth, timeout=TIMEOUT)
+            # Set gateway
+            requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.DefaultRouter": gateway},
+                auth=auth, timeout=TIMEOUT)
+            # Set subnet
+            requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.SubnetMask": subnet},
+                auth=auth, timeout=TIMEOUT)
+            # Set IP last (changes connectivity)
+            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.IPAddress": new_ip},
+                auth=auth, timeout=TIMEOUT)
+            return r.status_code == 200
+        except requests.exceptions.ConnectionError:
+            return True  # Camera likely rebooting on IP change
+        except:
+            return False
+
+    def set_hostname(self, ip, password, hostname):
+        clean = re.sub(r'[^a-zA-Z0-9-]', '-', hostname).strip('-')[:63]
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.HostName": clean},
+                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+            # Also set Bonjour name
+            try:
+                requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                    params={"action": "update", "root.Network.Bonjour.FriendlyName": clean},
+                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+            except:
+                pass
+            return r.status_code == 200 and 'OK' in r.text
+        except:
+            return False
+
+    def reboot(self, ip, password):
+        """Axis cameras reboot automatically after IP change. Explicit reboot via param.cgi."""
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/restart.cgi",
+                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+            return r.status_code == 200
+        except:
+            return False
+
+    def set_dhcp(self, ip, password, enable=True):
+        val = 'yes' if enable else 'no'
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "root.Network.IPv4.DHCP": val},
+                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+            return r.status_code == 200 and 'OK' in r.text
+        except:
+            return False
+
+    def get_serial(self, ip, password):
+        for attempt in range(3):
+            try:
+                r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                    params={"action": "list", "group": "Properties.System.SerialNumber"},
+                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+                if r.status_code == 200:
+                    for line in r.text.split('\n'):
+                        if 'SerialNumber=' in line:
+                            return line.split('=')[1].strip()
+            except:
+                pass
+            try:
+                r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
+                    json={"apiVersion": "1.0", "method": "getAllProperties"},
+                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+                if r.status_code == 200:
+                    data = r.json()
+                    if 'data' in data and 'propertyList' in data['data']:
+                        serial = data['data']['propertyList'].get('SerialNumber')
+                        if serial:
+                            return serial
+            except:
+                pass
+            time.sleep(1)
+        return "UNKNOWN"
+
+    def get_model_noauth(self, ip):
+        try:
+            r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
+                json={"apiVersion": "1.0", "method": "getAllProperties"},
+                timeout=TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+                if 'data' in data and 'propertyList' in data['data']:
+                    return data['data']['propertyList'].get('ProdNbr', '')
+        except:
+            pass
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "list", "group": "Brand.ProdNbr"},
+                timeout=TIMEOUT)
+            if r.status_code == 200:
+                for line in r.text.split('\n'):
+                    if 'ProdNbr=' in line:
+                        return line.split('=')[1].strip()
+        except:
+            pass
+        return None
+
+    def get_image(self, ip, username, password):
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/jpg/image.cgi",
+                auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
+            if r.status_code == 200:
+                return r.content
+        except:
+            pass
+        return None
+
+    def test_password(self, ip, username, password):
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "list", "group": "Brand"},
+                auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
+            return r.status_code == 200 and 'Brand' in r.text
+        except:
+            return False
+
+    def change_password(self, ip, username, old_pwd, new_pwd):
+        try:
+            return requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
+                params={"action": "update", "user": username, "pwd": new_pwd},
+                auth=HTTPDigestAuth(username, old_pwd), timeout=TIMEOUT).status_code == 200
+        except:
+            return False
+
+    def add_user(self, ip, admin_password, username, user_password, role='Operator'):
+        """Add a user to Axis camera via pwdgrp.cgi + ONVIF CreateUsers."""
+        # Map role to Axis groups
+        role_groups = {
+            'Administrator': 'admin:operator:viewer:ptz',
+            'Operator': 'operator:viewer:ptz',
+            'Viewer': 'viewer',
+        }
+        sgrp = role_groups.get(role, 'operator:viewer:ptz')
+
+        # Step 1: Create system user via pwdgrp.cgi
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
+                params={"action": "add", "user": username, "pwd": user_password,
+                        "grp": "users", "sgrp": sgrp},
+                auth=HTTPDigestAuth("root", admin_password), timeout=TIMEOUT)
+            if r.status_code != 200:
+                return False
+        except:
+            return False
+
+        # Step 2: Create matching ONVIF user (non-critical)
+        onvif_level = role if role in ('Administrator', 'Operator') else 'User'
+        try:
+            soap = (f'<?xml version="1.0"?>'
+                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                    f'<CreateUsers xmlns="http://www.onvif.org/ver10/device/wsdl" '
+                    f'xmlns:tt="http://www.onvif.org/ver10/schema">'
+                    f'<User><tt:Username>{username}</tt:Username>'
+                    f'<tt:Password>{user_password}</tt:Password>'
+                    f'<tt:UserLevel>{onvif_level}</tt:UserLevel>'
+                    f'</User></CreateUsers></Body></Envelope>')
+            requests.post(f"http://{ip}/vapix/services", data=soap,
+                headers={"Content-Type": "application/soap+xml"},
+                auth=HTTPDigestAuth("root", admin_password), timeout=TIMEOUT)
+        except:
+            pass  # ONVIF user creation is non-critical
+        return True
+
+    def factory_reset(self, ip, password):
+        # Method 1: firmwaremanagement API
+        try:
+            r = requests.post(f"http://{ip}/axis-cgi/firmwaremanagement.cgi",
+                json={"apiVersion": "1.0", "method": "factoryDefault",
+                      "params": {"mode": "hard"}},
+                auth=HTTPDigestAuth("root", password), timeout=10)
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    if 'error' not in data:
+                        return True
+                except:
+                    if 'error' not in r.text.lower():
+                        return True
+        except requests.exceptions.Timeout:
+            return True  # Camera rebooting
+        except:
+            pass
+
+        # Method 2: Legacy hardfactorydefault.cgi
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/hardfactorydefault.cgi",
+                auth=HTTPDigestAuth("root", password), timeout=10)
+            if r.status_code == 200:
+                return True
+        except requests.exceptions.Timeout:
+            return True
+        except:
+            pass
+
+        # Method 3: param.cgi
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "update", "System.HardFactoryDefault": "yes"},
+                auth=HTTPDigestAuth("root", password), timeout=10)
+            if r.status_code == 200:
+                return True
+        except requests.exceptions.Timeout:
+            return True
+        except:
+            pass
+        return False
+
+    def get_programming_steps(self, cam, password, options=None):
+        """Axis programming: create user -> set network -> (hostname)."""
+        ip = cam.get('_program_ip', cam['ip'])  # _program_ip = factory/link-local IP
+        static_ip = cam['ip']
+        gateway = cam['gateway']
+        subnet = cam['subnet']
+        set_hostname = options.get('set_hostname', False) if options else False
+
+        steps = [
+            ("Creating system user + ONVIF user",
+             lambda: self.create_initial_user(ip, password)),
+            ("Setting gateway + IP + disabling DHCP",
+             lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
+        ]
+        if set_hostname:
+            cam_number = cam.get('number', '1')
+            serial = cam.get('serial', 'unknown')
+            hostname = f"{cam_number}-axis-{serial.lower()}"
+            steps.append(("Setting hostname",
+                lambda: self.set_hostname(static_ip, password, hostname)))
+        return steps
+
+    def get_discovery_info(self, ip, timeout=2):
+        """Detect Axis camera at IP."""
+        try:
+            r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
+                json={"apiVersion": "1.0", "method": "getAllProperties"},
+                timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                if 'data' in data and 'propertyList' in data['data']:
+                    props = data['data']['propertyList']
+                    return {
+                        'ip': ip,
+                        'model': props.get('ProdFullName', props.get('ProdShortName', '')),
+                        'serial': props.get('SerialNumber', ''),
+                        'brand': 'axis',
+                    }
+            elif r.status_code == 401:
+                return {'ip': ip, 'model': '(Auth Required)', 'brand': 'axis'}
+        except:
+            pass
+        # Fallback: check image endpoint
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/jpg/image.cgi", timeout=1)
+            if r.status_code == 401:
+                return {'ip': ip, 'model': '(Auth Required)', 'brand': 'axis'}
+        except:
+            pass
+        return None
+
+
+# ============================================================================
+# BOSCH PROTOCOL
+# ============================================================================
+class BoschProtocol(CameraProtocol):
+    BRAND_NAME = 'Bosch'
+    BRAND_KEY = 'bosch'
+    DEFAULT_USER = 'service'
+    DEFAULT_PASSWORD = 'service'
+    FACTORY_IP = '192.168.0.1'
+    MAC_OUIS = [b'\x00\x07\x5f']
+
+    def create_initial_user(self, ip, password):
+        """Change Bosch service password from default 'service' to new password."""
+        auth = (BOSCH_DEFAULT_USER, 'service')
+        ok = True
+        for num, name in [(3, 'service'), (2, 'user'), (1, 'live')]:
+            if not BoschRCP.rcp_write(ip, RCP_CMD['password'], 'P_STRING',
+                                       password, auth, num=num):
+                if num == 3:
+                    ok = False
+        return ok
+
+    def set_network(self, ip, password, new_ip, subnet, gateway):
+        """Set network via RCP. Order: gateway -> subnet -> dhcp off -> IP."""
+        auth = (BOSCH_DEFAULT_USER, password)
+        ok = True
+        if gateway:
+            if not BoschRCP.rcp_write(ip, RCP_CMD['gateway'], 'P_STRING', gateway, auth):
+                ok = False
+        if subnet:
+            if not BoschRCP.rcp_write(ip, RCP_CMD['subnet'], 'P_STRING', subnet, auth):
+                ok = False
+        # Disable DHCP
+        BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_DWORD', '0', auth)
+        # IP last (changes connectivity)
+        if not BoschRCP.rcp_write(ip, RCP_CMD['ip'], 'P_STRING', new_ip, auth):
+            ok = False
+        return ok
+
+    def set_hostname(self, ip, password, hostname):
+        auth = (BOSCH_DEFAULT_USER, password)
+        return BoschRCP.rcp_write(ip, RCP_CMD['unit_name'], 'P_STRING', hostname, auth) or False
+
+    def reboot(self, ip, password):
+        auth = (BOSCH_DEFAULT_USER, password)
+        if BoschRCP.rcp_write(ip, RCP_CMD['reboot'], 'F_FLAG', '1', auth, timeout=10):
+            return True
+        if BoschRCP.rcp_write(ip, RCP_CMD['reboot'], 'T_DWORD', '1', auth, timeout=10):
+            return True
+        try:
+            r = requests.get(f'http://{ip}/reset', timeout=5)
+            if r.status_code == 200:
+                return True
+        except requests.exceptions.ConnectionError:
+            return True
+        except:
+            pass
+        return False
+
+    def set_dhcp(self, ip, password, enable=True):
+        auth = (BOSCH_DEFAULT_USER, password)
+        payload = '1' if enable else '0'
+        return BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_DWORD', payload, auth) or False
+
+    def get_serial(self, ip, password):
+        mac = BoschRCP.rcp_read(ip, RCP_CMD['mac'], 'T_OCTET')
+        if mac:
+            parts = mac.split()
+            if len(parts) >= 6:
+                return ''.join(p.upper() for p in parts[:6])
+        return 'UNKNOWN'
+
+    def get_model_noauth(self, ip):
+        info = BoschRCP.get_device_info(ip, timeout=2)
+        if info and info.get('model'):
+            return info['model']
+        return None
+
+    def get_image(self, ip, username, password):
+        try:
+            r = requests.get(f'http://{ip}/snap.jpg?JpegSize=M',
+                             auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
+            if r.status_code == 200 and len(r.content) > 1000:
+                return r.content
+        except:
+            pass
+        try:
+            r = requests.get(f'http://{ip}/snap.jpg?JpegSize=M', timeout=TIMEOUT)
+            if r.status_code == 200 and len(r.content) > 1000:
+                return r.content
+        except:
+            pass
+        return None
+
+    def test_password(self, ip, username, password):
+        result = BoschRCP.rcp_read(ip, RCP_CMD['unit_name'], 'P_STRING',
+                                   auth=(username, password))
+        return result is not None
+
+    def change_password(self, ip, username, old_pwd, new_pwd):
+        auth = (BOSCH_DEFAULT_USER, old_pwd)
+        ok = True
+        for num, name in [(3, 'service'), (2, 'user'), (1, 'live')]:
+            if not BoschRCP.rcp_write(ip, RCP_CMD['password'], 'P_STRING',
+                                       new_pwd, auth, num=num):
+                if num == 3:
+                    ok = False
+        return ok
+
+    def factory_reset(self, ip, password):
+        auth = (BOSCH_DEFAULT_USER, password)
+        if BoschRCP.rcp_write(ip, RCP_CMD['factory_reset'], 'T_DWORD', '1', auth, timeout=10):
+            return True
+        try:
+            r = requests.get(f'http://{ip}/reset', timeout=5)
+            if r.status_code == 200:
+                return True
+        except requests.exceptions.ConnectionError:
+            return True
+        except:
+            pass
+        return False
+
+    def get_programming_steps(self, cam, password, options=None):
+        ip = cam.get('_program_ip', cam['ip'])
+        static_ip = cam['ip']
+        gateway = cam['gateway']
+        subnet = cam['subnet']
+        set_hostname = options.get('set_hostname', False) if options else False
+
+        steps = [
+            ("Setting password via RCP",
+             lambda: self.create_initial_user(ip, password)),
+            ("Setting network via RCP",
+             lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
+            ("Rebooting camera",
+             lambda: self.reboot(ip, password)),
+        ]
+        if set_hostname:
+            cam_number = cam.get('number', '1')
+            serial = cam.get('serial', 'unknown')
+            hostname = f"{cam_number}-bosch-{serial.lower()}"
+            steps.append(("Setting unit name",
+                lambda: self.set_hostname(static_ip, password, hostname)))
+        return steps
+
+    def get_discovery_info(self, ip, timeout=2):
+        info = BoschRCP.get_device_info(ip, timeout=timeout)
+        if info:
+            net = BoschRCP.get_network_config(ip, timeout=timeout)
+            cam = {
+                'ip': ip,
+                'model': info.get('model', ''),
+                'serial': '',
+                'brand': 'bosch',
+            }
+            if net.get('mac'):
+                cam['mac'] = net['mac']
+                cam['serial'] = net['mac'].replace(':', '')
+            if net.get('subnet'):
+                cam['subnet'] = net['subnet']
+            if net.get('gateway') and net['gateway'] != '0.0.0.0':
+                cam['gateway'] = net['gateway']
+            if net.get('dhcp'):
+                cam['dhcp'] = net['dhcp']
+            return cam
+        return None
+
+
+# ============================================================================
+# HANWHA/WISENET PROTOCOL
+# ============================================================================
+class HanwhaProtocol(CameraProtocol):
+    BRAND_NAME = 'Hanwha'
+    BRAND_KEY = 'hanwha'
+    DEFAULT_USER = 'admin'
+    DEFAULT_PASSWORD = 'admin'
+    FACTORY_IP = '192.168.1.100'
+    MAC_OUIS = [b'\x00\x09\x18', b'\x00\x16\x6c', b'\x00\x09\x12', b'\xc4\xf1\xd1', b'\x9c\xdc\x71']
+    LOCKOUT_COOLDOWN = HANWHA_LOCKOUT_COOLDOWN
+
+    def _stw_get(self, ip, path, auth=None, timeout=None):
+        """Helper: GET request to STW-CGI endpoint."""
+        if timeout is None:
+            timeout = TIMEOUT
+        kwargs = {'timeout': timeout}
+        if auth:
+            kwargs['auth'] = HTTPDigestAuth(auth[0], auth[1])
+        return requests.get(f"http://{ip}{path}", **kwargs)
+
+    def _stw_post(self, ip, path, data=None, auth=None, timeout=None):
+        """Helper: POST request to STW-CGI endpoint."""
+        if timeout is None:
+            timeout = TIMEOUT
+        kwargs = {'timeout': timeout}
+        if auth:
+            kwargs['auth'] = HTTPDigestAuth(auth[0], auth[1])
+        if data:
+            kwargs['data'] = data
+        return requests.post(f"http://{ip}{path}", **kwargs)
+
+    def create_initial_user(self, ip, password):
+        """Set admin password on factory-default Hanwha camera (no auth required).
+        Password must be 8-15 chars with 3+ character types."""
+        try:
+            r = self._stw_post(ip,
+                '/stw-cgi/user.cgi?msubmenu=admin&action=set',
+                data={'NewPassword': password, 'ID': 'admin'},
+                timeout=10)
+            return r.status_code == 200
+        except:
+            return False
+
+    def set_network(self, ip, password, new_ip, subnet, gateway):
+        """Set static IP on Hanwha camera via STW-CGI."""
+        try:
+            r = self._stw_post(ip,
+                '/stw-cgi/network.cgi?msubmenu=ethernet&action=set',
+                data={
+                    'Type': 'Static',
+                    'IPAddress': new_ip,
+                    'SubnetMask': subnet,
+                    'DefaultGateway': gateway,
+                },
+                auth=('admin', password),
+                timeout=10)
+            return r.status_code == 200
+        except:
+            return False
+
+    def set_hostname(self, ip, password, hostname):
+        clean = re.sub(r'[^a-zA-Z0-9-]', '-', hostname).strip('-')[:63]
+        try:
+            r = self._stw_post(ip,
+                '/stw-cgi/system.cgi?msubmenu=general&action=set',
+                data={'HostName': clean},
+                auth=('admin', password))
+            return r.status_code == 200
+        except:
+            return False
+
+    def reboot(self, ip, password):
+        try:
+            r = self._stw_post(ip,
+                '/stw-cgi/system.cgi?msubmenu=reboot&action=execute',
+                auth=('admin', password), timeout=10)
+            return r.status_code == 200
+        except requests.exceptions.ConnectionError:
+            return True  # Camera already rebooting
+        except requests.exceptions.Timeout:
+            return True
+        except:
+            return False
+
+    def set_dhcp(self, ip, password, enable=True):
+        try:
+            mode = 'DHCP' if enable else 'Static'
+            r = self._stw_post(ip,
+                '/stw-cgi/network.cgi?msubmenu=ethernet&action=set',
+                data={'Type': mode},
+                auth=('admin', password))
+            return r.status_code == 200
+        except:
+            return False
+
+    def get_serial(self, ip, password):
+        try:
+            r = self._stw_get(ip,
+                '/stw-cgi/system.cgi?msubmenu=deviceinfo&action=view',
+                auth=('admin', password))
+            if r.status_code == 200:
+                for line in r.text.split('\n'):
+                    if 'SerialNumber=' in line or 'Serial=' in line:
+                        return line.split('=', 1)[1].strip()
+                # Try key=value parsing
+                for line in r.text.split('\n'):
+                    line = line.strip()
+                    if '=' in line:
+                        key, val = line.split('=', 1)
+                        if 'serial' in key.lower():
+                            return val.strip()
+        except:
+            pass
+        return 'UNKNOWN'
+
+    def get_model_noauth(self, ip):
+        """Try to get model without auth — works on some Hanwha firmware."""
+        try:
+            r = self._stw_get(ip,
+                '/stw-cgi/system.cgi?msubmenu=deviceinfo&action=view',
+                timeout=3)
+            if r.status_code == 200:
+                for line in r.text.split('\n'):
+                    line = line.strip()
+                    if '=' in line:
+                        key, val = line.split('=', 1)
+                        if 'model' in key.lower():
+                            return val.strip()
+        except:
+            pass
+        return None
+
+    def get_image(self, ip, username, password):
+        try:
+            r = self._stw_get(ip,
+                '/stw-cgi/image.cgi?msubmenu=snapshot&action=view',
+                auth=(username, password))
+            if r.status_code == 200 and len(r.content) > 1000:
+                return r.content
+        except:
+            pass
+        return None
+
+    def test_password(self, ip, username, password):
+        """Test credentials. Raises LockoutError on HTTP 490."""
+        try:
+            r = self._stw_get(ip,
+                '/stw-cgi/system.cgi?msubmenu=deviceinfo&action=view',
+                auth=(username, password))
+            if r.status_code == 200:
+                return True
+            elif r.status_code == 490:
+                raise LockoutError(f"Camera {ip} is locked out (HTTP 490)")
+            elif r.status_code == 401:
+                return False
+            return False
+        except LockoutError:
+            raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            raise LockoutError(f"Camera {ip} not responding (likely locked out)")
+        except:
+            return False
+
+    def change_password(self, ip, username, old_pwd, new_pwd):
+        try:
+            r = self._stw_post(ip,
+                '/stw-cgi/user.cgi?msubmenu=admin&action=set',
+                data={'OldPassword': old_pwd, 'NewPassword': new_pwd, 'ID': 'admin'},
+                auth=('admin', old_pwd))
+            return r.status_code == 200
+        except:
+            return False
+
+    def add_user(self, ip, admin_password, username, user_password, role='Operator'):
+        """Add a user to Hanwha camera via STW-CGI."""
+        # Map role to Hanwha user groups
+        role_map = {
+            'Administrator': 'admin',
+            'Operator': 'manager',
+            'Viewer': 'user',
+        }
+        group = role_map.get(role, 'manager')
+        try:
+            r = self._stw_post(ip,
+                '/stw-cgi/user.cgi?msubmenu=adduser&action=set',
+                data={'UserID': username, 'Password': user_password, 'UserGroup': group},
+                auth=('admin', admin_password))
+            return r.status_code == 200
+        except:
+            return False
+
+    def factory_reset(self, ip, password):
+        try:
+            r = self._stw_post(ip,
+                '/stw-cgi/system.cgi?msubmenu=factory&action=execute',
+                auth=('admin', password), timeout=10)
+            return r.status_code == 200
+        except requests.exceptions.ConnectionError:
+            return True
+        except requests.exceptions.Timeout:
+            return True
+        except:
+            return False
+
+    def get_programming_steps(self, cam, password, options=None):
+        ip = cam.get('_program_ip', cam['ip'])
+        static_ip = cam['ip']
+        gateway = cam['gateway']
+        subnet = cam['subnet']
+        set_hostname = options.get('set_hostname', False) if options else False
+
+        steps = [
+            ("Setting admin password",
+             lambda: self.create_initial_user(ip, password)),
+            ("Setting network (IP, subnet, gateway, static)",
+             lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
+            ("Rebooting camera",
+             lambda: self.reboot(ip, password)),
+        ]
+        if set_hostname:
+            cam_number = cam.get('number', '1')
+            serial = cam.get('serial', 'unknown')
+            hostname = f"{cam_number}-hanwha-{serial.lower()}"
+            steps.append(("Setting hostname",
+                lambda: self.set_hostname(static_ip, password, hostname)))
+        return steps
+
+    def get_discovery_info(self, ip, timeout=2):
+        """Detect Hanwha camera via STW-CGI probe."""
+        try:
+            r = requests.get(f"http://{ip}/stw-cgi/system.cgi?msubmenu=deviceinfo&action=view",
+                             timeout=timeout)
+            if r.status_code in (200, 401):
+                cam = {'ip': ip, 'brand': 'hanwha'}
+                if r.status_code == 200:
+                    for line in r.text.split('\n'):
+                        line = line.strip()
+                        if '=' in line:
+                            key, val = line.split('=', 1)
+                            if 'model' in key.lower():
+                                cam['model'] = val.strip()
+                            elif 'serial' in key.lower():
+                                cam['serial'] = val.strip()
+                    cam.setdefault('model', 'Hanwha Camera')
+                else:
+                    cam['model'] = '(Auth Required)'
+                return cam
+        except:
+            pass
+        return None
+
+
+# Protocol registry for easy lookup
+PROTOCOLS = {
+    'axis': AxisProtocol,
+    'bosch': BoschProtocol,
+    'hanwha': HanwhaProtocol,
+}
 
 
 # ============================================================================
@@ -1857,7 +2768,7 @@ class DiscoveryResultsDialog(tk.Toplevel):
         self.result = None
         self.transient(parent)
         self.grab_set()
-        self.geometry("950x600")
+        _center_on_parent(self, parent, 950, 600)
         self.settings = settings
         
         self.cameras = cameras
@@ -2130,6 +3041,23 @@ class ToolTip:
             self.tooltip = None
 
 
+def _center_on_parent(dialog, parent, width, height):
+    """Center a dialog on its parent window. Works across multiple monitors."""
+    parent.update_idletasks()
+    dialog.update_idletasks()
+    # Use requested size if width/height are 0 (auto-sized dialogs)
+    if width <= 0:
+        width = dialog.winfo_reqwidth()
+    if height <= 0:
+        height = dialog.winfo_reqheight()
+    # Center on parent — use parent's actual position (works on any monitor)
+    px = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+    py = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+    # Only prevent going above top of screen
+    py = max(0, py)
+    dialog.geometry(f"{width}x{height}+{px}+{py}")
+
+
 class PasswordDialog(tk.Toplevel):
     def __init__(self, parent, title="Enter Password", prompt="Password:"):
         super().__init__(parent)
@@ -2137,8 +3065,8 @@ class PasswordDialog(tk.Toplevel):
         self.result = None
         self.transient(parent)
         self.grab_set()
-        self.geometry(f"400x200+{parent.winfo_rootx()+50}+{parent.winfo_rooty()+50}")
-        
+        _center_on_parent(self, parent, 400, 200)
+
         frame = ttk.Frame(self, padding="25")
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text=prompt, font=('Helvetica', 12)).pack(anchor=tk.W)
@@ -2185,7 +3113,7 @@ class WarningDialog(tk.Toplevel):
         self.result = False
         self.transient(parent)
         self.grab_set()
-        self.geometry(f"550x430+{parent.winfo_rootx()+50}+{parent.winfo_rooty()+50}")
+        _center_on_parent(self, parent, 550, 430)
         self.setting_key = setting_key
         self.settings_manager = settings_manager
         
@@ -2230,46 +3158,47 @@ class ContinueDialog(tk.Toplevel):
         self.result = False
         self.transient(parent)
         self.grab_set()
-        self.geometry(f"800x550+{parent.winfo_rootx()+50}+{parent.winfo_rooty()+50}")
         self.preview_image = None
-        
-        frame = ttk.Frame(self, padding="20")
+
+        frame = ttk.Frame(self, padding="15")
         frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Top section with message and image
+
+        # Top section with message and image side by side
         top_frame = ttk.Frame(frame)
-        top_frame.pack(fill=tk.X, pady=(0, 15))
-        
+        top_frame.pack(fill=tk.X, pady=(0, 10))
+
         info_frame = ttk.Frame(top_frame)
         info_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(info_frame, text="✓ " + message, font=('Helvetica', 14, 'bold'), foreground='green').pack(anchor=tk.W)
-        
+        ttk.Label(info_frame, text="✓ " + message, font=('Helvetica', 12, 'bold'), foreground='green').pack(anchor=tk.W)
+
         if image_data and HAS_PIL:
             try:
                 img = Image.open(BytesIO(image_data))
-                img.thumbnail((320, 240), Image.Resampling.LANCZOS)
+                img.thumbnail((240, 180), Image.Resampling.LANCZOS)
                 self.preview_image = ImageTk.PhotoImage(img)
-                preview_frame = ttk.LabelFrame(top_frame, text="Camera Preview (Verify Lens)", padding="5")
-                preview_frame.pack(side=tk.RIGHT, padx=(15, 0))
+                preview_frame = ttk.LabelFrame(top_frame, text="Preview", padding="3")
+                preview_frame.pack(side=tk.RIGHT, padx=(10, 0))
                 ttk.Label(preview_frame, image=self.preview_image).pack()
             except: pass
-        
+
         if next_camera:
-            ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=10)
-            ttk.Label(frame, text="NEXT CAMERA:", font=('Helvetica', 12, 'bold')).pack()
-            ttk.Label(frame, text=next_camera, font=('Courier', 36, 'bold')).pack(pady=(5, 5))
+            ttk.Separator(frame, orient='horizontal').pack(fill=tk.X, pady=5)
+            ttk.Label(frame, text="NEXT CAMERA:", font=('Helvetica', 11, 'bold')).pack()
+            ttk.Label(frame, text=next_camera, font=('Courier', 22, 'bold')).pack(pady=(3, 3))
             if next_model:
-                ttk.Label(frame, text=next_model, font=('Courier', 28, 'bold')).pack(pady=(0, 10))
-        
-        ttk.Label(frame, text="Connect next camera and press Continue", font=('Helvetica', 11)).pack(pady=(10, 15))
-        
+                ttk.Label(frame, text=next_model, font=('Courier', 16, 'bold')).pack(pady=(0, 5))
+
+        ttk.Label(frame, text="Connect next camera and press Continue", font=('Helvetica', 10)).pack(pady=(8, 10))
+
         btn_frame = ttk.Frame(frame)
         btn_frame.pack()
         self.continue_btn = ttk.Button(btn_frame, text="Continue (Space/Enter)", command=self.on_continue)
         self.continue_btn.pack(side=tk.LEFT, padx=10)
         ttk.Button(btn_frame, text="Stop", command=self.on_cancel).pack(side=tk.LEFT, padx=10)
-        
+
         self.continue_btn.focus_set()
+        # Auto-size to content then center on parent
+        _center_on_parent(self, parent, 0, 0)
         self.bind("<space>", lambda e: self.on_continue())
         self.bind("<Return>", lambda e: self.on_continue())
         self.bind("<Escape>", lambda e: self.on_cancel())
@@ -2289,62 +3218,144 @@ class ContinueDialog(tk.Toplevel):
 # ============================================================================
 class ProgramOptionsDialog(tk.Toplevel):
     """Dialog to set factory IP and programming options before starting"""
-    def __init__(self, parent, factory_ip='192.168.0.90'):
+
+    @staticmethod
+    def _get_network_interfaces():
+        """Get list of network interfaces with IP addresses for the dropdown."""
+        import subprocess
+        interfaces = []
+        try:
+            cmd = ("Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+                   "Where-Object { $_.IPAddress -ne '127.0.0.1' -and "
+                   "-not $_.IPAddress.StartsWith('169.254.') } | "
+                   "Select-Object IPAddress,InterfaceIndex,InterfaceAlias | "
+                   "ConvertTo-Json -Compress")
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            if result.returncode == 0 and result.stdout.strip():
+                entries = json.loads(result.stdout)
+                if isinstance(entries, dict):
+                    entries = [entries]
+                for e in entries:
+                    ip = e.get('IPAddress', '')
+                    idx = e.get('InterfaceIndex', '')
+                    alias = e.get('InterfaceAlias', '')
+                    if ip:
+                        interfaces.append({
+                            'ip': ip, 'index': idx,
+                            'label': f"{alias} ({ip})",
+                        })
+        except:
+            pass
+        return interfaces
+
+    def __init__(self, parent, factory_ip='192.168.0.90', additional_users_count=0):
         super().__init__(parent)
         self.title("Programming Options")
         self.result = None
         self.transient(parent)
         self.grab_set()
         self.resizable(False, False)
-        
+
         frame = ttk.Frame(self, padding="15")
         frame.pack(fill=tk.BOTH, expand=True)
-        
+
+        # Network interface selector
+        self._interfaces = self._get_network_interfaces()
+        if self._interfaces:
+            ttk.Label(frame, text="Programming Interface:", font=('Helvetica', 10, 'bold')).grid(
+                row=0, column=0, columnspan=2, sticky='w', pady=(0, 5))
+            iface_labels = [i['label'] for i in self._interfaces]
+            iface_labels.insert(0, "Auto-detect (default)")
+            self.iface_var = tk.StringVar(value=iface_labels[0])
+            iface_combo = ttk.Combobox(frame, textvariable=self.iface_var,
+                                       values=iface_labels, state='readonly', width=40)
+            iface_combo.grid(row=1, column=0, columnspan=2, sticky='w', padx=(10, 0), pady=(0, 5))
+            ttk.Label(frame, text="Select which NIC is connected to the cameras",
+                     foreground='gray', font=('Helvetica', 8)).grid(
+                row=2, column=0, columnspan=2, sticky='w', padx=(10, 0))
+            sep_row = 3
+        else:
+            self.iface_var = tk.StringVar(value='')
+            sep_row = 0
+
+        # Separator before discovery
+        ttk.Separator(frame, orient='horizontal').grid(
+            row=sep_row, column=0, columnspan=2, sticky='ew', pady=8)
+
         # Discovery method section
+        base_row = sep_row + 1
         ttk.Label(frame, text="Camera Discovery Method:", font=('Helvetica', 10, 'bold')).grid(
-            row=0, column=0, columnspan=2, sticky='w', pady=(0, 5))
-        
+            row=base_row, column=0, columnspan=2, sticky='w', pady=(0, 5))
+
         self.discovery_var = tk.StringVar(value='both')
-        
+        r = base_row + 1  # running row counter
+
         # DHCP/mDNS only (for firmware 12.0+ link-local cameras)
         ttk.Radiobutton(frame, text="DHCP/mDNS only (firmware 12.0+ link-local)",
             variable=self.discovery_var, value='mdns',
-            command=self._update_ip_state).grid(row=1, column=0, columnspan=2, sticky='w', padx=(10, 0))
+            command=self._update_ip_state).grid(row=r, column=0, columnspan=2, sticky='w', padx=(10, 0))
+        r += 1
 
         # Factory IP only (legacy)
         ttk.Radiobutton(frame, text="Factory IP only",
             variable=self.discovery_var, value='factory',
-            command=self._update_ip_state).grid(row=2, column=0, columnspan=2, sticky='w', padx=(10, 0))
+            command=self._update_ip_state).grid(row=r, column=0, columnspan=2, sticky='w', padx=(10, 0))
+        r += 1
 
         # Both (recommended)
         ttk.Radiobutton(frame, text="Both DHCP/mDNS + Factory IP (recommended)",
             variable=self.discovery_var, value='both',
-            command=self._update_ip_state).grid(row=3, column=0, columnspan=2, sticky='w', padx=(10, 0))
-        
+            command=self._update_ip_state).grid(row=r, column=0, columnspan=2, sticky='w', padx=(10, 0))
+        r += 1
+
         # Factory IP entry
         self.ip_label = ttk.Label(frame, text="Factory Default IP:", font=('Helvetica', 10))
-        self.ip_label.grid(row=4, column=0, sticky='w', pady=(10, 5))
+        self.ip_label.grid(row=r, column=0, sticky='w', pady=(10, 5))
         self.ip_entry = ttk.Entry(frame, width=20)
         self.ip_entry.insert(0, factory_ip)
-        self.ip_entry.grid(row=4, column=1, sticky='w', pady=(10, 5), padx=(10, 0))
-        
+        self.ip_entry.grid(row=r, column=1, sticky='w', pady=(10, 5), padx=(10, 0))
+        r += 1
+
         # Separator
         ttk.Separator(frame, orient='horizontal').grid(
-            row=5, column=0, columnspan=2, sticky='ew', pady=10)
-        
+            row=r, column=0, columnspan=2, sticky='ew', pady=10)
+        r += 1
+
         # Hostname checkbox
         self.hostname_var = tk.BooleanVar(value=False)
-        self.hostname_check = ttk.Checkbutton(frame, 
-            text="Change network hostname", 
+        self.hostname_check = ttk.Checkbutton(frame,
+            text="Change network hostname",
             variable=self.hostname_var)
-        self.hostname_check.grid(row=6, column=0, columnspan=2, sticky='w', pady=2)
+        self.hostname_check.grid(row=r, column=0, columnspan=2, sticky='w', pady=2)
+        r += 1
         ttk.Label(frame, text="Sets hostname to <number>-<brand>-<serial> (lowercase)",
                  foreground='gray', font=('Helvetica', 8)).grid(
-            row=7, column=0, columnspan=2, sticky='w', padx=(22, 0))
-        
+            row=r, column=0, columnspan=2, sticky='w', padx=(22, 0))
+        r += 1
+
+        # Additional users checkbox
+        self.additional_users_var = tk.BooleanVar(value=False)
+        user_label = f"Create additional users ({additional_users_count} defined)"
+        if additional_users_count == 0:
+            user_label = "Create additional users (none defined)"
+        self.additional_users_check = ttk.Checkbutton(frame,
+            text=user_label,
+            variable=self.additional_users_var)
+        self.additional_users_check.grid(row=r, column=0, columnspan=2, sticky='w', pady=2)
+        if additional_users_count == 0:
+            self.additional_users_check.configure(state='disabled')
+        r += 1
+        ttk.Label(frame, text="Add users in the Passwords tab before programming",
+                 foreground='gray', font=('Helvetica', 8)).grid(
+            row=r, column=0, columnspan=2, sticky='w', padx=(22, 0))
+        r += 1
+
         # Buttons
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=8, column=0, columnspan=2, pady=(15, 0))
+        btn_frame.grid(row=r, column=0, columnspan=2, pady=(15, 0))
         ttk.Button(btn_frame, text="Start Programming", command=self.ok).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=self.cancel).pack(side=tk.LEFT, padx=5)
         
@@ -2352,6 +3363,8 @@ class ProgramOptionsDialog(tk.Toplevel):
         self.ip_entry.focus_set()
         self.bind("<Return>", lambda e: self.ok())
         self.bind("<Escape>", lambda e: self.cancel())
+        # Center on parent after content is laid out (auto-size: width=0, height=0)
+        _center_on_parent(self, parent, 0, 0)
         self.wait_window(self)
     
     def _update_ip_state(self):
@@ -2372,14 +3385,82 @@ class ProgramOptionsDialog(tk.Toplevel):
             messagebox.showwarning("Required", "Factory IP is required for this mode", parent=self)
             return
         
+        # Resolve selected interface
+        selected_iface = None
+        iface_selection = self.iface_var.get()
+        if iface_selection and iface_selection != 'Auto-detect (default)':
+            for iface in self._interfaces:
+                if iface['label'] == iface_selection:
+                    selected_iface = iface
+                    break
+
         self.result = {
             'factory_ip': ip if discovery != 'mdns' else None,
             'discovery_mode': discovery,  # 'mdns', 'factory', or 'both'
-            'set_hostname': self.hostname_var.get()
+            'set_hostname': self.hostname_var.get(),
+            'add_additional_users': self.additional_users_var.get(),
+            'interface': selected_iface,  # {'ip': ..., 'index': ..., 'label': ...} or None
         }
         self.destroy()
     
     def cancel(self):
+        self.destroy()
+
+
+# ============================================================================
+# BRAND SELECTION DIALOG
+# ============================================================================
+class BrandSelectionDialog(tk.Toplevel):
+    """Modal dialog to select camera brand. Shown on first run or when switching."""
+    def __init__(self, parent, current_brand='axis'):
+        super().__init__(parent)
+        self.title("Select Camera Brand")
+        self.result = None
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+
+        _center_on_parent(self, parent, 500, 350)
+
+        frame = ttk.Frame(self, padding="25")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Select Camera Brand",
+                 font=('Helvetica', 16, 'bold')).pack(pady=(0, 5))
+        ttk.Label(frame, text="All operations will use this brand's protocol.\nSwitch brands anytime from the brand bar.",
+                 font=('Helvetica', 10), foreground='gray', justify=tk.CENTER).pack(pady=(0, 15))
+
+        self.brand_var = tk.StringVar(value=current_brand)
+
+        brands = [
+            ('axis', 'Axis', 'VAPIX/ONVIF  •  Factory IP: 192.168.0.90  •  User: root'),
+            ('bosch', 'Bosch', 'RCP-over-HTTP  •  Factory IP: 192.168.0.1  •  User: service'),
+            ('hanwha', 'Hanwha / Wisenet', 'STW-CGI/Sunapi  •  Factory IP: 192.168.1.100  •  User: admin'),
+        ]
+
+        for key, name, desc in brands:
+            btn_frame = ttk.Frame(frame)
+            btn_frame.pack(fill=tk.X, pady=4)
+            rb = ttk.Radiobutton(btn_frame, text=name, variable=self.brand_var, value=key,
+                                style='Toolbutton')
+            rb.pack(side=tk.LEFT, padx=(10, 0))
+            ttk.Label(btn_frame, text=desc, foreground='gray',
+                     font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(15, 0))
+
+        # Buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=(20, 0))
+        ok_btn = tk.Button(btn_frame, text="Select Brand", command=self.ok,
+                          bg='#4CAF50', fg='white', font=('Helvetica', 11, 'bold'),
+                          padx=20, pady=5)
+        ok_btn.pack(side=tk.LEFT, padx=5)
+
+        self.bind("<Return>", lambda e: self.ok())
+        self.protocol("WM_DELETE_WINDOW", self.ok)
+        self.wait_window(self)
+
+    def ok(self):
+        self.result = self.brand_var.get()
         self.destroy()
 
 
@@ -2396,11 +3477,11 @@ class CameraEditorDialog(tk.Toplevel):
         self.settings = settings
         self.transient(parent)
         self.grab_set()
-        self.geometry(f"550x500+{parent.winfo_rootx()+50}+{parent.winfo_rooty()+50}")
-        
+        _center_on_parent(self, parent, 550, 500)
+
         frame = ttk.Frame(self, padding="25")
         frame.pack(fill=tk.BOTH, expand=True)
-        
+
         self.entries = {}
         row = 0
 
@@ -2579,7 +3660,7 @@ class CameraEditorDialog(tk.Toplevel):
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
-class AxisToolkitApp:
+class CCTVToolkitApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"CCTV IP Toolkit v{APP_VERSION} - Brian Preston")
@@ -2611,7 +3692,14 @@ class AxisToolkitApp:
         self.settings = SettingsManager()
         self.camera_data = CameraDataManager()
         self.password_data = PasswordDataManager()
-        
+        self.additional_users_data = AdditionalUsersDataManager()
+
+        # Initialize protocol from saved brand
+        saved_brand = self.settings.get('general', 'brand')
+        if saved_brand not in PROTOCOLS:
+            saved_brand = 'axis'
+        self.protocol = PROTOCOLS[saved_brand]()
+
         self.log_queue = queue.Queue()
         self.cancel_flag = False
         self.preview_image = None
@@ -2628,6 +3716,14 @@ class AxisToolkitApp:
         # Check for first run
         if self.settings.get_bool('general', 'first_run'):
             self.show_welcome()
+            # Show brand selection on first run
+            dialog = BrandSelectionDialog(self.root, self.protocol.BRAND_KEY)
+            if dialog.result:
+                self.protocol = PROTOCOLS[dialog.result]()
+                self.brand_var.set(dialog.result)
+                self.settings.set('general', 'brand', dialog.result)
+                self.factory_ip_label.config(
+                    text=f"Factory IP: {self.protocol.FACTORY_IP}  |  User: {self.protocol.DEFAULT_USER}")
             self.settings.set('general', 'first_run', 'false')
         
         self.process_log_queue()
@@ -2660,6 +3756,25 @@ class AxisToolkitApp:
         help_menu.add_command(label="Report Issues", command=lambda: __import__('webbrowser').open('mailto:axisprogrammer@thelostping.net'))
     
     def create_main_ui(self):
+        # Brand selection bar (always visible above tabs)
+        self.brand_bar = ttk.Frame(self.root)
+        self.brand_bar.pack(fill=tk.X, padx=10, pady=(5, 0))
+
+        ttk.Label(self.brand_bar, text="BRAND:", font=('Helvetica', 10, 'bold')).pack(side=tk.LEFT)
+
+        self.brand_var = tk.StringVar(value=self.protocol.BRAND_KEY)
+        for key, name in [('axis', 'Axis'), ('bosch', 'Bosch'), ('hanwha', 'Hanwha')]:
+            rb = ttk.Radiobutton(self.brand_bar, text=name, variable=self.brand_var,
+                                value=key, command=self._on_brand_change)
+            rb.pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Separator(self.brand_bar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=15)
+
+        self.factory_ip_label = ttk.Label(self.brand_bar,
+            text=f"Factory IP: {self.protocol.FACTORY_IP}  |  User: {self.protocol.DEFAULT_USER}",
+            font=('Courier', 9), foreground='#666666')
+        self.factory_ip_label.pack(side=tk.LEFT)
+
         # Main container with notebook (tabs)
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -2688,7 +3803,23 @@ class AxisToolkitApp:
         self.log_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.log_tab, text="📊 Log & Results")
         self.create_log_tab()
-    
+
+    def _on_brand_change(self):
+        """Handle brand radio button change."""
+        new_brand = self.brand_var.get()
+        if new_brand not in PROTOCOLS:
+            return
+        self.protocol = PROTOCOLS[new_brand]()
+        self.settings.set('general', 'brand', new_brand)
+        self.factory_ip_label.config(
+            text=f"Factory IP: {self.protocol.FACTORY_IP}  |  User: {self.protocol.DEFAULT_USER}")
+        # Clear discovered list (different brand = different cameras)
+        self.discovered_cameras = []
+        self.refresh_discovered_list()
+        self.log(f"Switched to {self.protocol.BRAND_NAME} protocol")
+        # Restart background scan for new brand
+        self.root.after(1000, lambda: self.background_scan(force=True, quiet=False))
+
     def create_cameras_tab(self):
         """Camera list editor tab"""
         self.cameras_frame = ttk.Frame(self.cameras_tab, padding="10")
@@ -2940,16 +4071,7 @@ class AxisToolkitApp:
             if is_linklocal:
                 display_ip = f"{cam_ip} [LL]"
 
-            # Show brand prefix for Bosch cameras
             display_model = cam.get('model', '')
-            is_bosch = cam.get('brand') == 'bosch'
-            if is_bosch and display_model and not display_model.startswith('[Bosch]'):
-                display_model = f"[Bosch] {display_model}"
-            # Override tag for Bosch cameras
-            if is_bosch and tag == 'new_cam':
-                tag = 'bosch_new'
-            elif is_bosch and tag == 'on_list':
-                tag = 'bosch'
 
             self.discovered_tree.insert('', 'end', values=(
                 display_ip,
@@ -3121,17 +4243,22 @@ class AxisToolkitApp:
             pass
 
     def create_passwords_tab(self):
-        """Password list editor tab"""
-        frame = ttk.Frame(self.passwords_tab, padding="10")
-        frame.pack(fill=tk.BOTH, expand=True)
-        
+        """Password list editor tab + additional users section"""
+        # Top/bottom split: passwords on top, additional users on bottom
+        outer_split = ttk.PanedWindow(self.passwords_tab, orient=tk.VERTICAL)
+        outer_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # ---- TOP: Password List ----
+        frame = ttk.Frame(outer_split)
+        outer_split.add(frame, weight=3)
+
         # Header
         header = ttk.Frame(frame)
         header.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(header, text="Password List", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT)
-        ttk.Label(header, text="  •  Used for batch password testing to find unknown camera passwords", 
+        ttk.Label(header, text="  •  Used for batch password testing to find unknown camera passwords",
                  font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
-        
+
         # Split view: list on left, add on right
         split = ttk.PanedWindow(frame, orient=tk.HORIZONTAL)
         split.pack(fill=tk.BOTH, expand=True)
@@ -3200,7 +4327,57 @@ class AxisToolkitApp:
         ttk.Label(left_frame, textvariable=self.password_status, font=('Helvetica', 10)).pack(anchor=tk.W, pady=(5, 0))
         
         self.refresh_password_list()
-    
+
+        # ---- BOTTOM: Additional Users ----
+        users_frame = ttk.LabelFrame(outer_split, text="Additional Users  •  Created on each camera during programming",
+                                     padding="10")
+        outer_split.add(users_frame, weight=2)
+
+        # Users treeview
+        users_top = ttk.Frame(users_frame)
+        users_top.pack(fill=tk.BOTH, expand=True)
+
+        cols = ('username', 'password', 'role')
+        self.users_tree = ttk.Treeview(users_top, columns=cols, show='headings', height=5)
+        self.users_tree.heading('username', text='Username')
+        self.users_tree.heading('password', text='Password')
+        self.users_tree.heading('role', text='Role')
+        self.users_tree.column('username', width=150)
+        self.users_tree.column('password', width=150)
+        self.users_tree.column('role', width=120)
+        users_scroll = ttk.Scrollbar(users_top, orient=tk.VERTICAL, command=self.users_tree.yview)
+        self.users_tree.configure(yscrollcommand=users_scroll.set)
+        self.users_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        users_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Add/remove controls
+        users_controls = ttk.Frame(users_frame)
+        users_controls.pack(fill=tk.X, pady=(8, 0))
+
+        ttk.Label(users_controls, text="Username:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_name_var = tk.StringVar()
+        ttk.Entry(users_controls, textvariable=self.new_user_name_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(users_controls, text="Password:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_pwd_var = tk.StringVar()
+        ttk.Entry(users_controls, textvariable=self.new_user_pwd_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(users_controls, text="Role:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_role_var = tk.StringVar(value='Operator')
+        role_combo = ttk.Combobox(users_controls, textvariable=self.new_user_role_var,
+                                  values=AdditionalUsersDataManager.ROLES, state='readonly', width=12)
+        role_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(users_controls, text="Add User", command=self.add_additional_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(users_controls, text="Delete Selected", command=self.delete_additional_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(users_controls, text="Clear All", command=self.clear_additional_users).pack(side=tk.LEFT, padx=3)
+
+        self.additional_users_status = tk.StringVar(value="0 additional users")
+        ttk.Label(users_controls, textvariable=self.additional_users_status,
+                 font=('Helvetica', 9), foreground='gray').pack(side=tk.RIGHT)
+
+        self.refresh_additional_users_list()
+
     def create_operations_tab(self):
         """Operations tab with big buttons and wizards"""
         frame = ttk.Frame(self.operations_tab, padding="20")
@@ -3386,8 +4563,7 @@ class AxisToolkitApp:
                     missing.append("Subnet")
                 status = f"⚠ Need {', '.join(missing)}"
             display_model = cam.get('model', '')
-            if cam.get('brand') == 'bosch' and display_model and not display_model.startswith('[Bosch]'):
-                display_model = f"[Bosch] {display_model}"
+            pass  # Brand is global — no per-camera prefix needed
             self.camera_tree.insert('', 'end', iid=str(i), values=(
                 cam.get('name', ''), cam.get('hostname', ''), cam.get('ip', ''), cam.get('mac', ''),
                 cam.get('gateway', ''), cam.get('subnet', ''), display_model,
@@ -3527,84 +4703,19 @@ class AxisToolkitApp:
         self.log(f"\n⚠️ FACTORY DEFAULTING: {cam_name} ({cam_ip})")
         
         def run():
-            username = self.settings.get('general', 'username')
             success = False
-            cam_brand = cam.get('brand') or detect_brand_from_mac(cam.get('mac', ''))
 
-            if cam_brand == 'bosch':
-                # Bosch factory reset via RCP
-                self.log("  Sending Bosch factory reset via RCP...")
-                try:
-                    if self.bosch_factory_reset(cam_ip, password):
-                        success = True
-                        self.log("  ✓ Factory reset command accepted (RCP)")
-                except requests.exceptions.Timeout:
+            self.log(f"  Sending {self.protocol.BRAND_NAME} factory reset...")
+            try:
+                if self.protocol.factory_reset(cam_ip, password):
                     success = True
-                    self.log("  ✓ Camera stopped responding (likely rebooting)")
-                except Exception as e:
-                    self.log(f"  RCP factory reset failed: {e}")
-            else:
-                # Axis: 3-method cascade
-                # Method 1: firmwaremanagement API (modern Axis cameras)
-                try:
-                    self.log("  Trying firmwaremanagement API...")
-                    r = requests.post(f"http://{cam_ip}/axis-cgi/firmwaremanagement.cgi",
-                        json={
-                            "apiVersion": "1.0",
-                            "method": "factoryDefault",
-                            "params": {"mode": "hard"}
-                        },
-                        auth=HTTPDigestAuth(username, password),
-                        timeout=10)
-                    if r.status_code == 200:
-                        try:
-                            data = r.json()
-                            if 'error' not in data:
-                                success = True
-                                self.log("  ✓ Factory default command accepted (firmwaremanagement)")
-                        except:
-                            if 'error' not in r.text.lower():
-                                success = True
-                                self.log("  ✓ Factory default command accepted")
-                except requests.exceptions.Timeout:
-                    success = True
-                    self.log("  ✓ Camera stopped responding (likely rebooting)")
-                except Exception as e:
-                    self.log(f"  firmwaremanagement API failed: {e}")
+                    self.log(f"  ✓ Factory reset command accepted")
+            except requests.exceptions.Timeout:
+                success = True
+                self.log("  ✓ Camera stopped responding (likely rebooting)")
+            except Exception as e:
+                self.log(f"  Factory reset failed: {e}")
 
-                # Method 2: Legacy hardfactorydefault.cgi
-                if not success:
-                    try:
-                        self.log("  Trying legacy hardfactorydefault.cgi...")
-                        r = requests.get(f"http://{cam_ip}/axis-cgi/hardfactorydefault.cgi",
-                            auth=HTTPDigestAuth(username, password),
-                            timeout=10)
-                        if r.status_code == 200:
-                            success = True
-                            self.log("  ✓ Factory default command accepted (legacy)")
-                    except requests.exceptions.Timeout:
-                        success = True
-                        self.log("  ✓ Camera stopped responding (likely rebooting)")
-                    except Exception as e:
-                        self.log(f"  Legacy API failed: {e}")
-
-                # Method 3: hardFactoryDefault param
-                if not success:
-                    try:
-                        self.log("  Trying param.cgi hardFactoryDefault...")
-                        r = requests.get(f"http://{cam_ip}/axis-cgi/param.cgi",
-                            params={"action": "update", "System.HardFactoryDefault": "yes"},
-                            auth=HTTPDigestAuth(username, password),
-                            timeout=10)
-                        if r.status_code == 200:
-                            success = True
-                            self.log("  ✓ Factory default command accepted (param.cgi)")
-                    except requests.exceptions.Timeout:
-                        success = True
-                        self.log("  ✓ Camera stopped responding (likely rebooting)")
-                    except Exception as e:
-                        self.log(f"  param.cgi failed: {e}")
-            
             if success:
                 self.log(f"\n  Camera is rebooting to factory defaults.")
                 self.log(f"  This takes 2-5 minutes. Camera will come back at factory IP.")
@@ -3997,14 +5108,12 @@ class AxisToolkitApp:
         if not quiet and not discovered_cameras:
             self.log("    No cameras found in Phase 1")
 
-        # If we found link-local cameras, add route so we can reach them via HTTP
+        # If we found link-local cameras, try targeted mDNS to resolve IPs
+        # NOTE: do NOT add link-local route here — that modifies network adapters
+        # and should only happen during programming when the user explicitly chooses
         has_linklocal = any(c.get('ip', '').startswith('169.254.') for c in discovered_cameras.values())
         has_dhcp_only = any(not c.get('ip') for c in discovered_cameras.values())
         if has_linklocal or has_dhcp_only:
-            if not quiet:
-                self.log("  Link-local camera(s) detected — adding route...")
-            self.add_linklocal_route()
-
             # Phase 1c: Targeted mDNS on correct interface for DHCP-only cameras
             # This resolves IPs that regular mDNS missed (multi-adapter issue)
             if has_dhcp_only and getattr(self, '_linklocal_route_active', False):
@@ -4104,89 +5213,35 @@ class AxisToolkitApp:
                     cam['dhcp'] = 'Yes' if val.lower() == 'dhcp' else 'No'
         
         def check_camera(ip):
-            """Detect Axis or Bosch camera and try to get its real network config"""
-            cam = None
+            """Detect camera of the selected brand and get its network config"""
+            # Step 1: Protocol-based detection (no auth)
+            cam = self.protocol.get_discovery_info(ip, timeout=2)
 
-            # Step 1: Detect camera - try Axis APIs without auth first
-            try:
-                r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
-                    json={"apiVersion": "1.0", "method": "getAllProperties"},
-                    timeout=1)
-                if r.status_code == 200:
-                    data = r.json()
-                    if 'data' in data and 'propertyList' in data['data']:
-                        props = data['data']['propertyList']
-                        model = props.get('ProdFullName', props.get('ProdShortName', ''))
-                        cam = {
-                            'ip': ip,
-                            'model': model,
-                            'serial': props.get('SerialNumber', ''),
-                            'brand': 'axis',
-                        }
-                elif r.status_code == 401:
-                    # Try with passwords
-                    for pwd in passwords_to_try[:8]:
-                        try:
-                            r2 = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
-                                json={"apiVersion": "1.0", "method": "getAllProperties"},
-                                auth=HTTPDigestAuth("root", pwd), timeout=1.5)
-                            if r2.status_code == 200:
-                                data = r2.json()
-                                if 'data' in data and 'propertyList' in data['data']:
-                                    props = data['data']['propertyList']
-                                    model = props.get('ProdFullName', props.get('ProdShortName', ''))
-                                    cam = {
-                                        'ip': ip,
-                                        'model': model,
-                                        'serial': props.get('SerialNumber', ''),
-                                        'brand': 'axis',
-                                        '_auth_pwd': pwd  # Remember which password worked
-                                    }
-                                    break
-                            elif r2.status_code == 401:
-                                continue
-                        except:
+            # Step 1b: If auth required, try known passwords for more details
+            if cam and cam.get('model') == '(Auth Required)' and passwords_to_try:
+                username = self.protocol.DEFAULT_USER
+                max_attempts = 2 if self.protocol.BRAND_KEY == 'hanwha' else 8
+                for pwd in passwords_to_try[:max_attempts]:
+                    try:
+                        if self.protocol.test_password(ip, username, pwd):
+                            model = self.protocol.get_model_noauth(ip)
+                            if model:
+                                cam['model'] = model
+                            serial = self.protocol.get_serial(ip, pwd)
+                            if serial and serial != 'UNKNOWN':
+                                cam['serial'] = serial
+                            cam['_auth_pwd'] = pwd
                             break
-            except:
-                pass
-
-            # Step 1b: Try Bosch detection if not found as Axis
-            if not cam:
-                try:
-                    bosch_info = BoschRCP.get_device_info(ip, timeout=2)
-                    if bosch_info:
-                        bosch_net = BoschRCP.get_network_config(ip, timeout=2)
-                        cam = {
-                            'ip': ip,
-                            'model': bosch_info.get('model', ''),
-                            'serial': '',
-                            'brand': 'bosch',
-                        }
-                        if bosch_net.get('mac'):
-                            cam['mac'] = bosch_net['mac']
-                            cam['serial'] = bosch_net['mac'].replace(':', '')
-                        if bosch_net.get('subnet'):
-                            cam['subnet'] = bosch_net['subnet']
-                        if bosch_net.get('gateway') and bosch_net['gateway'] != '0.0.0.0':
-                            cam['gateway'] = bosch_net['gateway']
-                        if bosch_net.get('dhcp'):
-                            cam['dhcp'] = bosch_net['dhcp']
-                except:
-                    pass
-
-            if not cam:
-                try:
-                    r = requests.get(f"http://{ip}/axis-cgi/jpg/image.cgi", timeout=0.5)
-                    if r.status_code == 401:
-                        cam = {'ip': ip, 'model': '(Auth Required)', 'brand': 'axis'}
-                except:
-                    pass
+                    except LockoutError:
+                        break
+                    except:
+                        continue
 
             if not cam:
                 return None
-            
-            # Step 2: Try to get network config (Axis via param.cgi, Bosch already done)
-            if cam.get('brand') != 'bosch':
+
+            # Step 2: Axis-specific network config via param.cgi
+            if self.protocol.BRAND_KEY == 'axis':
                 try:
                     r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                         params={"action": "list", "group": "Network"},
@@ -4205,7 +5260,6 @@ class AxisToolkitApp:
                     pass
 
                 if not cam.get('subnet') or not cam.get('hostname'):
-                    # Try the password that worked for basicdeviceinfo first
                     pwds_to_check = []
                     if cam.get('_auth_pwd'):
                         pwds_to_check.append(cam['_auth_pwd'])
@@ -4233,18 +5287,18 @@ class AxisToolkitApp:
                                 continue
                         except:
                             break
-            
+
             # Clean up internal tracking field
             if '_auth_pwd' in cam:
                 del cam['_auth_pwd']
-            
+
             # Set camera name from hostname
             cam['name'] = cam.get('hostname', cam['ip'])
-            
+
             # MAC from serial
             if cam.get('serial') and len(cam['serial']) == 12 and not cam.get('mac'):
                 cam['mac'] = ':'.join(cam['serial'][i:i+2] for i in range(0, 12, 2))
-            
+
             return cam
         
         def do_scan():
@@ -5210,7 +6264,48 @@ class AxisToolkitApp:
         if messagebox.askyesno("Confirm", "Delete ALL passwords from the list?"):
             self.password_data.clear()
             self.refresh_password_list()
-    
+
+    # ========================================================================
+    # ADDITIONAL USERS MANAGEMENT
+    # ========================================================================
+    def refresh_additional_users_list(self):
+        for item in self.users_tree.get_children():
+            self.users_tree.delete(item)
+        users = self.additional_users_data.get_all()
+        for u in users:
+            self.users_tree.insert('', tk.END, values=(u['username'], u['password'], u['role']))
+        self.additional_users_status.set(f"{len(users)} additional user{'s' if len(users) != 1 else ''}")
+
+    def add_additional_user(self):
+        name = self.new_user_name_var.get().strip()
+        pwd = self.new_user_pwd_var.get().strip()
+        role = self.new_user_role_var.get()
+        if not name:
+            messagebox.showwarning("Required", "Username is required.")
+            return
+        if not pwd:
+            messagebox.showwarning("Required", "Password is required.")
+            return
+        if self.additional_users_data.add(name, pwd, role):
+            self.new_user_name_var.set("")
+            self.new_user_pwd_var.set("")
+            self.refresh_additional_users_list()
+            self.log(f"Added additional user: {name} ({role})")
+        else:
+            messagebox.showwarning("Duplicate", f"User '{name}' already exists.")
+
+    def delete_additional_user(self):
+        selected = self.users_tree.selection()
+        if selected:
+            idx = self.users_tree.index(selected[0])
+            self.additional_users_data.delete(idx)
+            self.refresh_additional_users_list()
+
+    def clear_additional_users(self):
+        if messagebox.askyesno("Confirm", "Delete ALL additional users?"):
+            self.additional_users_data.clear()
+            self.refresh_additional_users_list()
+
     # ========================================================================
     # LOGGING
     # ========================================================================
@@ -5473,8 +6568,6 @@ https://buymeacoffee.com/thelostping""")
         
         settings_entries = {}
         defaults = [
-            ('Factory IP (Axis):', 'factory_ip'),
-            ('Factory IP (Bosch):', 'bosch_factory_ip'),
             ('Username:', 'username'),
         ]
         
@@ -5596,7 +6689,8 @@ https://buymeacoffee.com/thelostping""")
                 "3. Verify model matches (if specified)\n"
                 "4. Create system user with your password\n"
                 "5. Set static IP and disable DHCP\n"
-                "6. Capture serial/MAC after programming\n\n"
+                "6. Capture serial/MAC after programming\n"
+                "7. Optionally create additional users\n\n"
                 "Supports factory default IPs and link-local cameras.\n"
                 "Multiple cameras can be connected simultaneously\n"
                 "- each programmed one at a time.",
@@ -5616,22 +6710,31 @@ https://buymeacoffee.com/thelostping""")
             return
         
         # Get factory IP and hostname option
-        prog_opts = ProgramOptionsDialog(self.root, 
-            factory_ip=self.settings.get('general', 'factory_ip'))
+        prog_opts = ProgramOptionsDialog(self.root,
+            factory_ip=self.protocol.FACTORY_IP,
+            additional_users_count=len(self.additional_users_data.get_all()))
         if not prog_opts.result:
             return
         factory_ip = prog_opts.result['factory_ip']
         discovery_mode = prog_opts.result.get('discovery_mode', 'both')
         set_hostname = prog_opts.result['set_hostname']
-        
+        add_additional_users = prog_opts.result.get('add_additional_users', False)
+        selected_iface = prog_opts.result.get('interface')
+
+        # Override detected interface if user selected one — persist in settings
+        if selected_iface:
+            self._detected_iface_index = selected_iface['index']
+            self._detected_local_ip = selected_iface['ip']
+            self.settings.set('general', 'interface_index', str(selected_iface['index']))
+            self.log(f"Using interface: {selected_iface['label']}")
+
         # Start programming
         self.notebook.select(self.log_tab)  # Switch to log tab
         self.cancel_flag = False
         self.enable_cancel(True)
-        
+
         def run():
-            username = self.settings.get('general', 'username')
-            bosch_default_ip = self.settings.get('general', 'bosch_factory_ip') or BOSCH_DEFAULT_IP
+            username = self.protocol.DEFAULT_USER
             total_ok = total_fail = 0
             
             if not os.path.exists(OUTPUT_CSV):
@@ -5675,17 +6778,11 @@ https://buymeacoffee.com/thelostping""")
 
                 # Wait for a camera based on discovery mode
                 while not self.cancel_flag:
-                    # Try factory default IPs if enabled (fast 1s ping — local LAN)
+                    # Try factory default IP if enabled (fast 1s ping — local LAN)
                     if discovery_mode in ('factory', 'both'):
-                        factory_ips = [factory_ip]
-                        if bosch_default_ip != factory_ip:
-                            factory_ips.append(bosch_default_ip)
-                        for try_ip in factory_ips:
-                            if try_ip and self.ping_camera(try_ip, timeout_ms=1000):
-                                camera_ip = try_ip
-                                self.log(f"Camera found at {try_ip}")
-                                break
-                        if camera_ip:
+                        if factory_ip and self.ping_camera(factory_ip, timeout_ms=1000):
+                            camera_ip = factory_ip
+                            self.log(f"Camera found at {factory_ip}")
                             break
 
                     if discovery_mode in ('mdns', 'both'):
@@ -5700,7 +6797,7 @@ https://buymeacoffee.com/thelostping""")
                                 dc_mac = dc.get('mac', '').upper().replace(':', '').replace('-', '')
                                 if dc_mac and dc_mac not in seen_macs:
                                     dhcp_found_mac = dc.get('mac', '')
-                                    dhcp_found_brand = dc.get('brand', detect_brand_from_mac(dhcp_found_mac))
+                                    dhcp_found_brand = dc.get('brand', self.protocol.BRAND_KEY)
                                     self.log(f"Camera detected via DHCP broadcast:")
                                     self.log(f"  Brand: {dhcp_found_brand} | Model: {dc.get('model', '?')} | MAC: {dc.get('mac', '?')}")
                                     self.add_linklocal_route()
@@ -5708,17 +6805,16 @@ https://buymeacoffee.com/thelostping""")
                         except Exception:
                             pass
 
-                        # Bosch shortcut — try Bosch factory default IP directly
-                        if dhcp_found_mac and dhcp_found_brand == 'bosch' and not camera_ip:
-                            bosch_ip = bosch_default_ip
+                        # Brand shortcut — try factory IP for DHCP-discovered camera
+                        if dhcp_found_mac and not camera_ip:
                             try:
-                                if self.ping_camera(bosch_ip, timeout_ms=1000):
-                                    bosch_info = BoschRCP.get_device_info(bosch_ip, timeout=2)
-                                    if bosch_info:
-                                        camera_ip = bosch_ip
+                                if self.ping_camera(factory_ip, timeout_ms=1000):
+                                    info = self.protocol.get_discovery_info(factory_ip, timeout=2)
+                                    if info:
+                                        camera_ip = factory_ip
                                         pinned_mac = dhcp_found_mac
-                                        self.log(f"Bosch camera found at {bosch_ip}")
-                                        self.log(f"  Model: {bosch_info.get('model', '?')}")
+                                        self.log(f"Camera found at {factory_ip}")
+                                        self.log(f"  Model: {info.get('model', '?')}")
                                         break
                             except Exception:
                                 pass
@@ -5791,7 +6887,7 @@ https://buymeacoffee.com/thelostping""")
                     self.log("Camera detected! (could not read MAC from ARP table)")
                 
                 # Query the camera's actual model
-                actual_model = self.get_model_noauth(camera_ip)
+                actual_model = self.protocol.get_model_noauth(camera_ip)
                 if actual_model:
                     self.log(f"Camera model: {actual_model}")
                 else:
@@ -5872,185 +6968,184 @@ https://buymeacoffee.com/thelostping""")
                 if expected_model:
                     self.log(f"Model match: expected {expected_model}, got {actual_model} ✓")
                 
-                # Detect camera brand for branching
-                cam_brand = cam.get('brand') or detect_brand_from_mac(pinned_mac)
-                # Factory-fresh Bosch cameras use service:service — NOT the user's desired password
-                bosch_pw = 'service' if cam_brand == 'bosch' else password
+                # Program via protocol — brand-agnostic steps
+                # Network change MUST be last — after that the camera may be unreachable
+                cam['_program_ip'] = camera_ip  # Tell protocol which IP to program from
+                steps = self.protocol.get_programming_steps(cam, password)
 
-                if cam_brand == 'bosch':
-                    self.log("[1/3] Setting password via RCP...")
-                    if self.bosch_set_password(camera_ip, bosch_pw, password):
-                        self.log("      ✓ Password set.")
+                # Split: auth steps first, network change last
+                # Convention: "Setting gateway" / "Setting network" / "Setting password" are
+                # identified by looking for network-change keywords
+                network_keywords = ('gateway', 'network', 'ip', 'dhcp')
+                auth_steps = []
+                network_steps = []
+                for desc, fn in steps:
+                    desc_lower = desc.lower()
+                    if any(kw in desc_lower for kw in network_keywords):
+                        network_steps.append((desc, fn))
                     else:
-                        self.log("      ✗ Password failed")
-                        errors.append("password")
+                        auth_steps.append((desc, fn))
 
-                    # Use new password for remaining commands (if password change succeeded)
-                    bosch_auth_pw = password if 'password' not in errors else bosch_pw
+                # Phase 1: Auth steps (create user, set password)
+                total_steps = len(auth_steps) + len(network_steps)
+                extra_count = 0
+                if add_additional_users and self.additional_users_data.get_all():
+                    extra_count += len(self.additional_users_data.get_all())
+                if set_hostname:
+                    extra_count += 1
+                total_steps += extra_count
+                step_num = 0
 
-                    self.log("[2/3] Setting network via RCP...")
-                    if self.bosch_set_network(camera_ip, bosch_auth_pw, static_ip, subnet, gateway):
-                        self.log("      ✓ Network config applied.")
+                for desc, step_fn in auth_steps:
+                    step_num += 1
+                    self.log(f"[{step_num}/{total_steps}] {desc}")
+                    if step_fn():
+                        self.log("      ✓ Done.")
                     else:
-                        self.log("      ✗ Network config failed")
-                        errors.append("ip/dhcp")
+                        self.log(f"      ✗ {desc} failed")
+                        errors.append(desc.lower().split()[0])
 
-                    self.log("[3/3] Rebooting camera...")
-                    if self.bosch_reboot(camera_ip, bosch_auth_pw):
-                        self.log("      ✓ Reboot command sent.")
-                    else:
-                        self.log("      ✗ Reboot failed")
-                        errors.append("reboot")
-                else:
-                    # Axis 4-step flow
-                    self.log("[1/4] Creating system user...")
-                    if self.create_system_user(camera_ip, password):
-                        self.log("      ✓ System user created.")
-                    else:
-                        self.log("      ✗ System user failed")
-                        errors.append("user")
+                # Phase 2: Additional users + hostname at CURRENT IP (before network change)
+                if add_additional_users:
+                    extra_users = self.additional_users_data.get_all()
+                    if extra_users:
+                        for eu in extra_users:
+                            step_num += 1
+                            eu_name = eu['username']
+                            eu_pwd = eu['password']
+                            eu_role = eu['role']
+                            self.log(f"[{step_num}/{total_steps}] Creating user '{eu_name}' ({eu_role})")
+                            result = self.protocol.add_user(camera_ip, password, eu_name, eu_pwd, eu_role)
+                            if result:
+                                self.log(f"      ✓ Done.")
+                            else:
+                                self.log(f"      ✗ Failed (may not be supported for {self.protocol.BRAND_NAME})")
+                                errors.append(f"user:{eu_name}")
 
-                    self.log("[2/4] Creating ONVIF user...")
-                    if self.create_onvif_user(camera_ip, password):
-                        self.log("      ✓ ONVIF user created.")
-                    else:
-                        self.log("      ⚠ ONVIF user failed (non-critical)")
+                # Try to get serial while still at factory IP
+                try:
+                    pre_serial = self.protocol.get_serial(camera_ip, password)
+                    if pre_serial and pre_serial != 'UNKNOWN':
+                        cam['serial'] = pre_serial
+                        if len(pre_serial) == 12:
+                            cam['mac'] = ':'.join(pre_serial[j:j+2] for j in range(0, 12, 2))
+                        self.log(f"Serial (pre-network): {pre_serial}")
+                except:
+                    pass
 
-                    self.log("[3/4] Setting gateway...")
-                    if self.set_gateway(camera_ip, password, gateway):
-                        self.log("      ✓ Gateway set.")
+                if set_hostname:
+                    step_num += 1
+                    brand_prefix = self.protocol.BRAND_KEY
+                    cam_number = cam.get('number', str(programmed_count))
+                    s = cam.get('serial', 'unknown')
+                    if s and s != 'UNKNOWN':
+                        hostname = f"{cam_number}-{brand_prefix}-{s.lower()}"
                     else:
-                        self.log("      ✗ Gateway failed")
-                        errors.append("gateway")
+                        hostname = f"{cam_number}-{brand_prefix}-unknown"
+                    self.log(f"[{step_num}/{total_steps}] Setting hostname: {hostname}")
+                    result = self.protocol.set_hostname(camera_ip, password, hostname)
+                    if result:
+                        self.log("      ✓ Done.")
+                        cam['hostname'] = hostname
+                        cam['name'] = hostname
+                    else:
+                        self.log("      ✗ Hostname failed")
+                        errors.append("hostname")
 
-                    self.log("[4/4] Setting IP + Disabling DHCP...")
-                    if self.set_network(camera_ip, password, static_ip, cidr):
-                        self.log("      ✓ IP set, DHCP disabled.")
+                # Phase 3: Network change — LAST (camera may become unreachable)
+                for desc, step_fn in network_steps:
+                    step_num += 1
+                    self.log(f"[{step_num}/{total_steps}] {desc}")
+                    if step_fn():
+                        self.log("      ✓ Done.")
                     else:
-                        self.log("      ✗ Network config failed")
-                        errors.append("ip/dhcp")
-                
+                        self.log(f"      ✗ {desc} failed")
+                        errors.append(desc.lower().split()[0])
+
                 # Track this MAC as programmed and release ARP pin
                 if pinned_mac:
                     seen_macs.add(pinned_mac.upper().replace(':', '').replace('-', ''))
+                    # Always save MAC from ARP immediately
+                    if not cam.get('mac'):
+                        cam['mac'] = pinned_mac
                 self.arp_unpin(camera_ip)
-                
+
                 # Wait for camera to come back at new IP
+                camera_reachable = False
                 self.log(f"Waiting for camera at new IP ({static_ip})...")
+                # Brief delay — camera needs time to apply network changes
+                time.sleep(3)
                 wait_count = 0
-                while not self.ping_camera(static_ip, timeout_ms=1000) and not self.cancel_flag and wait_count < 30:
-                    time.sleep(1)
+                while not self.cancel_flag and wait_count < 45:
+                    if self.ping_camera(static_ip, timeout_ms=2000):
+                        camera_reachable = True
+                        break
                     wait_count += 1
-                
+                    if wait_count % 10 == 0:
+                        self.log(f"  Still waiting... ({wait_count}s)")
+                    time.sleep(1)
+
                 if self.cancel_flag:
                     break
-                
-                if wait_count >= 30:
-                    self.log(f"✗ Camera not responding at {static_ip} after 30s")
+
+                if not camera_reachable:
+                    self.log(f"✗ Camera not responding at {static_ip} after {wait_count}s")
                     errors.append("unreachable")
-                    self._mark_cam_failed(cam, "unreachable at new IP")
-                    total_fail += 1
-                    self.log(f"\n*** CAMERA {cam_name} FAILED ***")
-                    remaining.pop(cam_idx)
-                    
-                    if remaining:
-                        result = [None]
-                        def show_fail():
-                            result[0] = ContinueDialog(self.root, f"Camera {cam_name} FAILED (unreachable)",
-                                                       remaining[0]['name'], remaining[0].get('model', ''), None).result
-                        self.root.after(0, show_fail)
-                        while result[0] is None and not self.cancel_flag:
-                            time.sleep(0.1)
-                        if not result[0]:
-                            self.cancel_flag = True
-                            break
-                    continue
                 else:
-                    self.log(f"Camera online at {static_ip}")
+                    self.log(f"Camera online at {static_ip} (after {wait_count + 3}s)")
                     time.sleep(1)
-                
-                if cam_brand == 'bosch':
-                    serial = self.bosch_get_serial(static_ip)
+
+                # Get serial/MAC if camera is reachable
+                serial = 'UNKNOWN'
+                if camera_reachable:
+                    serial = self.protocol.get_serial(static_ip, password)
+                    self.log(f"Serial: {serial}")
+
+                    if serial and serial != 'UNKNOWN':
+                        cam['serial'] = serial
+                        if len(serial) == 12:
+                            cam['mac'] = ':'.join(serial[j:j+2] for j in range(0, 12, 2))
+                            self.log(f"MAC: {cam['mac']}")
+                    elif pinned_mac:
+                        cam['mac'] = pinned_mac
+                        self.log(f"MAC (from ARP): {pinned_mac}")
                 else:
-                    serial = self.get_serial(static_ip, password)
-                self.log(f"Serial: {serial}")
-                
-                if serial:
-                    cam['serial'] = serial
-                    if len(serial) == 12:
-                        cam['mac'] = ':'.join(serial[j:j+2] for j in range(0, 12, 2))
-                        self.log(f"MAC: {cam['mac']}")
-                elif pinned_mac:
-                    cam['mac'] = pinned_mac
-                    self.log(f"MAC (from ARP): {pinned_mac}")
+                    # Not reachable (different subnet or timed out) — use ARP MAC
+                    if pinned_mac:
+                        cam['mac'] = pinned_mac
+                        mac_clean = pinned_mac.upper().replace(':', '').replace('-', '')
+                        cam['serial'] = mac_clean
+                        self.log(f"MAC (from ARP): {pinned_mac}")
+                        serial = mac_clean
                 
                 # Update model from actual if entry had none
                 if actual_model and not expected_model:
                     cam['model'] = actual_model
-                
-                # Set hostname if enabled
-                if set_hostname:
-                    brand_prefix = 'bosch' if cam_brand == 'bosch' else 'axis'
-                    cam_number = cam.get('number', str(programmed_count))
-                    if serial:
-                        hostname = f"{cam_number}-{brand_prefix}-{serial.lower()}"
-                    else:
-                        hostname = f"{cam_number}-{brand_prefix}-unknown"
 
-                    if cam_brand == 'bosch':
-                        # Bosch: try unit_name RCP, skip if fails (no confirmed API)
-                        self.log(f"Setting hostname: {hostname}")
-                        bosch_auth = (BOSCH_DEFAULT_USER, bosch_pw)
-                        result = BoschRCP.rcp_write(static_ip, RCP_CMD['unit_name'],
-                                                    'P_STRING', hostname, bosch_auth)
-                        if result:
-                            self.log("      ✓ Unit name set.")
-                            cam['hostname'] = hostname
-                            cam['name'] = hostname
-                        else:
-                            self.log("      ⚠ Unit name set skipped (not supported)")
-                            cam['name'] = hostname
-                    else:
-                        self.log(f"Setting hostname: {hostname}")
-                        result = self.set_hostname(static_ip, password, hostname)
-                        if result:
-                            self.log("      ✓ Hostname set.")
-                            cam['hostname'] = hostname
-                            cam['name'] = hostname
-                        else:
-                            self.log("      Hostname failed, retrying in 3s...")
-                            time.sleep(3)
-                            result = self.set_hostname(static_ip, password, hostname)
-                            if result:
-                                self.log("      ✓ Hostname set on retry.")
-                                cam['hostname'] = hostname
-                                cam['name'] = hostname
-                            else:
-                                self.log("      ✗ Hostname set failed")
-                                errors.append("hostname")
-                else:
-                    self.log("Hostname: skipped (not enabled)")
-                
+                # Post-network: try to get image if reachable
+                if camera_reachable:
+                    img = self.protocol.get_image(static_ip, username, password)
+                    if img:
+                        self.root.after(0, lambda d=img: self.update_preview(d))
+
                 # Save updated camera data
                 self.camera_data.save()
                 self.root.after(0, self.refresh_camera_list)
-                
-                if cam_brand == 'bosch':
-                    img = self.bosch_get_image(static_ip, BOSCH_DEFAULT_USER, bosch_pw)
-                else:
-                    img = self.get_image(static_ip, username, password)
-                if img:
-                    self.root.after(0, lambda d=img: self.update_preview(d))
-                
-                # Save to output
+
+                # Save to output CSV (always — success or partial fail)
                 cam_mac = cam.get('mac', pinned_mac or '')
                 with open(OUTPUT_CSV, 'a', newline='') as f:
-                    csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac, 
+                    csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac,
                                            actual_model or expected_model, datetime.now().isoformat()])
-                
+
                 # Mark based on results
                 cam_mac = cam.get('mac', pinned_mac or 'unknown')
-                if errors:
+                if 'unreachable' in errors:
+                    self._mark_cam_failed(cam, ', '.join(errors))
+                    total_fail += 1
+                    self.log(f"\n*** CAMERA {cam_name} FAILED: {', '.join(errors)} ***")
+                    self.log(f"    IP: {static_ip}, Serial: {serial}, MAC: {cam_mac}")
+                elif errors:
                     self._mark_cam_failed(cam, ', '.join(errors))
                     total_fail += 1
                     self.log(f"\n*** CAMERA {cam_name} PARTIAL FAIL: {', '.join(errors)} ***")
@@ -6174,42 +7269,24 @@ https://buymeacoffee.com/thelostping""")
                     
                     current_ip = cam['ip']
                     cam_name = cam.get('name', current_ip)
-                    cam_brand = cam.get('brand') or detect_brand_from_mac(cam.get('mac', ''))
                     errors = []
                     self.root.after(0, lambda n=cam_name: self.update_display(n, "Updating..."))
                     self.log(f"\nUpdating {cam_name} ({current_ip})")
 
-                    # 1. Gateway + IP
+                    # 1. Network (IP + subnet + gateway + disable DHCP)
                     if 'ip' in tasks:
                         gateway = cam.get('gateway', '')
                         subnet = cam.get('subnet', '255.255.255.0')
                         new_ip = cam['new_ip']
-                        cidr = self.subnet_to_cidr(subnet)
 
-                        if cam_brand == 'bosch':
-                            self.root.after(0, lambda n=cam_name: self.update_display(n, "Setting network via RCP..."))
-                            self.log(f"  Setting IP: {current_ip} → {new_ip} (Bosch RCP)")
-                            if not self.bosch_set_network(current_ip, password, new_ip, subnet, gateway):
-                                self.log(f"  ✗ Network config failed")
-                                errors.append("ip")
-                                self._mark_cam_failed(cam, "IP change failed")
-                                fail += 1
-                                continue
-                        else:
-                            self.root.after(0, lambda n=cam_name: self.update_display(n, "Setting gateway..."))
-                            self.log(f"  Setting gateway: {gateway}")
-                            if not self.set_gateway(current_ip, password, gateway):
-                                self.log(f"  ⚠ Gateway set may have failed")
-                                errors.append("gateway")
-
-                            self.root.after(0, lambda n=cam_name: self.update_display(n, "Setting IP..."))
-                            self.log(f"  Setting IP: {current_ip} → {new_ip}")
-                            if not self.set_network(current_ip, password, new_ip, cidr):
-                                self.log(f"  ✗ IP change failed")
-                                errors.append("ip")
-                                self._mark_cam_failed(cam, "IP change failed")
-                                fail += 1
-                                continue
+                        self.root.after(0, lambda n=cam_name: self.update_display(n, "Setting network..."))
+                        self.log(f"  Setting IP: {current_ip} → {new_ip}")
+                        if not self.protocol.set_network(current_ip, password, new_ip, subnet, gateway):
+                            self.log(f"  ✗ Network config failed")
+                            errors.append("ip")
+                            self._mark_cam_failed(cam, "IP change failed")
+                            fail += 1
+                            continue
 
                         # Wait for camera at new IP for subsequent operations
                         if 'hostname' in tasks or 'dhcp_on' in tasks or 'dhcp_off' in tasks:
@@ -6247,27 +7324,18 @@ https://buymeacoffee.com/thelostping""")
                                 fail += 1
                                 continue
 
-                        if cam_brand == 'bosch':
-                            auth = (BOSCH_DEFAULT_USER, password)
-                            result = BoschRCP.rcp_write(target_ip, RCP_CMD['unit_name'],
-                                                        'P_STRING', hostname, auth)
-                            if result:
-                                self.log("  ✓ Unit name set")
-                            else:
-                                self.log("  ⚠ Unit name not supported on this Bosch model")
+                        result = self.protocol.set_hostname(target_ip, password, hostname)
+                        if result:
+                            self.log("  ✓ Hostname set")
                         else:
-                            result = self.set_hostname(target_ip, password, hostname)
+                            self.log("  Hostname failed, retrying...")
+                            time.sleep(3)
+                            result = self.protocol.set_hostname(target_ip, password, hostname)
                             if result:
-                                self.log("  ✓ Hostname set")
+                                self.log("  ✓ Hostname set on retry")
                             else:
-                                self.log("  Hostname failed, retrying...")
-                                time.sleep(3)
-                                result = self.set_hostname(target_ip, password, hostname)
-                                if result:
-                                    self.log("  ✓ Hostname set on retry")
-                                else:
-                                    self.log("  ✗ Hostname set failed")
-                                    errors.append("hostname")
+                                self.log("  ✗ Hostname set failed")
+                                errors.append("hostname")
 
                     # 3. DHCP
                     if ('dhcp_on' in tasks or 'dhcp_off' in tasks) and not self.cancel_flag:
@@ -6276,13 +7344,7 @@ https://buymeacoffee.com/thelostping""")
                         action = "Enabling" if enable else "Disabling"
                         self.root.after(0, lambda n=cam_name, a=action: self.update_display(n, f"{a} DHCP..."))
                         self.log(f"  {action} DHCP")
-                        if cam_brand == 'bosch':
-                            auth = (BOSCH_DEFAULT_USER, password)
-                            payload = '1' if enable else '0'
-                            result = BoschRCP.rcp_write(target_ip, RCP_CMD['dhcp'],
-                                                        'T_DWORD', payload, auth)
-                        else:
-                            result = self.set_dhcp(target_ip, password, enable=enable)
+                        result = self.protocol.set_dhcp(target_ip, password, enable=enable)
                         if result:
                             self.log(f"  ✓ DHCP {'enabled' if enable else 'disabled'}")
                         else:
@@ -6357,7 +7419,7 @@ https://buymeacoffee.com/thelostping""")
                     break
                 self.root.after(0, lambda n=cam['name']: self.update_display(n, "Capturing..."))
                 
-                img = self.get_image(cam['ip'], username, password)
+                img = self.protocol.get_image(cam['ip'], self.protocol.DEFAULT_USER, password)
                 fn = os.path.join(IMAGES_DIR, f"{self.sanitize_filename(cam['name'])}.jpg")
                 
                 if img:
@@ -6442,13 +7504,13 @@ https://buymeacoffee.com/thelostping""")
                     break
                 self.root.after(0, lambda n=cam['name']: self.update_display(n, "Testing password..."))
                 
-                if self.test_password(cam['ip'], username, password, cam.get('brand')):
+                if self.protocol.test_password(cam['ip'], self.protocol.DEFAULT_USER, password):
                     self.log(f"[OK] {cam['name']}")
                     ok += 1
                 else:
                     self.log(f"[FAIL] {cam['name']}")
                     fail += 1
-            
+
             self.log(f"\n{ok} OK, {fail} failed")
             self.root.after(0, lambda: self.update_display("DONE", f"{ok} OK, {fail} failed"))
             self.root.after(0, lambda: self.enable_cancel(False))
@@ -6490,7 +7552,7 @@ https://buymeacoffee.com/thelostping""")
                     break
                 self.root.after(0, lambda n=cam['name']: self.update_display(n, "Changing password..."))
                 
-                if self.change_password_on_camera(cam['ip'], username, old_pwd, new_pwd):
+                if self.protocol.change_password(cam['ip'], self.protocol.DEFAULT_USER, old_pwd, new_pwd):
                     self.log(f"[OK] {cam['name']}")
                     ok += 1
                 else:
@@ -6552,7 +7614,7 @@ https://buymeacoffee.com/thelostping""")
                     if self.cancel_flag:
                         break
                     masked = pwd[0] + '*' * (len(pwd) - 1) if len(pwd) > 1 else '*'
-                    if self.test_password(cam['ip'], username, pwd, cam.get('brand')):
+                    if self.protocol.test_password(cam['ip'], self.protocol.DEFAULT_USER, pwd):
                         self.log(f"  Trying {masked} ({pi}/{total_pwds})... ✓ FOUND")
                         found.append((cam['name'], cam['ip'], pwd))
                         matched = True
@@ -6589,195 +7651,6 @@ https://buymeacoffee.com/thelostping""")
         if not subnet:
             return 24
         return sum(bin(int(x)).count('1') for x in subnet.split('.'))
-    
-    def create_system_user(self, ip, password):
-        try:
-            return requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
-                params={"action": "add", "user": "root", "pwd": password,
-                        "grp": "root", "sgrp": "admin:operator:viewer:ptz"},
-                timeout=TIMEOUT).status_code == 200
-        except:
-            return False
-    
-    def create_onvif_user(self, ip, password):
-        soap = f'''<?xml version="1.0"?><Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body><CreateUsers xmlns="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><User><tt:Username>root</tt:Username><tt:Password>{password}</tt:Password><tt:UserLevel>Administrator</tt:UserLevel></User></CreateUsers></Body></Envelope>'''
-        try:
-            r = requests.post(f"http://{ip}/vapix/services", data=soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-            return r.status_code == 200 and "Fault" not in r.text
-        except:
-            return False
-    
-    def set_gateway(self, ip, password, gateway):
-        soap = f'''<?xml version="1.0"?><Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body><SetNetworkDefaultGateway xmlns="http://www.onvif.org/ver10/device/wsdl"><IPv4Address>{gateway}</IPv4Address></SetNetworkDefaultGateway></Body></Envelope>'''
-        try:
-            return requests.post(f"http://{ip}/vapix/services", data=soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT).status_code == 200
-        except:
-            return False
-    
-    def set_network(self, ip, password, new_ip, prefix):
-        """Set static IP and disable DHCP via ONVIF"""
-        soap = f'''<?xml version="1.0"?><Envelope xmlns="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><Header/><Body><tds:SetNetworkInterfaces><tds:InterfaceToken>eth0</tds:InterfaceToken><tds:NetworkInterface><tt:Enabled>true</tt:Enabled><tt:IPv4><tt:Enabled>true</tt:Enabled><tt:Manual><tt:Address>{new_ip}</tt:Address><tt:PrefixLength>{prefix}</tt:PrefixLength></tt:Manual><tt:DHCP>false</tt:DHCP></tt:IPv4></tds:NetworkInterface></tds:SetNetworkInterfaces></Body></Envelope>'''
-        try:
-            return requests.post(f"http://{ip}/vapix/services", data=soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT).status_code == 200
-        except:
-            return False
-    
-    def set_dhcp(self, ip, password, enable=True):
-        """Enable or disable DHCP via param.cgi"""
-        try:
-            value = "dhcp" if enable else "none"
-            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.BootProto": value},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-            return r.status_code == 200 and 'OK' in r.text
-        except:
-            return False
-
-    # ====================================================================
-    # BOSCH CAMERA API FUNCTIONS
-    # ====================================================================
-    def bosch_set_network(self, ip, password, new_ip, subnet, gateway):
-        """Set static IP on Bosch camera via RCP. Order matters:
-        gateway first, then subnet, then DHCP off, then IP last
-        (IP change breaks connectivity)."""
-        auth = (BOSCH_DEFAULT_USER, password)
-        ok = True
-        if gateway:
-            self.log(f"        RCP: gateway → {gateway}")
-            if not BoschRCP.rcp_write(ip, RCP_CMD['gateway'], 'P_STRING', gateway, auth):
-                self.log(f"        RCP: gateway FAILED")
-                ok = False
-        if subnet:
-            self.log(f"        RCP: subnet → {subnet}")
-            if not BoschRCP.rcp_write(ip, RCP_CMD['subnet'], 'P_STRING', subnet, auth):
-                self.log(f"        RCP: subnet FAILED")
-                ok = False
-        # Disable DHCP (older models may not support this — that's OK, they're always static)
-        self.log(f"        RCP: DHCP → off")
-        if not BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_DWORD', '0', auth):
-            self.log(f"        RCP: DHCP not supported (OK — camera uses static IP)")
-        # Set IP last — this will change the camera's address
-        self.log(f"        RCP: IP → {new_ip}")
-        if not BoschRCP.rcp_write(ip, RCP_CMD['ip'], 'P_STRING', new_ip, auth):
-            self.log(f"        RCP: IP FAILED")
-            ok = False
-        return ok
-
-    def bosch_factory_reset(self, ip, password):
-        """Factory reset a Bosch camera. Tries RCP first, falls back to HTTP /reset."""
-        auth = (BOSCH_DEFAULT_USER, password)
-        if BoschRCP.rcp_write(ip, RCP_CMD['factory_reset'], 'T_DWORD', '1', auth, timeout=10):
-            return True
-        # Fallback: older Bosch models support unauthenticated HTTP reset
-        try:
-            r = requests.get(f'http://{ip}/reset', timeout=5)
-            if r.status_code == 200:
-                return True
-        except requests.exceptions.ConnectionError:
-            # Camera already resetting — connection dropped
-            return True
-        except Exception:
-            pass
-        return False
-
-    def bosch_reboot(self, ip, password):
-        """Reboot a Bosch camera. Tries RCP (two types), then HTTP /reset."""
-        auth = (BOSCH_DEFAULT_USER, password)
-        # Try RCP reboot with F_FLAG type (used by Bosch web UI)
-        if BoschRCP.rcp_write(ip, RCP_CMD['reboot'], 'F_FLAG', '1', auth, timeout=10):
-            return True
-        # Try RCP reboot with T_DWORD type (newer models)
-        if BoschRCP.rcp_write(ip, RCP_CMD['reboot'], 'T_DWORD', '1', auth, timeout=10):
-            return True
-        # Fallback: older Bosch models support unauthenticated HTTP /reset
-        try:
-            r = requests.get(f'http://{ip}/reset', timeout=5)
-            if r.status_code == 200:
-                return True
-        except requests.exceptions.ConnectionError:
-            return True
-        except Exception:
-            pass
-        return False
-
-    def bosch_set_password(self, ip, old_password, new_password):
-        """Set all password levels on a Bosch camera via RCP 0x028b.
-        Levels: 1=LIVE, 2=USER, 3=SERVICE. Returns True if service password set."""
-        auth = (BOSCH_DEFAULT_USER, old_password)
-        ok = True
-        for num, name in [(3, 'service'), (2, 'user'), (1, 'live')]:
-            if not BoschRCP.rcp_write(ip, RCP_CMD['password'], 'P_STRING',
-                                       new_password, auth, num=num):
-                self.log(f"        Password ({name}) FAILED")
-                if num == 3:  # Service password is critical
-                    ok = False
-        return ok
-
-    def bosch_get_serial(self, ip):
-        """Get Bosch camera serial from MAC address (no auth required)."""
-        mac = BoschRCP.rcp_read(ip, RCP_CMD['mac'], 'T_OCTET')
-        if mac:
-            parts = mac.split()
-            if len(parts) >= 6:
-                return ''.join(p.upper() for p in parts[:6])
-        return 'UNKNOWN'
-
-    def bosch_test_password(self, ip, username, password):
-        """Test if password works on Bosch camera by trying an auth-required RCP read."""
-        result = BoschRCP.rcp_read(ip, RCP_CMD['unit_name'], 'P_STRING',
-                                   auth=(username, password))
-        return result is not None
-
-    def bosch_get_image(self, ip, username, password):
-        """Get a snapshot from a Bosch camera."""
-        try:
-            r = requests.get(f'http://{ip}/snap.jpg?JpegSize=M',
-                             auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
-            if r.status_code == 200 and len(r.content) > 1000:
-                return r.content
-        except:
-            pass
-        # Try without auth (works on older firmware)
-        try:
-            r = requests.get(f'http://{ip}/snap.jpg?JpegSize=M', timeout=TIMEOUT)
-            if r.status_code == 200 and len(r.content) > 1000:
-                return r.content
-        except:
-            pass
-        return None
-
-    def get_serial(self, ip, password):
-        for attempt in range(3):
-            try:
-                r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                    params={"action": "list", "group": "Properties.System.SerialNumber"},
-                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-                if r.status_code == 200:
-                    for line in r.text.split('\n'):
-                        if 'SerialNumber=' in line:
-                            return line.split('=')[1].strip()
-            except:
-                pass
-            try:
-                r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
-                    json={"apiVersion": "1.0", "method": "getAllProperties"},
-                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-                if r.status_code == 200:
-                    data = r.json()
-                    if 'data' in data and 'propertyList' in data['data']:
-                        serial = data['data']['propertyList'].get('SerialNumber')
-                        if serial:
-                            return serial
-            except:
-                pass
-            time.sleep(1)
-        return "UNKNOWN"
     
     def get_mac_from_arp(self, ip):
         """Get MAC address from ARP table after pinging an IP"""
@@ -6873,11 +7746,18 @@ https://buymeacoffee.com/thelostping""")
 
     def _get_interface_index(self):
         """Get the interface index for the active network adapter.
-        Returns an integer or None. Uses cached value from get_local_network_info()
-        or detects it fresh."""
+        Returns an integer or None. Checks: cached value, saved setting, then auto-detect."""
         idx = getattr(self, '_detected_iface_index', None)
         if idx is not None:
             return idx
+        # Check saved preference from settings
+        try:
+            saved = self.settings.get('general', 'interface_index')
+            if saved:
+                self._detected_iface_index = int(saved)
+                return self._detected_iface_index
+        except:
+            pass
         local_ip, _, _ = self.get_local_network_info()
         return getattr(self, '_detected_iface_index', None)
 
@@ -7033,37 +7913,6 @@ https://buymeacoffee.com/thelostping""")
             pass
         return cameras
 
-    def get_model_noauth(self, ip):
-        """Get camera model without authentication (works on factory-fresh cameras)"""
-        try:
-            r = requests.get(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
-                json={"apiVersion": "1.0", "method": "getAllProperties"},
-                timeout=TIMEOUT)
-            if r.status_code == 200:
-                data = r.json()
-                if 'data' in data and 'propertyList' in data['data']:
-                    return data['data']['propertyList'].get('ProdNbr', '')
-        except:
-            pass
-        try:
-            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "list", "group": "Brand.ProdNbr"},
-                timeout=TIMEOUT)
-            if r.status_code == 200:
-                for line in r.text.split('\n'):
-                    if 'ProdNbr=' in line:
-                        return line.split('=')[1].strip()
-        except:
-            pass
-        # Try Bosch detection
-        try:
-            info = BoschRCP.get_device_info(ip, timeout=2)
-            if info and info.get('model'):
-                return info['model']
-        except:
-            pass
-        return None
-    
     def ping_camera(self, ip, timeout_ms=None):
         import subprocess
         if timeout_ms is None:
@@ -7072,33 +7921,18 @@ https://buymeacoffee.com/thelostping""")
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startupinfo.wShowWindow = subprocess.SW_HIDE
-            result = subprocess.run(['ping', '-n', '1', '-w', str(timeout_ms), ip],
+            cmd = ['ping', '-n', '1', '-w', str(timeout_ms), ip]
+            result = subprocess.run(cmd,
                 capture_output=True, timeout=(timeout_ms / 1000) + 2, startupinfo=startupinfo,
                 creationflags=subprocess.CREATE_NO_WINDOW)
-            return result.returncode == 0
+            # Check stdout for "Reply from" — returncode alone can be unreliable
+            # when there are multiple adapters or "Destination host unreachable"
+            output = result.stdout.decode('utf-8', errors='ignore') if result.stdout else ''
+            if 'Reply from' in output and 'unreachable' not in output.lower():
+                return True
+            return result.returncode == 0 and 'Reply from' in output
         except:
             return False
-    
-    def test_password(self, ip, username, password, brand=None):
-        if brand == 'bosch':
-            return self.bosch_test_password(ip, BOSCH_DEFAULT_USER, password)
-        try:
-            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "list", "group": "Brand"},
-                auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
-            return r.status_code == 200 and 'Brand' in r.text
-        except:
-            return False
-    
-    def get_image(self, ip, username, password):
-        try:
-            r = requests.get(f"http://{ip}/axis-cgi/jpg/image.cgi",
-                auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
-            if r.status_code == 200:
-                return r.content
-        except:
-            pass
-        return None
     
     def watermark_image(self, img_bytes, cam_name=''):
         """Add timestamp watermark to bottom-right corner of image"""
@@ -7155,58 +7989,6 @@ https://buymeacoffee.com/thelostping""")
         except:
             return img_bytes
     
-    def set_hostname(self, ip, password, hostname):
-        """Set camera hostname via param.cgi with verification"""
-        # Sanitize hostname - RFC 952/1123: alphanumeric and hyphens only, max 63 chars
-        clean = re.sub(r'[^a-zA-Z0-9-]', '-', hostname)
-        clean = clean.strip('-')[:63]
-        if clean != hostname:
-            self.root.after(0, lambda: self.log(f"      Sanitized hostname: {hostname} → {clean}"))
-            hostname = clean
-        
-        try:
-            # Set hostname via param.cgi
-            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.HostName": hostname},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-            self.root.after(0, lambda: self.log(f"      Hostname response: {r.status_code} | {r.text.strip()[:100]}"))
-            
-            # Also set Bonjour friendly name
-            try:
-                requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                    params={"action": "update", "root.Network.Bonjour.FriendlyName": hostname},
-                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-            except:
-                pass
-            
-            # Verify it stuck
-            try:
-                v = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                    params={"action": "list", "group": "root.Network.HostName"},
-                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-                actual = v.text.strip().split('=')[-1] if '=' in v.text else v.text.strip()
-                if actual == hostname:
-                    self.root.after(0, lambda: self.log(f"      Verified hostname: {actual}"))
-                    return True
-                else:
-                    self.root.after(0, lambda a=actual: self.log(f"      Hostname mismatch! Set '{hostname}' but read back '{a}'"))
-                    return False
-            except:
-                # Can't verify, trust the update response
-                return r.status_code == 200 and 'OK' in r.text
-                
-        except Exception as e:
-            self.root.after(0, lambda err=str(e): self.log(f"      Hostname error: {err}"))
-            return False
-    
-    def change_password_on_camera(self, ip, username, old_pwd, new_pwd):
-        try:
-            return requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
-                params={"action": "update", "user": username, "pwd": new_pwd},
-                auth=HTTPDigestAuth(username, old_pwd), timeout=TIMEOUT).status_code == 200
-        except:
-            return False
-
 
 # ============================================================================
 # MAIN
@@ -7242,5 +8024,5 @@ def _ensure_admin():
 if __name__ == "__main__":
     _ensure_admin()
     root = tk.Tk()
-    app = AxisToolkitApp(root)
+    app = CCTVToolkitApp(root)
     root.mainloop()

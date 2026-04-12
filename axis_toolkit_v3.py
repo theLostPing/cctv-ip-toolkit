@@ -103,6 +103,43 @@ DEFAULT_SETTINGS = {
     }
 }
 
+OUTPUT_CSV_HEADER = ['CameraName', 'IPAddress', 'SerialNumber', 'MACAddress', 'Model', 'Firmware', 'Timestamp']
+
+
+def _ensure_output_csv_header():
+    """Create programmed_cameras.csv with current header, or migrate an old header
+    in-place by adding the Firmware column. Existing rows get a blank Firmware cell."""
+    if not os.path.exists(OUTPUT_CSV):
+        os.makedirs(os.path.dirname(OUTPUT_CSV) or '.', exist_ok=True)
+        with open(OUTPUT_CSV, 'w', newline='') as f:
+            csv.writer(f).writerow(OUTPUT_CSV_HEADER)
+        return
+    # File exists — check the header
+    try:
+        with open(OUTPUT_CSV, 'r', newline='') as f:
+            rows = list(csv.reader(f))
+    except Exception:
+        return
+    if not rows:
+        with open(OUTPUT_CSV, 'w', newline='') as f:
+            csv.writer(f).writerow(OUTPUT_CSV_HEADER)
+        return
+    header = rows[0]
+    if header == OUTPUT_CSV_HEADER:
+        return
+    # Old header (no Firmware column) — migrate
+    if 'Firmware' not in header and len(header) >= 6:
+        # Old: CameraName,IPAddress,SerialNumber,MACAddress,Model,Timestamp
+        # New: CameraName,IPAddress,SerialNumber,MACAddress,Model,Firmware,Timestamp
+        new_rows = [OUTPUT_CSV_HEADER]
+        for row in rows[1:]:
+            if len(row) >= 6:
+                # Insert blank Firmware before the timestamp
+                new_rows.append(row[:5] + [''] + row[5:])
+            else:
+                new_rows.append(row)
+        with open(OUTPUT_CSV, 'w', newline='') as f:
+            csv.writer(f).writerows(new_rows)
 
 
 # ============================================================================
@@ -960,6 +997,11 @@ class CameraProtocol(ABC):
     def get_model_noauth(self, ip):
         """Query model without authentication. Returns string or None."""
 
+    def get_firmware(self, ip, password):
+        """Get firmware version. Returns string or 'UNKNOWN'.
+        Default implementation returns 'UNKNOWN' — subclasses should override."""
+        return 'UNKNOWN'
+
     @abstractmethod
     def get_image(self, ip, username, password):
         """Get JPEG snapshot bytes. Returns bytes or None."""
@@ -1192,6 +1234,49 @@ class AxisProtocol(CameraProtocol):
         except:
             pass
         return None
+
+    def get_firmware(self, ip, password):
+        """Get Axis firmware version. Tries no-auth first, then digest auth."""
+        # Method 1: basicdeviceinfo.cgi (no auth on factory cameras)
+        try:
+            r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
+                json={"apiVersion": "1.0", "method": "getAllProperties"},
+                timeout=TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+                if 'data' in data and 'propertyList' in data['data']:
+                    fw = data['data']['propertyList'].get('Version')
+                    if fw:
+                        return fw
+        except:
+            pass
+        # Method 2: basicdeviceinfo.cgi with auth
+        if password:
+            try:
+                r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
+                    json={"apiVersion": "1.0", "method": "getAllProperties"},
+                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+                if r.status_code == 200:
+                    data = r.json()
+                    if 'data' in data and 'propertyList' in data['data']:
+                        fw = data['data']['propertyList'].get('Version')
+                        if fw:
+                            return fw
+            except:
+                pass
+        # Method 3: param.cgi Properties.Firmware.Version
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "list", "group": "Properties.Firmware.Version"},
+                auth=HTTPDigestAuth("root", password) if password else None,
+                timeout=TIMEOUT)
+            if r.status_code == 200:
+                for line in r.text.split('\n'):
+                    if 'Version=' in line:
+                        return line.split('=', 1)[1].strip()
+        except:
+            pass
+        return 'UNKNOWN'
 
     def get_image(self, ip, username, password):
         try:
@@ -1433,6 +1518,13 @@ class BoschProtocol(CameraProtocol):
             return info['model']
         return None
 
+    def get_firmware(self, ip, password):
+        """Get Bosch firmware via /config.js (no auth needed)."""
+        info = BoschRCP.get_device_info(ip, timeout=3)
+        if info and info.get('firmware'):
+            return info['firmware']
+        return 'UNKNOWN'
+
     def get_image(self, ip, username, password):
         try:
             r = requests.get(f'http://{ip}/snap.jpg?JpegSize=M',
@@ -1656,6 +1748,28 @@ class HanwhaProtocol(CameraProtocol):
         except:
             pass
         return None
+
+    def get_firmware(self, ip, password):
+        """Get Hanwha firmware version from deviceinfo endpoint."""
+        # Try with auth first (most reliable)
+        for auth in [('admin', password) if password else None, None]:
+            try:
+                r = self._stw_get(ip,
+                    '/stw-cgi/system.cgi?msubmenu=deviceinfo&action=view',
+                    auth=auth, timeout=3)
+                if r.status_code == 200:
+                    for line in r.text.split('\n'):
+                        line = line.strip()
+                        if '=' in line:
+                            key, val = line.split('=', 1)
+                            kl = key.lower()
+                            if 'firmware' in kl or 'fwversion' in kl or kl.endswith('version'):
+                                v = val.strip()
+                                if v:
+                                    return v
+            except:
+                pass
+        return 'UNKNOWN'
 
     def get_image(self, ip, username, password):
         try:
@@ -3408,6 +3522,314 @@ class ProgramOptionsDialog(tk.Toplevel):
 
 
 # ============================================================================
+# PROGRAM WIZARD DIALOG (step-by-step setup)
+# ============================================================================
+class ProgramWizardDialog(tk.Toplevel):
+    """Step-by-step wizard for programming new cameras.
+    Replaces the all-in-one ProgramOptionsDialog with one decision per screen.
+    Returns a result dict with password + all options, or None on cancel."""
+
+    def __init__(self, parent, brand_name, factory_ip='192.168.0.90',
+                 camera_count=0, additional_users_count=0):
+        super().__init__(parent)
+        self.title(f"Program {brand_name} Cameras — Setup Wizard")
+        self.result = None
+        self.brand_name = brand_name
+        self.camera_count = camera_count
+        self.additional_users_count = additional_users_count
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(False, False)
+
+        # Variables (shared across steps)
+        self.password_var = tk.StringVar()
+        self.password_confirm_var = tk.StringVar()
+        self.discovery_var = tk.StringVar(value='both')
+        self.factory_ip_var = tk.StringVar(value=factory_ip)
+        self.hostname_var = tk.BooleanVar(value=False)
+        self.additional_users_var = tk.BooleanVar(value=False)
+        self.iface_var = tk.StringVar(value='Auto-detect (default)')
+        self._interfaces = ProgramOptionsDialog._get_network_interfaces()
+
+        # Layout: header bar + step area + nav bar
+        outer = ttk.Frame(self, padding=(0, 0, 0, 0))
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # Header
+        header = tk.Frame(outer, bg='#4CAF50', padx=20, pady=14)
+        header.pack(fill=tk.X)
+        self.header_title = tk.Label(header, text='', bg='#4CAF50', fg='white',
+                                     font=('Helvetica', 16, 'bold'), anchor='w')
+        self.header_title.pack(fill=tk.X)
+        self.header_subtitle = tk.Label(header, text='', bg='#4CAF50', fg='white',
+                                        font=('Helvetica', 10), anchor='w')
+        self.header_subtitle.pack(fill=tk.X)
+
+        # Step content area
+        self.body = ttk.Frame(outer, padding=20)
+        self.body.pack(fill=tk.BOTH, expand=True)
+
+        # Build all step frames (only shown one at a time)
+        self.steps = []
+        self._build_step_welcome()
+        self._build_step_password()
+        self._build_step_discovery()
+        self._build_step_extras()
+        self._build_step_review()
+
+        # Nav bar
+        nav = ttk.Frame(outer, padding=(20, 10, 20, 15))
+        nav.pack(fill=tk.X)
+        self.back_btn = ttk.Button(nav, text='← Back', command=self.go_back, width=12)
+        self.back_btn.pack(side=tk.LEFT)
+        ttk.Button(nav, text='Cancel', command=self.cancel, width=12).pack(side=tk.LEFT, padx=(8, 0))
+        self.next_btn = tk.Button(nav, text='Next →', command=self.go_next,
+                                  bg='#4CAF50', fg='white', font=('Helvetica', 10, 'bold'),
+                                  padx=14, pady=6, relief=tk.RAISED, cursor='hand2', width=18)
+        self.next_btn.pack(side=tk.RIGHT)
+        self.step_label = ttk.Label(nav, text='', font=('Helvetica', 9), foreground='gray')
+        self.step_label.pack(side=tk.RIGHT, padx=(0, 12))
+
+        self.current_step = 0
+        self.show_step(0)
+
+        self.bind("<Escape>", lambda e: self.cancel())
+        # Auto-size dialog to content
+        _center_on_parent(self, parent, 640, 460)
+        self.wait_window(self)
+
+    # ------------------------------------------------------------------
+    # Step builders
+    # ------------------------------------------------------------------
+    def _new_step(self, title, subtitle):
+        f = ttk.Frame(self.body)
+        self.steps.append({'frame': f, 'title': title, 'subtitle': subtitle})
+        return f
+
+    def _build_step_welcome(self):
+        f = self._new_step("Welcome",
+                           f"You're about to program {self.camera_count} {self.brand_name} camera(s).")
+        msg = (
+            "This wizard walks you through programming brand-new cameras one at a time.\n\n"
+            "What to expect:\n"
+            "  •  You'll set a password and a few options on the next screens.\n"
+            "  •  Then you'll be told when to plug in each camera.\n"
+            "  •  Programming each camera takes about 1–2 minutes.\n"
+            "  •  A live checklist will show exactly what's happening.\n\n"
+            "Before you continue, make sure:\n"
+            "  ✓  You have your camera list ready in the Camera List tab.\n"
+            "  ✓  Your laptop is plugged into the camera switch.\n"
+            "  ✓  PoE is powering the cameras.\n\n"
+            "When you're ready, click  Next →"
+        )
+        ttk.Label(f, text=msg, justify=tk.LEFT, font=('Helvetica', 10)).pack(
+            anchor='w', pady=(10, 0))
+
+    def _build_step_password(self):
+        f = self._new_step("Step 1 of 4 — Set Password",
+                           "This password will be set on every camera you program.")
+        ttk.Label(f, text="Password:", font=('Helvetica', 11, 'bold')).pack(
+            anchor='w', pady=(20, 4))
+        e1 = ttk.Entry(f, textvariable=self.password_var, show='•', width=40, font=('Helvetica', 11))
+        e1.pack(anchor='w', ipady=4)
+        self._pwd_entry = e1
+
+        ttk.Label(f, text="Confirm password:", font=('Helvetica', 11, 'bold')).pack(
+            anchor='w', pady=(15, 4))
+        e2 = ttk.Entry(f, textvariable=self.password_confirm_var, show='•', width=40, font=('Helvetica', 11))
+        e2.pack(anchor='w', ipady=4)
+
+        ttk.Label(f,
+                  text="\nTip: Use a strong password — this is the camera's admin login.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(10, 0))
+
+    def _build_step_discovery(self):
+        f = self._new_step("Step 2 of 4 — How to find cameras",
+                           "Pick how the toolkit should discover the camera when you plug it in.")
+
+        if self._interfaces:
+            ttk.Label(f, text="Network interface (which port the cameras are on):",
+                      font=('Helvetica', 10, 'bold')).pack(anchor='w', pady=(15, 4))
+            iface_labels = ['Auto-detect (default)'] + [i['label'] for i in self._interfaces]
+            ttk.Combobox(f, textvariable=self.iface_var, values=iface_labels,
+                         state='readonly', width=50).pack(anchor='w')
+
+        ttk.Label(f, text="Discovery method:", font=('Helvetica', 10, 'bold')).pack(
+            anchor='w', pady=(18, 4))
+
+        rb_frame = ttk.Frame(f)
+        rb_frame.pack(fill=tk.X)
+
+        ttk.Radiobutton(rb_frame, text="Both — DHCP/mDNS + Factory IP  (recommended)",
+                        variable=self.discovery_var, value='both',
+                        command=self._update_factory_state).pack(anchor='w', pady=2)
+        ttk.Label(rb_frame, text="    Works for both old and new (firmware 12+) cameras.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
+        ttk.Radiobutton(rb_frame, text="DHCP/mDNS only",
+                        variable=self.discovery_var, value='mdns',
+                        command=self._update_factory_state).pack(anchor='w', pady=(10, 2))
+        ttk.Label(rb_frame, text="    For firmware 12.0+ cameras with link-local 169.254.x.x addresses.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
+        ttk.Radiobutton(rb_frame, text="Factory IP only",
+                        variable=self.discovery_var, value='factory',
+                        command=self._update_factory_state).pack(anchor='w', pady=(10, 2))
+        ttk.Label(rb_frame, text="    Older cameras with a fixed factory IP address.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
+        ip_row = ttk.Frame(f)
+        ip_row.pack(fill=tk.X, pady=(18, 0))
+        self.ip_label = ttk.Label(ip_row, text="Factory default IP:", font=('Helvetica', 10, 'bold'))
+        self.ip_label.pack(side=tk.LEFT)
+        self.ip_entry = ttk.Entry(ip_row, textvariable=self.factory_ip_var, width=20, font=('Helvetica', 10))
+        self.ip_entry.pack(side=tk.LEFT, padx=(10, 0), ipady=3)
+
+    def _build_step_extras(self):
+        f = self._new_step("Step 3 of 4 — Extras",
+                           "Optional things to do during programming.")
+
+        ttk.Checkbutton(f, text="Set network hostname automatically",
+                        variable=self.hostname_var).pack(anchor='w', pady=(20, 2))
+        ttk.Label(f, text="    Sets hostname to <number>-<brand>-<serial> on each camera.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
+        if self.additional_users_count > 0:
+            label = f"Create additional user accounts ({self.additional_users_count} defined)"
+            state = 'normal'
+        else:
+            label = "Create additional user accounts (none defined)"
+            state = 'disabled'
+        cb = ttk.Checkbutton(f, text=label, variable=self.additional_users_var)
+        cb.pack(anchor='w', pady=(15, 2))
+        cb.configure(state=state)
+        ttk.Label(f,
+                  text="    Add users in the Passwords tab before programming if you need this.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
+        ttk.Label(f, text="\nNo extras needed? Just click  Next →",
+                  foreground='gray', font=('Helvetica', 10)).pack(anchor='w', pady=(20, 0))
+
+    def _build_step_review(self):
+        f = self._new_step("Step 4 of 4 — Review",
+                           "Last check before you start programming.")
+        self._review_text = tk.Text(f, height=14, width=70, font=('Consolas', 10),
+                                    relief=tk.SUNKEN, borderwidth=1, wrap=tk.WORD,
+                                    bg='#f8f8f8')
+        self._review_text.pack(fill=tk.BOTH, expand=True, pady=(15, 0))
+        self._review_text.configure(state='disabled')
+
+    def _populate_review(self):
+        iface = self.iface_var.get()
+        mode = self.discovery_var.get()
+        mode_name = {'both': 'Both DHCP/mDNS + Factory IP',
+                     'mdns': 'DHCP/mDNS only',
+                     'factory': 'Factory IP only'}.get(mode, mode)
+        lines = [
+            f"Brand                : {self.brand_name}",
+            f"Cameras to program   : {self.camera_count}",
+            "",
+            f"Password             : {'•' * len(self.password_var.get())}",
+            f"Network interface    : {iface}",
+            f"Discovery method     : {mode_name}",
+        ]
+        if mode != 'mdns':
+            lines.append(f"Factory IP           : {self.factory_ip_var.get()}")
+        lines.append("")
+        lines.append(f"Set hostname         : {'YES' if self.hostname_var.get() else 'no'}")
+        lines.append(f"Add extra users      : {'YES' if self.additional_users_var.get() else 'no'}")
+        lines.append("")
+        lines.append("Click  Start Programming  to begin.")
+        lines.append("You'll be prompted to plug in each camera one at a time.")
+
+        self._review_text.configure(state='normal')
+        self._review_text.delete('1.0', tk.END)
+        self._review_text.insert('1.0', '\n'.join(lines))
+        self._review_text.configure(state='disabled')
+
+    # ------------------------------------------------------------------
+    # Navigation
+    # ------------------------------------------------------------------
+    def show_step(self, idx):
+        for s in self.steps:
+            s['frame'].pack_forget()
+        self.current_step = idx
+        step = self.steps[idx]
+        step['frame'].pack(fill=tk.BOTH, expand=True)
+        self.header_title.config(text=step['title'])
+        self.header_subtitle.config(text=step['subtitle'])
+        self.step_label.config(text=f"Step {idx + 1} of {len(self.steps)}")
+        self.back_btn.config(state='normal' if idx > 0 else 'disabled')
+        if idx == len(self.steps) - 1:
+            self.next_btn.config(text='✓ Start Programming')
+            self._populate_review()
+        else:
+            self.next_btn.config(text='Next →')
+        # Focus first input on the password step
+        if idx == 1:
+            self.after(50, self._pwd_entry.focus_set)
+
+    def go_back(self):
+        if self.current_step > 0:
+            self.show_step(self.current_step - 1)
+
+    def go_next(self):
+        # Validate current step
+        idx = self.current_step
+        if idx == 1:  # password
+            pwd = self.password_var.get()
+            if not pwd:
+                messagebox.showwarning("Required", "Password is required.", parent=self)
+                return
+            if pwd != self.password_confirm_var.get():
+                messagebox.showerror("Mismatch", "Passwords don't match!", parent=self)
+                return
+        elif idx == 2:  # discovery
+            mode = self.discovery_var.get()
+            if mode != 'mdns' and not self.factory_ip_var.get().strip():
+                messagebox.showwarning("Required",
+                                       "Factory IP is required for this mode.", parent=self)
+                return
+
+        if idx == len(self.steps) - 1:
+            self.finish()
+        else:
+            self.show_step(idx + 1)
+
+    def _update_factory_state(self):
+        if self.discovery_var.get() == 'mdns':
+            self.ip_entry.configure(state='disabled')
+            self.ip_label.configure(foreground='gray')
+        else:
+            self.ip_entry.configure(state='normal')
+            self.ip_label.configure(foreground='black')
+
+    def finish(self):
+        # Resolve interface selection
+        selected_iface = None
+        sel = self.iface_var.get()
+        if sel and sel != 'Auto-detect (default)':
+            for iface in self._interfaces:
+                if iface['label'] == sel:
+                    selected_iface = iface
+                    break
+        mode = self.discovery_var.get()
+        self.result = {
+            'password': self.password_var.get(),
+            'factory_ip': self.factory_ip_var.get().strip() if mode != 'mdns' else None,
+            'discovery_mode': mode,
+            'set_hostname': self.hostname_var.get(),
+            'add_additional_users': self.additional_users_var.get(),
+            'interface': selected_iface,
+        }
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
+
+# ============================================================================
 # BRAND SELECTION DIALOG
 # ============================================================================
 class BrandSelectionDialog(tk.Toplevel):
@@ -3799,7 +4221,12 @@ class CCTVToolkitApp:
         self.notebook.add(self.operations_tab, text="⚡ Operations")
         self.create_operations_tab()
         
-        # Tab 4: Log/Results
+        # Tab 4: Programming Status (live checklist for new wizard)
+        self.status_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.status_tab, text="🟢 Programming Status")
+        self.create_status_tab()
+
+        # Tab 5: Log/Results
         self.log_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.log_tab, text="📊 Log & Results")
         self.create_log_tab()
@@ -4391,20 +4818,22 @@ class CCTVToolkitApp:
         btn_frame.pack(fill=tk.BOTH, expand=True)
         
         operations = [
-            ("🔧 Program New Cameras", "Configure factory-default cameras with\nIP, password, and disable DHCP", 
+            ("🔧 Program New Cameras", "Step-by-step wizard with live\nchecklist (recommended)",
              self.start_program_wizard, "#4CAF50"),
-            ("🔄 Update Cameras", "Push changes (IP, hostname, DHCP)\nfrom Camera List to cameras", 
+            ("🔄 Update Cameras", "Push changes (IP, hostname, DHCP)\nfrom Camera List to cameras",
              self.start_update_wizard, "#2196F3"),
-            ("📷 Capture Images", "Download snapshot images from\nall cameras in the list", 
+            ("📷 Capture Images", "Download snapshot images from\nall cameras in the list",
              self.start_capture_wizard, "#9C27B0"),
-            ("📡 Ping Test", "Check connectivity to all cameras\nand export results to CSV", 
+            ("📡 Ping Test", "Check connectivity to all cameras\nand export results to CSV",
              self.start_ping_wizard, "#FF9800"),
-            ("✓ Validate Password", "Test ONE password against\nALL cameras in the list", 
+            ("✓ Validate Password", "Test ONE password against\nALL cameras in the list",
              self.start_validate_wizard, "#607D8B"),
-            ("🔑 Change Passwords", "Change password on all cameras\n(requires current password)", 
+            ("🔑 Change Passwords", "Change password on all cameras\n(requires current password)",
              self.start_change_password_wizard, "#F44336"),
-            ("🔍 Batch Password Test", "Test MULTIPLE passwords to find\nunknown camera credentials", 
+            ("🔍 Batch Password Test", "Test MULTIPLE passwords to find\nunknown camera credentials",
              self.start_batch_test_wizard, "#795548"),
+            ("🛠️ Classic Programmer", "Original combined-options dialog\n(fallback if new wizard misbehaves)",
+             self.start_program_wizard_classic, "#9E9E9E"),
         ]
         
         for i, (text, desc, cmd, color) in enumerate(operations):
@@ -4500,9 +4929,188 @@ class CCTVToolkitApp:
                                            padx=12, pady=4, cursor='hand2')
         self.triplett_recv_btn.pack(side=tk.LEFT, padx=(0, 8))
         
-        ttk.Label(recv_row, text="Downloads images, logs, passwords & results → data/triplett/", 
+        ttk.Label(recv_row, text="Downloads images, logs, passwords & results → data/triplett/",
                  foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT)
-    
+
+    # ========================================================================
+    # PROGRAMMING STATUS TAB (live checklist for new wizard)
+    # ========================================================================
+    PROG_STEPS = [
+        ('discover',     '1. Detect camera on the network'),
+        ('pin',          '2. Lock onto camera (ARP pin)'),
+        ('verify_model', '3. Verify camera model'),
+        ('firmware',     '4. Read firmware version'),
+        ('auth',         '5. Set password / create user'),
+        ('extra_users',  '6. Create additional users'),
+        ('hostname',     '7. Set hostname'),
+        ('network',      '8. Apply IP / network settings'),
+        ('verify_online','9. Wait for camera at new IP'),
+        ('capture',      '10. Capture serial / MAC / image'),
+    ]
+
+    def create_status_tab(self):
+        """Live programming status: banner, checklist, log."""
+        frame = ttk.Frame(self.status_tab, padding="15")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # ---- Big banner ----
+        self._status_banner_frame = tk.Frame(frame, bg='#9E9E9E', padx=20, pady=18)
+        self._status_banner_frame.pack(fill=tk.X)
+        self._status_banner_label = tk.Label(self._status_banner_frame,
+            text="READY", bg='#9E9E9E', fg='white',
+            font=('Helvetica', 28, 'bold'))
+        self._status_banner_label.pack()
+        self._status_banner_sub = tk.Label(self._status_banner_frame,
+            text="Start a programming run from the Operations tab.",
+            bg='#9E9E9E', fg='white', font=('Helvetica', 11))
+        self._status_banner_sub.pack(pady=(4, 0))
+
+        # ---- Camera + progress row ----
+        info_row = ttk.Frame(frame)
+        info_row.pack(fill=tk.X, pady=(15, 5))
+        self._status_camera_label = ttk.Label(info_row,
+            text="—", font=('Helvetica', 14, 'bold'))
+        self._status_camera_label.pack(side=tk.LEFT)
+        self._status_progress_label = ttk.Label(info_row,
+            text="", font=('Helvetica', 11), foreground='#555')
+        self._status_progress_label.pack(side=tk.RIGHT)
+
+        # ---- Two columns: checklist on left, preview on right ----
+        body = ttk.Frame(frame)
+        body.pack(fill=tk.BOTH, expand=True, pady=(5, 5))
+
+        # Checklist column
+        check_frame = ttk.LabelFrame(body, text="Programming Steps", padding=10)
+        check_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._status_step_widgets = {}
+        for step_id, label in self.PROG_STEPS:
+            row = ttk.Frame(check_frame)
+            row.pack(fill=tk.X, pady=2)
+            icon = tk.Label(row, text='○', font=('Helvetica', 14),
+                            fg='#999', width=2)
+            icon.pack(side=tk.LEFT)
+            text = tk.Label(row, text=label, font=('Helvetica', 11),
+                            fg='#666', anchor='w')
+            text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            detail = tk.Label(row, text='', font=('Helvetica', 9),
+                              fg='#888', anchor='e')
+            detail.pack(side=tk.RIGHT)
+            self._status_step_widgets[step_id] = {
+                'icon': icon, 'text': text, 'detail': detail,
+            }
+
+        # Preview column
+        preview_col = ttk.Frame(body)
+        preview_col.pack(side=tk.RIGHT, fill=tk.Y, padx=(15, 0))
+        prev_box = ttk.LabelFrame(preview_col, text="Camera Preview", padding=8)
+        prev_box.pack(fill=tk.BOTH, expand=False)
+        self._status_preview_label = ttk.Label(prev_box, text="(no image yet)",
+                                               width=40, anchor='center')
+        self._status_preview_label.pack(padx=4, pady=4)
+
+        # ---- Bottom: cancel + log toggle ----
+        bottom = ttk.Frame(frame)
+        bottom.pack(fill=tk.X, pady=(10, 0))
+        self._status_cancel_btn = ttk.Button(bottom, text="⏹️ Cancel",
+                                             command=self.cancel_operation,
+                                             state='disabled')
+        self._status_cancel_btn.pack(side=tk.LEFT)
+
+        self._status_log_visible = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bottom, text="Show detailed log",
+                        variable=self._status_log_visible,
+                        command=self._toggle_status_log).pack(side=tk.LEFT, padx=(15, 0))
+
+        # ---- Detailed log (collapsible) ----
+        self._status_log_container = ttk.LabelFrame(frame, text="Detailed Log", padding=5)
+        self._status_log_container.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self._status_log_text = scrolledtext.ScrolledText(
+            self._status_log_container, font=('Courier', 9), height=8)
+        self._status_log_text.pack(fill=tk.BOTH, expand=True)
+
+        # Tally
+        self._status_ok_count = 0
+        self._status_fail_count = 0
+
+    def _toggle_status_log(self):
+        if self._status_log_visible.get():
+            self._status_log_container.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        else:
+            self._status_log_container.pack_forget()
+
+    # ---------- Status view API (called from worker thread via root.after) ----
+    def status_set_banner(self, text, subtitle='', color='#9E9E9E'):
+        self._status_banner_frame.config(bg=color)
+        self._status_banner_label.config(text=text, bg=color)
+        self._status_banner_sub.config(text=subtitle, bg=color)
+
+    def status_set_camera(self, name='—', detail=''):
+        self._status_camera_label.config(text=name)
+        self._status_progress_label.config(text=detail)
+
+    def status_reset_steps(self, used_steps=None):
+        """Reset all step icons. If used_steps given, dim unused ones."""
+        for step_id, w in self._status_step_widgets.items():
+            if used_steps is not None and step_id not in used_steps:
+                w['icon'].config(text='—', fg='#ccc')
+                w['text'].config(fg='#bbb')
+            else:
+                w['icon'].config(text='○', fg='#999')
+                w['text'].config(fg='#666')
+            w['detail'].config(text='')
+
+    def status_set_step(self, step_id, state, detail=''):
+        """state: 'pending', 'active', 'ok', 'fail', 'skip'."""
+        w = self._status_step_widgets.get(step_id)
+        if not w:
+            return
+        if state == 'active':
+            w['icon'].config(text='⏳', fg='#FF9800')
+            w['text'].config(fg='#000', font=('Helvetica', 11, 'bold'))
+        elif state == 'ok':
+            w['icon'].config(text='✓', fg='#4CAF50')
+            w['text'].config(fg='#444', font=('Helvetica', 11))
+        elif state == 'fail':
+            w['icon'].config(text='✗', fg='#F44336')
+            w['text'].config(fg='#444', font=('Helvetica', 11))
+        elif state == 'skip':
+            w['icon'].config(text='—', fg='#bbb')
+            w['text'].config(fg='#bbb', font=('Helvetica', 11))
+        else:  # pending
+            w['icon'].config(text='○', fg='#999')
+            w['text'].config(fg='#666', font=('Helvetica', 11))
+        if detail:
+            w['detail'].config(text=detail)
+
+    def status_log(self, msg):
+        """Append a line to the embedded detailed log + the main log tab."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        try:
+            self._status_log_text.insert(tk.END, f"[{timestamp}] {msg}\n")
+            self._status_log_text.see(tk.END)
+        except Exception:
+            pass
+        self.log(msg)  # also goes to main log tab
+
+    def status_set_preview(self, image_data=None):
+        if not HAS_PIL:
+            return
+        if image_data is None:
+            self._status_preview_label.config(image='', text='(no image yet)')
+            self._status_preview_image = None
+            return
+        try:
+            img = Image.open(BytesIO(image_data))
+            img.thumbnail((280, 200), Image.Resampling.LANCZOS)
+            self._status_preview_image = ImageTk.PhotoImage(img)
+            self._status_preview_label.config(image=self._status_preview_image, text='')
+        except Exception:
+            self._status_preview_label.config(image='', text='(preview error)')
+
+    def status_enable_cancel(self, enable):
+        self._status_cancel_btn.config(state='normal' if enable else 'disabled')
+
     def create_log_tab(self):
         """Log and results tab"""
         frame = ttk.Frame(self.log_tab, padding="10")
@@ -6671,16 +7279,16 @@ https://buymeacoffee.com/thelostping""")
             return None
         return cameras
     
-    def start_program_wizard(self):
-        """Wizard for programming new cameras"""
+    def start_program_wizard_classic(self):
+        """Classic programming flow — original combined-options dialog + log-only UI."""
         cameras = self.validate_cameras_for_programming()
         if not cameras:
             return
-        
+
         # Show intro if enabled
         if self.settings.get_bool('warnings', 'show_programming_intro'):
             factory_ip = self.settings.get('general', 'factory_ip')
-            dialog = WarningDialog(self.root, "Program New Cameras",
+            dialog = WarningDialog(self.root, "Program New Cameras (Classic)",
                 f"Ready to program {len(cameras)} camera(s).\n\n"
                 "This will:\n"
                 f"1. Discover cameras via DHCP/mDNS (finds link-local 169.254.x.x)\n"
@@ -6737,10 +7345,8 @@ https://buymeacoffee.com/thelostping""")
             username = self.protocol.DEFAULT_USER
             total_ok = total_fail = 0
             
-            if not os.path.exists(OUTPUT_CSV):
-                with open(OUTPUT_CSV, 'w', newline='') as f:
-                    csv.writer(f).writerow(['CameraName', 'IPAddress', 'SerialNumber', 'MACAddress', 'Model', 'Timestamp'])
-            
+            _ensure_output_csv_header()
+
             self.log(f"Discovery mode: {discovery_mode}")
             if factory_ip:
                 self.log(f"Factory IP: {factory_ip}")
@@ -6892,7 +7498,16 @@ https://buymeacoffee.com/thelostping""")
                     self.log(f"Camera model: {actual_model}")
                 else:
                     self.log("Camera model: could not query (will match any entry)")
-                
+
+                # Try to read firmware while still at factory IP (no auth on most brands)
+                actual_firmware = 'UNKNOWN'
+                try:
+                    actual_firmware = self.protocol.get_firmware(camera_ip, '') or 'UNKNOWN'
+                except Exception:
+                    actual_firmware = 'UNKNOWN'
+                if actual_firmware and actual_firmware != 'UNKNOWN':
+                    self.log(f"Camera firmware: {actual_firmware}")
+
                 # Find a matching camera entry from the remaining list
                 cam = None
                 cam_idx = None
@@ -7122,11 +7737,21 @@ https://buymeacoffee.com/thelostping""")
                 if actual_model and not expected_model:
                     cam['model'] = actual_model
 
-                # Post-network: try to get image if reachable
+                # Post-network: try to get image if reachable + retry firmware with auth
                 if camera_reachable:
                     img = self.protocol.get_image(static_ip, username, password)
                     if img:
                         self.root.after(0, lambda d=img: self.update_preview(d))
+                    if actual_firmware == 'UNKNOWN':
+                        try:
+                            fw = self.protocol.get_firmware(static_ip, password)
+                            if fw and fw != 'UNKNOWN':
+                                actual_firmware = fw
+                                self.log(f"Camera firmware: {actual_firmware}")
+                        except Exception:
+                            pass
+
+                cam['firmware'] = actual_firmware
 
                 # Save updated camera data
                 self.camera_data.save()
@@ -7136,7 +7761,8 @@ https://buymeacoffee.com/thelostping""")
                 cam_mac = cam.get('mac', pinned_mac or '')
                 with open(OUTPUT_CSV, 'a', newline='') as f:
                     csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac,
-                                           actual_model or expected_model, datetime.now().isoformat()])
+                                           actual_model or expected_model, actual_firmware,
+                                           datetime.now().isoformat()])
 
                 # Mark based on results
                 cam_mac = cam.get('mac', pinned_mac or 'unknown')
@@ -7193,7 +7819,540 @@ https://buymeacoffee.com/thelostping""")
             self.clear_preview()
 
         threading.Thread(target=run, daemon=True).start()
-    
+
+    # ========================================================================
+    # NEW PROGRAMMING FLOW (step-by-step wizard + live status view)
+    # ========================================================================
+    def start_program_wizard(self):
+        """Step-by-step programming flow with live checklist UI."""
+        cameras = self.validate_cameras_for_programming()
+        if not cameras:
+            return
+
+        # Show wizard
+        wiz = ProgramWizardDialog(self.root,
+            brand_name=self.protocol.BRAND_NAME,
+            factory_ip=self.protocol.FACTORY_IP,
+            camera_count=len(cameras),
+            additional_users_count=len(self.additional_users_data.get_all()))
+        if not wiz.result:
+            return
+
+        opts = wiz.result
+        password = opts['password']
+        factory_ip = opts['factory_ip']
+        discovery_mode = opts['discovery_mode']
+        set_hostname = opts['set_hostname']
+        add_additional_users = opts['add_additional_users']
+        selected_iface = opts['interface']
+
+        # Persist factory IP if user changed it
+        if factory_ip and factory_ip != self.protocol.FACTORY_IP:
+            self.protocol.FACTORY_IP = factory_ip
+            try:
+                key = 'bosch_factory_ip' if self.protocol.BRAND_KEY == 'bosch' else 'factory_ip'
+                self.settings.set('general', key, factory_ip)
+            except Exception:
+                pass
+
+        # Override interface if user picked one
+        if selected_iface:
+            self._detected_iface_index = selected_iface['index']
+            self._detected_local_ip = selected_iface['ip']
+            self.settings.set('general', 'interface_index', str(selected_iface['index']))
+
+        # Determine which checklist steps will actually run for this config
+        used_steps = ['discover', 'pin', 'verify_model', 'firmware', 'auth']
+        if add_additional_users and self.additional_users_data.get_all():
+            used_steps.append('extra_users')
+        if set_hostname:
+            used_steps.append('hostname')
+        used_steps.extend(['network', 'verify_online', 'capture'])
+
+        # Switch to status tab and prep the UI
+        self.notebook.select(self.status_tab)
+        self.cancel_flag = False
+        self.enable_cancel(True)
+        self.status_enable_cancel(True)
+        self.root.after(0, lambda: self.status_reset_steps(used_steps))
+        self.root.after(0, lambda: self.status_set_camera('—', f'0 of {len(cameras)} done'))
+        self.root.after(0, lambda: self.status_set_banner(
+            'STARTING…', f'Programming {len(cameras)} {self.protocol.BRAND_NAME} camera(s)', '#2196F3'))
+        self.root.after(0, lambda: self.status_set_preview(None))
+
+        def _ui(fn, *args, **kwargs):
+            self.root.after(0, lambda: fn(*args, **kwargs))
+
+        def run():
+            username = self.protocol.DEFAULT_USER
+            total_ok = total_fail = 0
+
+            _ensure_output_csv_header()
+
+            self.status_log(f"Discovery mode: {discovery_mode}")
+            if factory_ip:
+                self.status_log(f"Factory IP: {factory_ip}")
+
+            if discovery_mode in ('mdns', 'both'):
+                self.status_log("Adding link-local route for camera discovery...")
+                self.add_linklocal_route()
+
+            remaining = list(cameras)
+            programmed_count = 0
+            seen_macs = set()
+            consecutive_skips = 0
+
+            while remaining and not self.cancel_flag:
+                programmed_count += 1
+                pinned_mac = None
+                camera_ip = None
+
+                # Banner: waiting for next camera
+                next_cam = remaining[0]
+                next_name = next_cam['name']
+                next_model = next_cam.get('model', '')
+                _ui(self.status_set_banner, 'PLUG IN CAMERA',
+                    f"Plug in: {next_name}" + (f"  ({next_model})" if next_model else ''),
+                    '#FF9800')
+                _ui(self.status_set_camera, next_name,
+                    f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
+                _ui(self.status_reset_steps, used_steps)
+                _ui(self.status_set_step, 'discover', 'active')
+
+                self.status_log(f"\n{'=' * 50}")
+                self.status_log(f"Waiting for camera {programmed_count}: {next_name}")
+                self.status_log(f"{'=' * 50}")
+
+                # ---- Discovery phase ----
+                while not self.cancel_flag:
+                    if discovery_mode in ('factory', 'both'):
+                        if factory_ip and self.ping_camera(factory_ip, timeout_ms=1000):
+                            camera_ip = factory_ip
+                            self.status_log(f"Camera found at factory IP {factory_ip}")
+                            break
+
+                    if discovery_mode in ('mdns', 'both'):
+                        dhcp_found_mac = None
+                        try:
+                            dhcp_cams = AxisDHCPDiscovery.discover(timeout=3)
+                            for dc in dhcp_cams:
+                                dc_mac = dc.get('mac', '').upper().replace(':', '').replace('-', '')
+                                if dc_mac and dc_mac not in seen_macs:
+                                    dhcp_found_mac = dc.get('mac', '')
+                                    self.status_log(f"DHCP broadcast: {dc.get('model', '?')} MAC {dhcp_found_mac}")
+                                    self.add_linklocal_route()
+                                    break
+                        except Exception:
+                            pass
+
+                        if dhcp_found_mac and not camera_ip:
+                            try:
+                                if self.ping_camera(factory_ip, timeout_ms=1000):
+                                    info = self.protocol.get_discovery_info(factory_ip, timeout=2)
+                                    if info:
+                                        camera_ip = factory_ip
+                                        pinned_mac = dhcp_found_mac
+                                        self.status_log(f"Camera at {factory_ip}  Model: {info.get('model', '?')}")
+                                        break
+                            except Exception:
+                                pass
+
+                        if not camera_ip:
+                            try:
+                                resolved_cams = self._resolve_linklocal_cameras(
+                                    target_mac=dhcp_found_mac, timeout=4)
+                                for mc in resolved_cams:
+                                    mc_ip = mc.get('ip', '')
+                                    mc_mac = mc.get('mac', '').upper().replace(':', '').replace('-', '')
+                                    if mc_mac and mc_mac in seen_macs:
+                                        continue
+                                    if mc_ip and self.ping_camera(mc_ip, timeout_ms=1000):
+                                        camera_ip = mc_ip
+                                        pinned_mac = mc.get('mac', '')
+                                        self.status_log(f"Camera at {mc_ip}  Model: {mc.get('model', '?')}")
+                                        break
+                                if camera_ip:
+                                    break
+                            except Exception:
+                                pass
+
+                        if not camera_ip:
+                            try:
+                                mdns_cams = AxisMDNSDiscovery.discover(timeout=2)
+                                for mc in mdns_cams:
+                                    mc_ip = mc.get('ip', '')
+                                    mc_mac = mc.get('mac', '').upper().replace(':', '').replace('-', '')
+                                    if mc_mac and mc_mac in seen_macs:
+                                        continue
+                                    if mc_ip.startswith('169.254.'):
+                                        self.add_linklocal_route()
+                                    if mc_ip and self.ping_camera(mc_ip, timeout_ms=1000):
+                                        camera_ip = mc_ip
+                                        pinned_mac = mc.get('mac', '')
+                                        self.status_log(f"Camera (mDNS): {mc_ip}  Model: {mc.get('model', '?')}")
+                                        break
+                                if camera_ip:
+                                    break
+                            except Exception:
+                                pass
+
+                    time.sleep(1)
+
+                if self.cancel_flag:
+                    break
+
+                _ui(self.status_set_step, 'discover', 'ok', camera_ip)
+                _ui(self.status_set_banner, 'PROGRAMMING…',
+                    f"{next_name}  →  working on it", '#2196F3')
+
+                # ---- ARP pin ----
+                _ui(self.status_set_step, 'pin', 'active')
+                if not pinned_mac:
+                    pinned_mac = self.get_mac_from_arp(camera_ip)
+                if pinned_mac:
+                    if pinned_mac.upper().replace(':', '').replace('-', '') in seen_macs:
+                        self.status_log(f"MAC {pinned_mac} already programmed, waiting for reboot...")
+                        self.arp_unpin(camera_ip)
+                        time.sleep(3)
+                        _ui(self.status_set_step, 'pin', 'pending')
+                        _ui(self.status_set_step, 'discover', 'pending')
+                        continue
+                    if self.arp_pin(camera_ip, pinned_mac):
+                        self.status_log(f"ARP pinned to {pinned_mac}")
+                        _ui(self.status_set_step, 'pin', 'ok', pinned_mac)
+                    else:
+                        self.status_log(f"ARP pin failed for {pinned_mac} (continuing)")
+                        _ui(self.status_set_step, 'pin', 'ok', pinned_mac)
+                else:
+                    self.status_log("No MAC from ARP")
+                    _ui(self.status_set_step, 'pin', 'fail', 'no MAC')
+
+                # ---- Verify model ----
+                _ui(self.status_set_step, 'verify_model', 'active')
+                actual_model = self.protocol.get_model_noauth(camera_ip)
+                if actual_model:
+                    self.status_log(f"Camera model: {actual_model}")
+                else:
+                    self.status_log("Could not query model — will match any entry")
+
+                # ---- Read firmware (no-auth) ----
+                _ui(self.status_set_step, 'firmware', 'active')
+                actual_firmware = 'UNKNOWN'
+                try:
+                    actual_firmware = self.protocol.get_firmware(camera_ip, '') or 'UNKNOWN'
+                except Exception:
+                    actual_firmware = 'UNKNOWN'
+                if actual_firmware and actual_firmware != 'UNKNOWN':
+                    self.status_log(f"Firmware: {actual_firmware}")
+                    _ui(self.status_set_step, 'firmware', 'ok', actual_firmware)
+                else:
+                    _ui(self.status_set_step, 'firmware', 'pending', '(retry after auth)')
+
+                # ---- Match camera entry ----
+                cam = None
+                cam_idx = None
+                if actual_model:
+                    norm_actual = actual_model.upper().replace('AXIS-', '').replace('AXIS ', '').strip()
+                    for idx, c in enumerate(remaining):
+                        c_model = c.get('model', '')
+                        if not c_model:
+                            cam = c
+                            cam_idx = idx
+                            break
+                        norm_expected = c_model.upper().replace('AXIS-', '').replace('AXIS ', '').strip()
+                        if norm_expected in norm_actual or norm_actual in norm_expected:
+                            cam = c
+                            cam_idx = idx
+                            break
+
+                    if not cam:
+                        self.status_log(f"⚠ MODEL MISMATCH: got {actual_model}")
+                        _ui(self.status_set_step, 'verify_model', 'fail', f'got {actual_model}')
+                        _ui(self.status_set_banner, 'WRONG MODEL',
+                            f'Got {actual_model} — plug in a different camera', '#F44336')
+                        self.arp_unpin(camera_ip)
+                        consecutive_skips += 1
+
+                        result = [None]
+                        skip_count = consecutive_skips
+                        models_needed = sorted(set(c.get('model', '(any)') for c in remaining))
+                        def show_mismatch():
+                            msg = (f"Wrong camera model detected!\n\n"
+                                   f"Connected: {actual_model}\n\n"
+                                   f"Models still needed:\n")
+                            model_counts = {}
+                            for c in remaining:
+                                m = c.get('model', '(any)')
+                                model_counts[m] = model_counts.get(m, 0) + 1
+                            for m, count in sorted(model_counts.items()):
+                                msg += f"  • {m}  ×{count}\n"
+                            msg += (f"\n({skip_count} mismatch{'es' if skip_count != 1 else ''} so far)\n\n"
+                                    "Try again?")
+                            result[0] = messagebox.askyesno("Wrong Camera Model", msg)
+                        self.root.after(0, show_mismatch)
+                        while result[0] is None and not self.cancel_flag:
+                            time.sleep(0.1)
+                        if not result[0]:
+                            self.cancel_flag = True
+                            break
+                        time.sleep(2)
+                        continue
+                else:
+                    cam = remaining[0]
+                    cam_idx = 0
+
+                consecutive_skips = 0
+                _ui(self.status_set_step, 'verify_model', 'ok', actual_model or '(unverified)')
+
+                cam_name = cam['name']
+                static_ip = cam['ip']
+                gateway = cam['gateway']
+                subnet = cam['subnet']
+                expected_model = cam.get('model', '')
+                cidr = self.subnet_to_cidr(subnet)
+                errors = []
+
+                _ui(self.status_set_camera, cam_name,
+                    f"Programming → {static_ip}  ({programmed_count} of {len(cameras)})")
+                self.status_log(f"\nAssigned to: {cam_name} → {static_ip}")
+                self.status_log(f"Programming from: {camera_ip}" + (" [link-local]" if camera_ip.startswith('169.254.') else ""))
+
+                # ---- Build steps and split ----
+                cam['_program_ip'] = camera_ip
+                steps = self.protocol.get_programming_steps(cam, password)
+                network_keywords = ('gateway', 'network', 'ip', 'dhcp')
+                auth_steps = []
+                network_steps = []
+                for desc, fn in steps:
+                    desc_lower = desc.lower()
+                    if any(kw in desc_lower for kw in network_keywords):
+                        network_steps.append((desc, fn))
+                    else:
+                        auth_steps.append((desc, fn))
+
+                # ---- Phase 1: Auth ----
+                _ui(self.status_set_step, 'auth', 'active')
+                auth_ok = True
+                for desc, step_fn in auth_steps:
+                    self.status_log(f"  {desc}")
+                    if step_fn():
+                        self.status_log("    ✓ Done.")
+                    else:
+                        self.status_log(f"    ✗ {desc} failed")
+                        errors.append(desc.lower().split()[0])
+                        auth_ok = False
+                _ui(self.status_set_step, 'auth', 'ok' if auth_ok else 'fail')
+
+                # ---- Phase 2a: Additional users ----
+                if add_additional_users:
+                    extra_users = self.additional_users_data.get_all()
+                    if extra_users:
+                        _ui(self.status_set_step, 'extra_users', 'active')
+                        eu_ok = True
+                        for eu in extra_users:
+                            self.status_log(f"  Creating user '{eu['username']}' ({eu['role']})")
+                            if self.protocol.add_user(camera_ip, password,
+                                                       eu['username'], eu['password'], eu['role']):
+                                self.status_log("    ✓ Done.")
+                            else:
+                                self.status_log(f"    ✗ Failed")
+                                errors.append(f"user:{eu['username']}")
+                                eu_ok = False
+                        _ui(self.status_set_step, 'extra_users', 'ok' if eu_ok else 'fail')
+
+                # Try to get serial while still at factory IP
+                try:
+                    pre_serial = self.protocol.get_serial(camera_ip, password)
+                    if pre_serial and pre_serial != 'UNKNOWN':
+                        cam['serial'] = pre_serial
+                        if len(pre_serial) == 12:
+                            cam['mac'] = ':'.join(pre_serial[j:j+2] for j in range(0, 12, 2))
+                        self.status_log(f"Pre-network serial: {pre_serial}")
+                except Exception:
+                    pass
+
+                # ---- Phase 2b: Hostname ----
+                if set_hostname:
+                    _ui(self.status_set_step, 'hostname', 'active')
+                    brand_prefix = self.protocol.BRAND_KEY
+                    cam_number = cam.get('number', str(programmed_count))
+                    s = cam.get('serial', 'unknown')
+                    if s and s != 'UNKNOWN':
+                        hostname = f"{cam_number}-{brand_prefix}-{s.lower()}"
+                    else:
+                        hostname = f"{cam_number}-{brand_prefix}-unknown"
+                    self.status_log(f"  Setting hostname: {hostname}")
+                    if self.protocol.set_hostname(camera_ip, password, hostname):
+                        self.status_log("    ✓ Done.")
+                        cam['hostname'] = hostname
+                        cam['name'] = hostname
+                        _ui(self.status_set_step, 'hostname', 'ok', hostname)
+                    else:
+                        self.status_log("    ✗ Hostname failed")
+                        errors.append("hostname")
+                        _ui(self.status_set_step, 'hostname', 'fail')
+
+                # ---- Phase 3: Network change ----
+                _ui(self.status_set_step, 'network', 'active')
+                net_ok = True
+                for desc, step_fn in network_steps:
+                    self.status_log(f"  {desc}")
+                    if step_fn():
+                        self.status_log("    ✓ Done.")
+                    else:
+                        self.status_log(f"    ✗ {desc} failed")
+                        errors.append(desc.lower().split()[0])
+                        net_ok = False
+                _ui(self.status_set_step, 'network', 'ok' if net_ok else 'fail')
+
+                # Track this MAC and release pin
+                if pinned_mac:
+                    seen_macs.add(pinned_mac.upper().replace(':', '').replace('-', ''))
+                    if not cam.get('mac'):
+                        cam['mac'] = pinned_mac
+                self.arp_unpin(camera_ip)
+
+                # ---- Wait for camera at new IP ----
+                _ui(self.status_set_step, 'verify_online', 'active')
+                camera_reachable = False
+                self.status_log(f"Waiting for camera at {static_ip}...")
+                time.sleep(3)
+                wait_count = 0
+                while not self.cancel_flag and wait_count < 45:
+                    if self.ping_camera(static_ip, timeout_ms=2000):
+                        camera_reachable = True
+                        break
+                    wait_count += 1
+                    if wait_count % 10 == 0:
+                        self.status_log(f"  Still waiting... ({wait_count}s)")
+                    time.sleep(1)
+
+                if self.cancel_flag:
+                    break
+
+                if not camera_reachable:
+                    self.status_log(f"✗ Camera not responding at {static_ip} after {wait_count}s")
+                    errors.append("unreachable")
+                    _ui(self.status_set_step, 'verify_online', 'fail', f'{wait_count}s timeout')
+                else:
+                    self.status_log(f"Camera online at {static_ip} (after {wait_count + 3}s)")
+                    _ui(self.status_set_step, 'verify_online', 'ok', f'{wait_count + 3}s')
+                    time.sleep(1)
+
+                # ---- Capture serial / MAC / image ----
+                _ui(self.status_set_step, 'capture', 'active')
+                serial = 'UNKNOWN'
+                if camera_reachable:
+                    serial = self.protocol.get_serial(static_ip, password)
+                    self.status_log(f"Serial: {serial}")
+                    if serial and serial != 'UNKNOWN':
+                        cam['serial'] = serial
+                        if len(serial) == 12:
+                            cam['mac'] = ':'.join(serial[j:j+2] for j in range(0, 12, 2))
+                            self.status_log(f"MAC: {cam['mac']}")
+                    elif pinned_mac:
+                        cam['mac'] = pinned_mac
+                        self.status_log(f"MAC (from ARP): {pinned_mac}")
+                else:
+                    if pinned_mac:
+                        cam['mac'] = pinned_mac
+                        mac_clean = pinned_mac.upper().replace(':', '').replace('-', '')
+                        cam['serial'] = mac_clean
+                        self.status_log(f"MAC (from ARP): {pinned_mac}")
+                        serial = mac_clean
+
+                if actual_model and not expected_model:
+                    cam['model'] = actual_model
+
+                if camera_reachable:
+                    img = self.protocol.get_image(static_ip, username, password)
+                    if img:
+                        _ui(self.status_set_preview, img)
+                    # Retry firmware with auth if we didn't get it before
+                    if actual_firmware == 'UNKNOWN':
+                        try:
+                            fw = self.protocol.get_firmware(static_ip, password)
+                            if fw and fw != 'UNKNOWN':
+                                actual_firmware = fw
+                                self.status_log(f"Firmware: {actual_firmware}")
+                                _ui(self.status_set_step, 'firmware', 'ok', actual_firmware)
+                        except Exception:
+                            pass
+
+                if actual_firmware == 'UNKNOWN':
+                    _ui(self.status_set_step, 'firmware', 'fail', 'UNKNOWN')
+
+                cam['firmware'] = actual_firmware
+                _ui(self.status_set_step, 'capture', 'ok',
+                    f"{serial} / {cam.get('mac', '?')}")
+
+                self.camera_data.save()
+                _ui(self.refresh_camera_list)
+
+                # ---- Write CSV row ----
+                cam_mac = cam.get('mac', pinned_mac or '')
+                with open(OUTPUT_CSV, 'a', newline='') as f:
+                    csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac,
+                                           actual_model or expected_model, actual_firmware,
+                                           datetime.now().isoformat()])
+
+                # ---- Mark success/fail ----
+                if 'unreachable' in errors:
+                    self._mark_cam_failed(cam, ', '.join(errors))
+                    total_fail += 1
+                    self.status_log(f"\n*** {cam_name} FAILED: {', '.join(errors)} ***")
+                    _ui(self.status_set_banner, f'FAILED  ({total_ok} OK / {total_fail} fail)',
+                        f"{cam_name} failed — plug in next camera", '#F44336')
+                elif errors:
+                    self._mark_cam_failed(cam, ', '.join(errors))
+                    total_fail += 1
+                    self.status_log(f"\n*** {cam_name} PARTIAL FAIL: {', '.join(errors)} ***")
+                    _ui(self.status_set_banner, f'PARTIAL  ({total_ok} OK / {total_fail} fail)',
+                        f"{cam_name} had errors — plug in next camera", '#FF9800')
+                else:
+                    idx = self.camera_data.get_all().index(cam)
+                    self.camera_data.mark_processed(idx)
+                    total_ok += 1
+                    self.status_log(f"\n*** {cam_name} COMPLETE ***")
+                    _ui(self.status_set_banner, f'DONE  ({total_ok} OK / {total_fail} fail)',
+                        f"{cam_name} complete — plug in next camera", '#4CAF50')
+
+                remaining.pop(cam_idx)
+
+                if remaining and not self.cancel_flag:
+                    # No continue dialog — banner tells the user what to do
+                    _ui(self.status_set_camera, '—',
+                        f'{programmed_count} of {len(cameras)} done · {len(remaining)} remaining')
+                    time.sleep(2)  # brief pause so user can see "DONE" before "PLUG IN"
+
+            self.remove_linklocal_route()
+
+            self.status_log(f"\n{'=' * 50}")
+            self.status_log(f"PROGRAMMING COMPLETE: {total_ok} succeeded, {total_fail} failed")
+            if remaining:
+                self.status_log(f"  {len(remaining)} cameras not programmed")
+            self.status_log(f"Results saved to {OUTPUT_CSV}")
+            self.status_log(f"{'=' * 50}")
+
+            if self.cancel_flag:
+                _ui(self.status_set_banner, 'CANCELLED',
+                    f'{total_ok} OK / {total_fail} failed / {len(remaining)} skipped', '#9E9E9E')
+            elif total_fail == 0 and not remaining:
+                _ui(self.status_set_banner, 'ALL DONE!',
+                    f'All {total_ok} cameras programmed successfully', '#4CAF50')
+            else:
+                _ui(self.status_set_banner,
+                    f'FINISHED  ({total_ok} OK / {total_fail} fail)',
+                    f'{len(remaining)} cameras not programmed' if remaining else '',
+                    '#FF9800' if total_fail else '#4CAF50')
+            _ui(self.status_set_camera, '—', f'{total_ok + total_fail} of {len(cameras)} processed')
+            _ui(self.enable_cancel, False)
+            _ui(self.status_enable_cancel, False)
+            _ui(self.refresh_camera_list)
+            _ui(self.rescan_after_operation)
+
+        threading.Thread(target=run, daemon=True).start()
+
     def start_update_wizard(self):
         """Smart update — pushes any changes (IP, hostname, DHCP) to cameras"""
         cameras = self.camera_data.get_all()
