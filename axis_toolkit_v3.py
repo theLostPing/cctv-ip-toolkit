@@ -4080,6 +4080,362 @@ class CameraEditorDialog(tk.Toplevel):
 
 
 # ============================================================================
+# LLDP SWITCH PORT DISCOVERY
+# ============================================================================
+
+class LldpDiscoveryDialog(tk.Toplevel):
+    """Listens for LLDP frames to identify the connected switch and port.
+    Uses pktmon (built-in Windows 10/11) for packet capture."""
+
+    CAPTURE_TIMEOUT = 35  # LLDP default interval is 30s
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Identify Switch Port (LLDP)")
+        self.transient(parent)
+        self.grab_set()
+        self.resizable(True, True)
+        self.geometry("580x500")
+        self._thread = None
+        self._cancel = threading.Event()
+        self._temp_files = []
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        frame = ttk.Frame(self, padding=15)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="LLDP Switch Port Discovery",
+                  font=('Helvetica', 14, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text="Listens for LLDP advertisements from connected switches.\n"
+                  "Most managed switches broadcast every 30 seconds.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(2, 10))
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 8))
+        self.listen_btn = ttk.Button(btn_frame, text="Start Listening",
+                                      command=self._start)
+        self.listen_btn.pack(side=tk.LEFT)
+        self.stop_btn = ttk.Button(btn_frame, text="Stop",
+                                    command=self._stop, state='disabled')
+        self.stop_btn.pack(side=tk.LEFT, padx=(10, 0))
+
+        self.status_var = tk.StringVar(value="Ready.")
+        ttk.Label(frame, textvariable=self.status_var,
+                  font=('Helvetica', 10)).pack(anchor='w')
+        self.progress = ttk.Progressbar(frame, mode='determinate',
+                                         maximum=self.CAPTURE_TIMEOUT)
+        self.progress.pack(fill=tk.X, pady=(4, 10))
+
+        results_lf = ttk.LabelFrame(frame, text="Results", padding=8)
+        results_lf.pack(fill=tk.BOTH, expand=True)
+        self.results_text = tk.Text(results_lf, height=14, width=65,
+                                     state='disabled', font=('Consolas', 10),
+                                     wrap='word')
+        scroll = ttk.Scrollbar(results_lf, orient='vertical',
+                                command=self.results_text.yview)
+        self.results_text.configure(yscrollcommand=scroll.set)
+        self.results_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        bottom = ttk.Frame(frame)
+        bottom.pack(fill=tk.X, pady=(8, 0))
+        self.copy_btn = ttk.Button(bottom, text="Copy to Clipboard",
+                                    command=self._copy, state='disabled')
+        self.copy_btn.pack(side=tk.RIGHT)
+        ttk.Button(bottom, text="Close",
+                   command=self._on_close).pack(side=tk.RIGHT, padx=(0, 8))
+
+        self.update_idletasks()
+        px = parent.winfo_rootx() + (parent.winfo_width() - 580) // 2
+        py = parent.winfo_rooty() + (parent.winfo_height() - 500) // 2
+        self.geometry(f"+{max(0, px)}+{max(0, py)}")
+
+    def _start(self):
+        self._cancel.clear()
+        self.listen_btn.config(state='disabled')
+        self.stop_btn.config(state='normal')
+        self.copy_btn.config(state='disabled')
+        self.progress['value'] = 0
+        self._set_results("")
+        self.status_var.set("Starting packet capture...")
+        self._thread = threading.Thread(target=self._capture_worker, daemon=True)
+        self._thread.start()
+        self._tick(0)
+
+    def _tick(self, elapsed):
+        if self._cancel.is_set() or self._thread is None or not self._thread.is_alive():
+            return
+        self.progress['value'] = elapsed
+        remaining = self.CAPTURE_TIMEOUT - elapsed
+        self.status_var.set(f"Listening for LLDP frames... {remaining}s remaining")
+        if elapsed < self.CAPTURE_TIMEOUT:
+            self.after(1000, self._tick, elapsed + 1)
+
+    def _stop(self):
+        self._cancel.set()
+        self.stop_btn.config(state='disabled')
+        self.status_var.set("Stopping capture...")
+
+    def _on_close(self):
+        self._cancel.set()
+        self.after(500, self.destroy)
+
+    def _set_results(self, text):
+        self.results_text.config(state='normal')
+        self.results_text.delete('1.0', tk.END)
+        if text:
+            self.results_text.insert('1.0', text)
+        self.results_text.config(state='disabled')
+
+    def _copy(self):
+        text = self.results_text.get('1.0', tk.END).strip()
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.status_var.set("Copied to clipboard!")
+
+    def _capture_worker(self):
+        """Background thread: capture LLDP via pktmon, parse results."""
+        import subprocess as sp
+        import tempfile
+
+        etl = tempfile.mktemp(suffix='.etl')
+        pcap = tempfile.mktemp(suffix='.pcapng')
+        self._temp_files = [etl, pcap]
+        kw = dict(capture_output=True, timeout=10,
+                  creationflags=0x08000000)  # CREATE_NO_WINDOW
+
+        try:
+            # Clean slate
+            sp.run(['pktmon', 'stop'], **kw)
+            sp.run(['pktmon', 'filter', 'remove'], **kw)
+
+            # Filter for LLDP EtherType 0x88CC
+            r = sp.run(['pktmon', 'filter', 'add', 'LLDP', '-t', '0x88CC'], **kw)
+            if r.returncode != 0:
+                self.after(0, self._done, None,
+                           "pktmon filter failed — is this Windows 10 2004 or later?")
+                return
+
+            # Start capture
+            r = sp.run(['pktmon', 'start', '-c', '--pkt-size', '512',
+                         '-f', etl], **kw)
+            if r.returncode != 0:
+                self.after(0, self._done, None,
+                           "pktmon start failed:\n" +
+                           r.stderr.decode(errors='replace'))
+                return
+
+            # Wait for frames or cancellation
+            t0 = time.time()
+            while time.time() - t0 < self.CAPTURE_TIMEOUT:
+                if self._cancel.is_set():
+                    break
+                time.sleep(0.5)
+
+            sp.run(['pktmon', 'stop'], **kw)
+            time.sleep(0.3)
+
+            # Convert ETL -> pcapng
+            sp.run(['pktmon', 'etl2pcap', etl, '-o', pcap], **kw)
+
+            if not os.path.exists(pcap) or os.path.getsize(pcap) < 100:
+                self.after(0, self._done, [], None)
+                return
+
+            # Parse
+            packets = self._read_pcapng(pcap)
+            results = []
+            seen = set()
+            for pkt in packets:
+                info = self._parse_lldp(pkt)
+                if info:
+                    key = (info['switch_name'], info['port_id'])
+                    if key not in seen:
+                        seen.add(key)
+                        results.append(info)
+
+            self.after(0, self._done, results, None)
+
+        except Exception as e:
+            self.after(0, self._done, None, f"Error: {e}")
+        finally:
+            try:
+                sp.run(['pktmon', 'filter', 'remove'], capture_output=True,
+                       timeout=5, creationflags=0x08000000)
+            except:
+                pass
+            for f in self._temp_files:
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+    def _done(self, results, error):
+        """Main-thread callback when capture finishes."""
+        self.listen_btn.config(state='normal')
+        self.stop_btn.config(state='disabled')
+        self.progress['value'] = self.CAPTURE_TIMEOUT
+
+        if error:
+            self.status_var.set("Capture failed.")
+            self._set_results(error)
+            return
+
+        if not results:
+            self.status_var.set("No LLDP frames received.")
+            self._set_results(
+                "No LLDP advertisements detected.\n\n"
+                "Possible causes:\n"
+                "  - LLDP is not enabled on the switch\n"
+                "  - Not connected via wired Ethernet\n"
+                "  - Switch interval > 35s — try again\n"
+                "  - Some unmanaged switches don't support LLDP")
+            return
+
+        self.status_var.set(f"Found {len(results)} switch port(s)!")
+        self.copy_btn.config(state='normal')
+
+        lines = []
+        for i, r in enumerate(results):
+            if i > 0:
+                lines.append("\n" + "\u2500" * 48)
+            lines.append(f"Switch Name : {r['switch_name'] or '(not advertised)'}")
+            lines.append(f"Port ID     : {r['port_id'] or '(not advertised)'}")
+            if r['port_desc']:
+                lines.append(f"Port Desc   : {r['port_desc']}")
+            if r['chassis_id']:
+                lines.append(f"Chassis ID  : {r['chassis_id']}")
+            lines.append(f"Switch MAC  : {r['switch_mac']}")
+            if r['mgmt_ip']:
+                lines.append(f"Mgmt IP     : {r['mgmt_ip']}")
+            if r['vlan']:
+                lines.append(f"VLAN        : {r['vlan']}")
+            if r['system_desc']:
+                # Truncate long sysDescr to keep it readable
+                desc = r['system_desc']
+                if len(desc) > 120:
+                    desc = desc[:117] + '...'
+                lines.append(f"System      : {desc}")
+
+        self._set_results('\n'.join(lines))
+
+    @staticmethod
+    def _read_pcapng(filepath):
+        """Extract raw packet data from a pcapng file."""
+        packets = []
+        with open(filepath, 'rb') as f:
+            data = f.read()
+        offset = 0
+        while offset + 12 <= len(data):
+            btype = struct.unpack('<I', data[offset:offset + 4])[0]
+            blen = struct.unpack('<I', data[offset + 4:offset + 8])[0]
+            if blen < 12 or offset + blen > len(data):
+                break
+            if btype == 0x00000006:  # Enhanced Packet Block
+                if offset + 28 <= len(data):
+                    cap_len = struct.unpack('<I', data[offset + 20:offset + 24])[0]
+                    end = offset + 28 + cap_len
+                    if end <= len(data):
+                        packets.append(data[offset + 28:end])
+            offset += blen
+        return packets
+
+    @staticmethod
+    def _parse_lldp(frame):
+        """Parse LLDP TLVs from a raw Ethernet frame."""
+        if len(frame) < 16:
+            return None
+
+        # Standard Ethernet: dst(6) src(6) ethertype(2)
+        ethertype = struct.unpack('!H', frame[12:14])[0]
+        payload_off = 14
+
+        # Skip 802.1Q tag
+        if ethertype == 0x8100 and len(frame) >= 18:
+            ethertype = struct.unpack('!H', frame[16:18])[0]
+            payload_off = 18
+
+        # pktmon may prepend metadata — scan for 0x88CC in first 64 bytes
+        if ethertype != 0x88CC:
+            for i in range(12, min(64, len(frame) - 1)):
+                if frame[i] == 0x88 and frame[i + 1] == 0xCC:
+                    payload_off = i + 2
+                    ethertype = 0x88CC
+                    break
+        if ethertype != 0x88CC:
+            return None
+
+        # Source MAC is 6 bytes before ethertype
+        mac_start = payload_off - 8  # src is 6 bytes before the 2-byte ethertype
+        if mac_start < 0:
+            mac_start = 6
+        src_mac = frame[mac_start:mac_start + 6]
+
+        r = {'switch_mac': ':'.join(f'{b:02X}' for b in src_mac),
+             'switch_name': '', 'port_id': '', 'port_desc': '',
+             'system_desc': '', 'mgmt_ip': '', 'chassis_id': '',
+             'ttl': 0, 'vlan': ''}
+
+        off = payload_off
+        while off + 2 <= len(frame):
+            hdr = struct.unpack('!H', frame[off:off + 2])[0]
+            ttype = (hdr >> 9) & 0x7F
+            tlen = hdr & 0x01FF
+            off += 2
+            if ttype == 0:
+                break
+            if off + tlen > len(frame):
+                break
+            val = frame[off:off + tlen]
+            off += tlen
+
+            if ttype == 1 and len(val) > 1:        # Chassis ID
+                sub = val[0]
+                if sub == 4 and len(val) >= 7:
+                    r['chassis_id'] = ':'.join(f'{b:02X}' for b in val[1:7])
+                elif sub == 5 and len(val) >= 6 and val[1] == 1:
+                    r['chassis_id'] = socket.inet_ntoa(val[2:6])
+                else:
+                    r['chassis_id'] = val[1:].decode('utf-8', errors='replace').rstrip('\x00')
+
+            elif ttype == 2 and len(val) > 1:       # Port ID
+                sub = val[0]
+                if sub == 3 and len(val) >= 7:
+                    r['port_id'] = ':'.join(f'{b:02X}' for b in val[1:7])
+                else:
+                    r['port_id'] = val[1:].decode('utf-8', errors='replace').rstrip('\x00')
+
+            elif ttype == 3 and len(val) >= 2:      # TTL
+                r['ttl'] = struct.unpack('!H', val[:2])[0]
+
+            elif ttype == 4:                         # Port Description
+                r['port_desc'] = val.decode('utf-8', errors='replace').rstrip('\x00')
+
+            elif ttype == 5:                         # System Name
+                r['switch_name'] = val.decode('utf-8', errors='replace').rstrip('\x00')
+
+            elif ttype == 6:                         # System Description
+                r['system_desc'] = val.decode('utf-8', errors='replace').rstrip('\x00')
+
+            elif ttype == 8 and len(val) >= 6:       # Management Address
+                if val[0] >= 5 and val[1] == 1:
+                    r['mgmt_ip'] = socket.inet_ntoa(val[2:6])
+
+            elif ttype == 127 and len(val) >= 6:     # Org-specific
+                oui, sub = val[0:3], val[3]
+                if oui == b'\x00\x80\xc2' and sub == 1:       # Port VLAN ID
+                    r['vlan'] = str(struct.unpack('!H', val[4:6])[0])
+                elif oui == b'\x00\x80\xc2' and sub == 3 and len(val) >= 7:  # VLAN Name
+                    vid = struct.unpack('!H', val[4:6])[0]
+                    nlen = val[6]
+                    vname = val[7:7 + nlen].decode('utf-8', errors='replace') if nlen else ''
+                    r['vlan'] = f"{vid}" + (f" ({vname})" if vname else '')
+
+        return r
+
+
+# ============================================================================
 # MAIN APPLICATION
 # ============================================================================
 class CCTVToolkitApp:
@@ -4169,6 +4525,11 @@ class CCTVToolkitApp:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
         
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Identify Switch Port (LLDP)...",
+                               command=self.show_lldp_discovery)
+
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="Quick Start Guide", command=self.show_quick_start)
@@ -7143,6 +7504,9 @@ Features:
 
 https://buymeacoffee.com/thelostping""")
     
+    def show_lldp_discovery(self):
+        LldpDiscoveryDialog(self.root)
+
     def show_settings(self):
         w = tk.Toplevel(self.root)
         w.title("Settings")
