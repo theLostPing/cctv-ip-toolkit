@@ -1,5 +1,7 @@
 # CCTV IP Toolkit
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95-FFDD00?style=flat-square&labelColor=1a1a2e)](https://buymeacoffee.com/thelostping)
+
 Windows GUI toolkit for field techs programming Axis, Bosch, and Hanwha/Wisenet IP cameras. Distribution site: **[cctv.thelostping.net](https://cctv.thelostping.net)**.
 
 Source is published here so the binary on the website can be audited and/or rebuilt from scratch. The `.exe` isn't Microsoft-code-signed yet, so Windows SmartScreen will warn on first run — if that's a dealbreaker for you, compile it yourself from this repo.
@@ -54,3 +56,5 @@ Bug reports and feature requests: [cctv.thelostping.net/feedback](https://cctv.t
 ## License / reuse
 
 Created by **Brian Preston**. Free to use, modify, audit, redistribute. Attribution appreciated.
+
+If this saved you a service call or an afternoon, [buy me a coffee](https://buymeacoffee.com/thelostping) &#9749;
