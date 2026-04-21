@@ -1,0 +1,25 @@
+# Build artifacts
+dist/
+build/
+*.exe
+__pycache__/
+*.pyc
+
+# Editor / IDE
+.claude/
+.vscode/
+.idea/
+
+# Local recordings and captures (not source)
+*.mp4
+*.pcapng
+
+# Screenshots (kept on the website, not the repo)
+Screenshot*.png
+
+# Local backups
+*.bak
+
+# OS cruft
+Thumbs.db
+.DS_Store
