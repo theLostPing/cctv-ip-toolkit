@@ -11,6 +11,22 @@ Features:
 - "Don't show again" options for warnings
 """
 
+import sys
+# Enable per-monitor DPI awareness BEFORE Tkinter is imported. Without this,
+# Windows scales the whole UI up as a bitmap (fuzzy + cut-off widgets) when
+# the user runs at 125%/150% display scaling. With it, Tk renders at the
+# correct logical pixel size and ttk widgets grow to accommodate text.
+if sys.platform == 'win32':
+    try:
+        import ctypes
+        # Try per-monitor DPI v2 first (Win10 1703+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # Win Vista+ fallback
+        except Exception:
+            pass
+
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
 import threading
@@ -3156,20 +3172,31 @@ class ToolTip:
 
 
 def _center_on_parent(dialog, parent, width, height):
-    """Center a dialog on its parent window. Works across multiple monitors."""
+    """Center a dialog on its parent window. Works across multiple monitors.
+    The width/height args act as MINIMUM sizes — if the dialog's content
+    requests more space (likely under DPI scaling), the dialog grows so
+    nothing is cut off. Also clamps to screen bounds and sets minsize so
+    the user can't drag it smaller than the content."""
     parent.update_idletasks()
     dialog.update_idletasks()
-    # Use requested size if width/height are 0 (auto-sized dialogs)
-    if width <= 0:
-        width = dialog.winfo_reqwidth()
-    if height <= 0:
-        height = dialog.winfo_reqheight()
+    req_w = dialog.winfo_reqwidth()
+    req_h = dialog.winfo_reqheight()
+    # Use the larger of (caller-requested, content-required) so widgets fit
+    width = max(width, req_w) if width > 0 else req_w
+    height = max(height, req_h) if height > 0 else req_h
+    # Clamp to screen so dialog isn't bigger than the display
+    sw = dialog.winfo_screenwidth()
+    sh = dialog.winfo_screenheight()
+    width = min(width, sw - 40)
+    height = min(height, sh - 80)
     # Center on parent — use parent's actual position (works on any monitor)
     px = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
     py = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
-    # Only prevent going above top of screen
-    py = max(0, py)
+    px = max(0, min(px, sw - width))
+    py = max(0, min(py, sh - height))
     dialog.geometry(f"{width}x{height}+{px}+{py}")
+    # Keep dialog at-or-above the content's minimum size during user resize
+    dialog.minsize(width, height)
 
 
 class PasswordDialog(tk.Toplevel):
@@ -3179,25 +3206,27 @@ class PasswordDialog(tk.Toplevel):
         self.result = None
         self.transient(parent)
         self.grab_set()
-        _center_on_parent(self, parent, 400, 200)
+        self.resizable(True, True)
 
-        frame = ttk.Frame(self, padding="25")
+        frame = ttk.Frame(self, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text=prompt, font=('Helvetica', 12)).pack(anchor=tk.W)
-        
+        ttk.Label(frame, text=prompt, font=('Helvetica', 12), wraplength=520, justify=tk.LEFT).pack(anchor=tk.W, fill=tk.X)
+
         pwd_frame = ttk.Frame(frame)
-        pwd_frame.pack(fill=tk.X, pady=(5, 10))
+        pwd_frame.pack(fill=tk.X, pady=(8, 14))
         self.password_var = tk.StringVar()
         self.show_password = tk.BooleanVar(value=False)
         self.pwd_entry = ttk.Entry(pwd_frame, textvariable=self.password_var, show="*", width=30, font=('Helvetica', 12))
-        self.pwd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.pwd_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=2)
         ttk.Checkbutton(pwd_frame, text="Show", variable=self.show_password,
-                       command=self.toggle_show).pack(side=tk.LEFT, padx=(5, 0))
-        
+                       command=self.toggle_show).pack(side=tk.LEFT, padx=(8, 0))
+
         btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill=tk.X)
-        ttk.Button(btn_frame, text="OK", command=self.ok).pack(side=tk.RIGHT, padx=(5, 0))
-        ttk.Button(btn_frame, text="Cancel", command=self.cancel).pack(side=tk.RIGHT)
+        btn_frame.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(btn_frame, text="OK", command=self.ok, width=10).pack(side=tk.RIGHT, padx=(8, 0))
+        ttk.Button(btn_frame, text="Cancel", command=self.cancel, width=10).pack(side=tk.RIGHT)
+        # Center AFTER widgets are packed so winfo_reqwidth includes content
+        _center_on_parent(self, parent, 480, 220)
         
         self.pwd_entry.bind("<Return>", lambda e: self.ok())
         self.bind("<Escape>", lambda e: self.cancel())
@@ -3371,7 +3400,7 @@ class ProgramOptionsDialog(tk.Toplevel):
         self.result = None
         self.transient(parent)
         self.grab_set()
-        self.resizable(False, False)
+        self.resizable(True, True)
 
         frame = ttk.Frame(self, padding="15")
         frame.pack(fill=tk.BOTH, expand=True)
@@ -3539,7 +3568,7 @@ class ProgramWizardDialog(tk.Toplevel):
         self.additional_users_count = additional_users_count
         self.transient(parent)
         self.grab_set()
-        self.resizable(False, False)
+        self.resizable(True, True)
 
         # Variables (shared across steps)
         self.password_var = tk.StringVar()
@@ -3840,7 +3869,7 @@ class BrandSelectionDialog(tk.Toplevel):
         self.result = None
         self.transient(parent)
         self.grab_set()
-        self.resizable(False, False)
+        self.resizable(True, True)
 
         _center_on_parent(self, parent, 500, 350)
 
@@ -4210,11 +4239,18 @@ class LldpDiscoveryDialog(tk.Toplevel):
             sp.run(['pktmon', 'stop'], **kw)
             sp.run(['pktmon', 'filter', 'remove'], **kw)
 
-            # Filter for LLDP EtherType 0x88CC
-            r = sp.run(['pktmon', 'filter', 'add', 'LLDP', '-t', '0x88CC'], **kw)
+            # Filter for LLDP EtherType 0x88CC.
+            # Modern pktmon (Win10 2004+ / Win11) uses -d for ethertype/datalink;
+            # older versions used -t. Try new syntax first, fall back to old.
+            r = sp.run(['pktmon', 'filter', 'add', 'LLDP', '-d', '0x88CC'], **kw)
+            if r.returncode != 0:
+                # Fallback to legacy syntax for pre-2004 pktmon
+                r = sp.run(['pktmon', 'filter', 'add', 'LLDP', '-t', '0x88CC'], **kw)
             if r.returncode != 0:
                 self.after(0, self._done, None,
-                           "pktmon filter failed — is this Windows 10 2004 or later?")
+                           "pktmon filter failed:\n" +
+                           r.stderr.decode(errors='replace') +
+                           "\n(Need Windows 10 2004+ or Windows 11, with admin rights.)")
                 return
 
             # Start capture
