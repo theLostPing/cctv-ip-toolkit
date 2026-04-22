@@ -1,10 +1,20 @@
 # CCTV IP Toolkit
 
-[![Latest Release](https://img.shields.io/github/v/release/theLostPing/cctv-ip-toolkit?style=flat-square&color=0969da&label=Download%20EXE)](https://github.com/theLostPing/cctv-ip-toolkit/releases/latest)
+<p align="center">
+  <a href="https://cctv.thelostping.net">
+    <img src="https://img.shields.io/badge/⬇_Download_on_cctv.thelostping.net-0969da?style=for-the-badge&logoColor=white" alt="Download on cctv.thelostping.net" height="48">
+  </a>
+</p>
+
 [![Code Signing](https://img.shields.io/badge/Code%20Signing-IN%20PROGRESS-f59e0b?style=flat-square)](https://cctv.thelostping.net/#transparency)
+[![Latest Release (mirror)](https://img.shields.io/github/v/release/theLostPing/cctv-ip-toolkit?style=flat-square&color=555&label=GitHub%20Release)](https://github.com/theLostPing/cctv-ip-toolkit/releases/latest)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95-FFDD00?style=flat-square&labelColor=1a1a2e)](https://buymeacoffee.com/thelostping)
 
-> **⬇ Download the EXE from the [latest GitHub release](https://github.com/theLostPing/cctv-ip-toolkit/releases/latest).** Docs + install notes at [cctv.thelostping.net](https://cctv.thelostping.net). This repo is the source mirror — published so every binary can be audited or rebuilt from scratch.
+> ## 📥 Get the EXE at **[cctv.thelostping.net](https://cctv.thelostping.net)**
+>
+> One-click download, above the fold. Install notes, SmartScreen walkthrough, and release notes are all there.
+>
+> This repo is the **source mirror** — published so every binary can be audited or rebuilt from scratch. [GitHub Releases](https://github.com/theLostPing/cctv-ip-toolkit/releases/latest) carry the same signed binary + SHA-256 for audit.
 
 Windows GUI toolkit for field techs programming Axis, Bosch, and Hanwha/Wisenet IP cameras.
 
