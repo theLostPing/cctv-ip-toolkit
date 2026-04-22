@@ -49,13 +49,24 @@ jobs:
         shell: pwsh
         run: |
           # Excludes per memory project_cctv_toolkit.md:
-          # .git, __pycache__, dist, *.bak, *.mp4, *.pcapng, Screenshot*.png, private/
-          $tmp = "$env:RUNNER_TEMP\src-stage"
-          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-          robocopy . $tmp /E `
-            /XD .git __pycache__ dist build private .github `
-            /XF *.bak *.mp4 *.pcapng Screenshot*.png | Out-Null
-          Compress-Archive -Path "$tmp\*" -DestinationPath dist\cctv-ip-toolkit-source.zip -Force
+          # .git, __pycache__, dist, build, private, .github
+          # file globs: *.bak, *.mp4, *.pcapng, Screenshot*.png
+          $excludeDirs = @('.git','__pycache__','dist','build','private','.github')
+          $excludeFiles = @('*.bak','*.mp4','*.pcapng','Screenshot*.png')
+          $items = Get-ChildItem -Path . -Force | Where-Object {
+            $_.Name -notin $excludeDirs -and
+            -not ($excludeFiles | Where-Object { $_n = $_; $item = $args[0]; $item.Name -like $_n })
+          }
+          # Stage to a temp dir so Compress-Archive preserves structure cleanly.
+          $stage = Join-Path $env:RUNNER_TEMP 'src-stage'
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          foreach ($item in $items) {
+            Copy-Item $item.FullName -Destination $stage -Recurse -Force `
+              -Exclude ($excludeFiles + $excludeDirs)
+          }
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\cctv-ip-toolkit-source.zip" -Force
+          Write-Host "source zip built: $(Get-Item dist\cctv-ip-toolkit-source.zip | Select-Object -Expand Length) bytes"
 
       # Placeholder for Azure Trusted Signing. Uncomment + fill in once the
       # Azure account + code-signing account is provisioned. The action docs
