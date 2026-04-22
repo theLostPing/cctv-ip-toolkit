@@ -1,20 +1,18 @@
 # CCTV IP Toolkit
 
 <p align="center">
-  <a href="https://cctv.thelostping.net">
-    <img src="https://img.shields.io/badge/⬇_Download_on_cctv.thelostping.net-0969da?style=for-the-badge&logoColor=white" alt="Download on cctv.thelostping.net" height="48">
+  <a href="https://github.com/theLostPing/cctv-ip-toolkit/releases/latest">
+    <img src="https://img.shields.io/badge/⬇_Download_Latest_Release-0969da?style=for-the-badge&logoColor=white" alt="Download latest release" height="48">
   </a>
 </p>
 
+[![Latest Release](https://img.shields.io/github/v/release/theLostPing/cctv-ip-toolkit?style=flat-square&color=0969da&label=version)](https://github.com/theLostPing/cctv-ip-toolkit/releases/latest)
 [![Code Signing](https://img.shields.io/badge/Code%20Signing-IN%20PROGRESS-f59e0b?style=flat-square)](https://cctv.thelostping.net/#transparency)
-[![Latest Release (mirror)](https://img.shields.io/github/v/release/theLostPing/cctv-ip-toolkit?style=flat-square&color=555&label=GitHub%20Release)](https://github.com/theLostPing/cctv-ip-toolkit/releases/latest)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95-FFDD00?style=flat-square&labelColor=1a1a2e)](https://buymeacoffee.com/thelostping)
 
-> ## 📥 Get the EXE at **[cctv.thelostping.net](https://cctv.thelostping.net)**
+> ## 📥 Get the EXE from the [latest GitHub release](https://github.com/theLostPing/cctv-ip-toolkit/releases/latest)
 >
-> One-click download, above the fold. Install notes, SmartScreen walkthrough, and release notes are all there.
->
-> This repo is the **source mirror** — published so every binary can be audited or rebuilt from scratch. [GitHub Releases](https://github.com/theLostPing/cctv-ip-toolkit/releases/latest) carry the same signed binary + SHA-256 for audit.
+> Docs, install notes, and the SmartScreen walkthrough live at [cctv.thelostping.net](https://cctv.thelostping.net) (no binary hosted there — GitHub is the source of truth for downloads).
 
 Windows GUI toolkit for field techs programming Axis, Bosch, and Hanwha/Wisenet IP cameras.
 
