@@ -2,9 +2,11 @@
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%E2%98%95-FFDD00?style=flat-square&labelColor=1a1a2e)](https://buymeacoffee.com/thelostping)
 
-Windows GUI toolkit for field techs programming Axis, Bosch, and Hanwha/Wisenet IP cameras. Distribution site: **[cctv.thelostping.net](https://cctv.thelostping.net)**.
+> **Downloads, docs, and install notes: [cctv.thelostping.net](https://cctv.thelostping.net).** This repo is the source mirror — published so the binary on the site can be audited or rebuilt from scratch.
 
-Source is published here so the binary on the website can be audited and/or rebuilt from scratch. The `.exe` isn't Microsoft-code-signed yet, so Windows SmartScreen will warn on first run — if that's a dealbreaker for you, compile it yourself from this repo.
+Windows GUI toolkit for field techs programming Axis, Bosch, and Hanwha/Wisenet IP cameras.
+
+The `.exe` isn't Microsoft-code-signed yet (in-progress via Azure Trusted Signing), so Windows SmartScreen will warn on first run — if that's a dealbreaker for you, compile it yourself from this repo.
 
 ## Features
 
