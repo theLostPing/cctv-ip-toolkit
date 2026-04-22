@@ -1,0 +1,96 @@
+name: Build CCTV IP Toolkit
+
+# Fires on:
+#   - Tagged release (v*) -> builds + uploads EXE + source zip to the GitHub release
+#   - Manual trigger (workflow_dispatch) -> builds and drops artifacts for download
+#   - Any push to master -> builds and drops artifacts (sanity check, no release)
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller requests pillow openpyxl
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller --clean AxisCameraToolkit.spec
+
+      - name: Rename EXE to public filename
+        shell: pwsh
+        run: |
+          Move-Item dist\AxisCameraToolkit.exe dist\CCTVIPToolkit.exe -Force
+
+      - name: Compute SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 dist\CCTVIPToolkit.exe).Hash.ToLower()
+          Write-Host "SHA-256: $hash"
+          Set-Content -Path dist\CCTVIPToolkit.exe.sha256 -Value "$hash  CCTVIPToolkit.exe"
+
+      - name: Build source zip (public release pattern)
+        shell: pwsh
+        run: |
+          # Excludes per memory project_cctv_toolkit.md:
+          # .git, __pycache__, dist, *.bak, *.mp4, *.pcapng, Screenshot*.png, private/
+          $tmp = "$env:RUNNER_TEMP\src-stage"
+          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+          robocopy . $tmp /E `
+            /XD .git __pycache__ dist build private .github `
+            /XF *.bak *.mp4 *.pcapng Screenshot*.png | Out-Null
+          Compress-Archive -Path "$tmp\*" -DestinationPath dist\cctv-ip-toolkit-source.zip -Force
+
+      # Placeholder for Azure Trusted Signing. Uncomment + fill in once the
+      # Azure account + code-signing account is provisioned. The action docs
+      # are at https://github.com/Azure/trusted-signing-action
+      # - name: Sign CCTVIPToolkit.exe with Azure Trusted Signing
+      #   uses: azure/trusted-signing-action@v0.4.0
+      #   with:
+      #     azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      #     azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      #     azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+      #     endpoint: https://eus.codesigning.azure.net/
+      #     trusted-signing-account-name: ${{ secrets.TS_ACCOUNT }}
+      #     certificate-profile-name: ${{ secrets.TS_PROFILE }}
+      #     files-folder: dist
+      #     files-folder-filter: exe
+      #     file-digest: SHA256
+      #     timestamp-rfc3161: http://timestamp.acs.microsoft.com
+      #     timestamp-digest: SHA256
+
+      - name: Upload build artifacts (every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CCTVIPToolkit-${{ github.sha }}
+          path: |
+            dist/CCTVIPToolkit.exe
+            dist/CCTVIPToolkit.exe.sha256
+            dist/cctv-ip-toolkit-source.zip
+          retention-days: 30
+
+      - name: Attach to GitHub Release (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/CCTVIPToolkit.exe
+            dist/CCTVIPToolkit.exe.sha256
+            dist/cctv-ip-toolkit-source.zip
+          generate_release_notes: true
