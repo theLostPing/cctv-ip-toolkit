@@ -31,6 +31,21 @@ Windows GUI toolkit for field techs programming Axis, Bosch, and Hanwha/Wisenet 
 - DPI-aware UI; dialogs clamp to the active monitor on multi-display rigs
 - Remembers per-job preferences in an INI file
 
+## Where your data lives
+
+Two folders, on purpose: the program is disposable, your data isn't.
+
+| | Path | What | Why |
+|---|---|---|---|
+| **Config** | `%APPDATA%\CCTVIPToolkit\` | `passwords.json`, `cameras.json`, `settings.ini`, `additional_users.json` | Private per-user profile; follows you across reinstalls and machine moves. Never shipped inside the .exe. |
+| **Exports** | `%USERPROFILE%\Documents\CCTV Toolkit\` *(default, user-configurable)* | `programmed_cameras.csv`, `ping_results.csv`, `found_passwords.csv`, `screenshots/`, `triplett/` | Visible, browseable, zippable for the site report. Change it from **File → Settings → Export Folder** to point at a per-site folder if you want each job kept separate. |
+
+Upgrades never touch either folder — drop in a new `CCTVIPToolkit.exe` and your password list + camera history are still there.
+
+Quick jumps: **File → Open Export Folder** / **File → Open Config Folder**.
+
+If you used v4.0, a one-time migration on first launch copies your old `./data/` folder into the two new locations and leaves the original untouched as a backup.
+
 ## Supported brands
 
 | Brand | Protocol(s) |

@@ -44,6 +44,8 @@ import struct
 from io import BytesIO
 import configparser
 import ftplib
+import shutil
+from pathlib import Path
 
 try:
     from PIL import Image, ImageTk, ImageDraw, ImageFont
@@ -61,17 +63,114 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.0"
-DATA_FOLDER = "data"
-SETTINGS_FILE = os.path.join(DATA_FOLDER, "settings.ini")
-CAMERAS_FILE = os.path.join(DATA_FOLDER, "cameras.json")
-PASSWORDS_FILE = os.path.join(DATA_FOLDER, "passwords.json")
-IMAGES_DIR = os.path.join(DATA_FOLDER, "images")
-TRIPLETT_DIR = os.path.join(DATA_FOLDER, "triplett")
-OUTPUT_CSV = os.path.join(DATA_FOLDER, "programmed_cameras.csv")
-PING_RESULTS = os.path.join(DATA_FOLDER, "ping_results.csv")
-SUCCESSFUL_PASSWORDS = os.path.join(DATA_FOLDER, "found_passwords.csv")
-ADDITIONAL_USERS_FILE = os.path.join(DATA_FOLDER, "additional_users.json")
+APP_VERSION = "4.1"
+
+# v4.1 split: config (private, survives upgrades) vs. exports (visible, user-configurable).
+#   CONFIG_DIR -> %APPDATA%\CCTVIPToolkit\       (passwords, cameras, settings)
+#   EXPORT_DIR -> %USERPROFILE%\Documents\CCTV Toolkit\  (CSVs, screenshots, FTP pulls)
+# Both are created on first launch; legacy ./data/ next to the .exe is auto-migrated once.
+APP_NAME = "CCTVIPToolkit"
+
+def _default_config_dir() -> Path:
+    if sys.platform == 'win32':
+        root = os.environ.get('APPDATA') or str(Path.home() / 'AppData' / 'Roaming')
+    elif sys.platform == 'darwin':
+        root = str(Path.home() / 'Library' / 'Application Support')
+    else:
+        root = os.environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')
+    return Path(root) / APP_NAME
+
+def _default_export_dir() -> Path:
+    # Documents folder if it resolves; otherwise home.
+    docs = Path.home() / 'Documents'
+    if not docs.exists():
+        docs = Path.home()
+    return docs / 'CCTV Toolkit'
+
+CONFIG_DIR = _default_config_dir()
+# EXPORT_DIR is mutable — settings may point it elsewhere after load. Initial value is the default;
+# SettingsManager rebinds it via set_export_dir() during startup.
+EXPORT_DIR = _default_export_dir()
+
+# Config files (private, per-user)
+SETTINGS_FILE         = str(CONFIG_DIR / "settings.ini")
+CAMERAS_FILE          = str(CONFIG_DIR / "cameras.json")
+PASSWORDS_FILE        = str(CONFIG_DIR / "passwords.json")
+ADDITIONAL_USERS_FILE = str(CONFIG_DIR / "additional_users.json")
+
+# Export files (visible, user-configurable). These are rebuilt whenever EXPORT_DIR changes
+# via _rebind_export_paths() so the rest of the code can keep using the module-level names.
+IMAGES_DIR = TRIPLETT_DIR = OUTPUT_CSV = PING_RESULTS = SUCCESSFUL_PASSWORDS = ""
+
+def _rebind_export_paths():
+    global IMAGES_DIR, TRIPLETT_DIR, OUTPUT_CSV, PING_RESULTS, SUCCESSFUL_PASSWORDS
+    IMAGES_DIR           = str(EXPORT_DIR / "screenshots")
+    TRIPLETT_DIR         = str(EXPORT_DIR / "triplett")
+    OUTPUT_CSV           = str(EXPORT_DIR / "programmed_cameras.csv")
+    PING_RESULTS         = str(EXPORT_DIR / "ping_results.csv")
+    SUCCESSFUL_PASSWORDS = str(EXPORT_DIR / "found_passwords.csv")
+
+_rebind_export_paths()
+
+def _exe_dir() -> Path:
+    # Directory of the running .exe (PyInstaller) or the .py script.
+    return Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+
+_MIGRATION_NOTE: list = []  # filled by _migrate_legacy_data(); surfaced as a one-time dialog
+
+def _migrate_legacy_data():
+    """One-time: if old ./data/ lives next to the .exe, split it into CONFIG_DIR and EXPORT_DIR.
+    Copies (not moves) so the original stays as a belt-and-suspenders backup."""
+    legacy = _exe_dir() / 'data'
+    if not legacy.is_dir():
+        return
+    marker = CONFIG_DIR / '.migrated_from_data'
+    if marker.exists():
+        return
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    config_names = {'settings.ini', 'cameras.json', 'passwords.json', 'additional_users.json'}
+    export_file_map = {
+        'programmed_cameras.csv': 'programmed_cameras.csv',
+        'ping_results.csv':       'ping_results.csv',
+        'found_passwords.csv':    'found_passwords.csv',
+    }
+    export_dir_map = {
+        'images':   'screenshots',
+        'triplett': 'triplett',
+    }
+    copied = []
+    for item in legacy.iterdir():
+        try:
+            if item.is_file() and item.name in config_names:
+                dst = CONFIG_DIR / item.name
+                if not dst.exists():
+                    shutil.copy2(item, dst)
+                    copied.append(('config', item.name))
+            elif item.is_file() and item.name in export_file_map:
+                dst = EXPORT_DIR / export_file_map[item.name]
+                if not dst.exists():
+                    shutil.copy2(item, dst)
+                    copied.append(('export', item.name))
+            elif item.is_dir() and item.name in export_dir_map:
+                dst = EXPORT_DIR / export_dir_map[item.name]
+                if not dst.exists():
+                    shutil.copytree(item, dst)
+                    copied.append(('export', item.name + '/'))
+        except Exception as e:
+            copied.append(('error', f'{item.name}: {e}'))
+    # Record that we migrated, even if nothing copied (folder existed but was empty).
+    try:
+        marker.write_text(f"migrated at {datetime.now().isoformat()}\n")
+    except Exception:
+        pass
+    if copied:
+        _MIGRATION_NOTE.append((str(legacy), str(CONFIG_DIR), str(EXPORT_DIR), copied))
+
+# Create dirs + run migration before any data manager touches disk.
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+_migrate_legacy_data()
 TIMEOUT = 5
 
 # Bosch camera constants
@@ -108,7 +207,8 @@ DEFAULT_SETTINGS = {
         'android_ip': '',
         'first_run': 'true',
         'brand': 'axis',
-        'interface_index': ''
+        'interface_index': '',
+        'export_dir': '',  # blank = use default Documents/CCTV Toolkit
     },
     'warnings': {
         'show_incomplete_camera_warning': 'true',
@@ -165,7 +265,8 @@ class SettingsManager:
     def __init__(self):
         self.config = configparser.ConfigParser()
         self.load()
-    
+        self.apply_export_dir()
+
     def load(self):
         if os.path.exists(SETTINGS_FILE):
             self.config.read(SETTINGS_FILE)
@@ -177,11 +278,25 @@ class SettingsManager:
                 if key not in self.config[section]:
                     self.config[section][key] = val
         self.save()
-    
+
     def save(self):
-        os.makedirs(DATA_FOLDER, exist_ok=True)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(SETTINGS_FILE, 'w') as f:
             self.config.write(f)
+
+    def apply_export_dir(self):
+        """Point EXPORT_DIR at the user's configured folder (or the default) and rebind the
+        module-level export paths so the rest of the code picks it up without further work."""
+        global EXPORT_DIR
+        configured = (self.config.get('general', 'export_dir', fallback='') or '').strip()
+        target = Path(configured) if configured else _default_export_dir()
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            target = _default_export_dir()
+            target.mkdir(parents=True, exist_ok=True)
+        EXPORT_DIR = target
+        _rebind_export_paths()
     
     def get(self, section, key):
         return self.config.get(section, key, fallback=DEFAULT_SETTINGS.get(section, {}).get(key, ''))
@@ -219,7 +334,7 @@ class CameraDataManager:
         return self.cameras
     
     def save(self):
-        os.makedirs(DATA_FOLDER, exist_ok=True)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(CAMERAS_FILE, 'w') as f:
             json.dump(self.cameras, f, indent=2)
     
@@ -462,7 +577,7 @@ class PasswordDataManager:
         return self.passwords
     
     def save(self):
-        os.makedirs(DATA_FOLDER, exist_ok=True)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(PASSWORDS_FILE, 'w') as f:
             json.dump(self.passwords, f, indent=2)
     
@@ -502,7 +617,7 @@ class AdditionalUsersDataManager:
         return self.users
 
     def save(self):
-        os.makedirs(DATA_FOLDER, exist_ok=True)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(ADDITIONAL_USERS_FILE, 'w') as f:
             json.dump(self.users, f, indent=2)
 
@@ -4526,7 +4641,23 @@ class CCTVToolkitApp:
         # Create UI
         self.create_menu()
         self.create_main_ui()
-        
+
+        # One-time notice if we migrated a legacy ./data/ folder on startup
+        if _MIGRATION_NOTE:
+            legacy, cfg, exp, copied = _MIGRATION_NOTE[0]
+            n_cfg = sum(1 for kind, _ in copied if kind == 'config')
+            n_exp = sum(1 for kind, _ in copied if kind == 'export')
+            self.root.after(400, lambda: messagebox.showinfo(
+                "Data folders moved",
+                "Your existing data folder has been split so upgrades don't wipe it out:\n\n"
+                f"  Config ({n_cfg} file(s)): {cfg}\n"
+                f"    • passwords, camera list, settings\n\n"
+                f"  Exports ({n_exp} item(s)): {exp}\n"
+                f"    • CSVs, screenshots, FTP pulls\n\n"
+                f"Your original folder is untouched at:\n  {legacy}\n"
+                "You can delete it after confirming the new folders look right."
+            ))
+
         # Check for first run
         if self.settings.get_bool('general', 'first_run'):
             self.show_welcome()
@@ -4555,7 +4686,8 @@ class CCTVToolkitApp:
         file_menu.add_command(label="Smart Import/Paste...", command=self.smart_import)
         file_menu.add_command(label="Export Cameras to CSV...", command=self.export_cameras)
         file_menu.add_separator()
-        file_menu.add_command(label="Open Data Folder", command=self.open_data_folder)
+        file_menu.add_command(label="Open Export Folder", command=self.open_export_folder)
+        file_menu.add_command(label="Open Config Folder", command=self.open_config_folder)
         file_menu.add_separator()
         file_menu.add_command(label="Settings", command=self.show_settings)
         file_menu.add_separator()
@@ -5273,61 +5405,65 @@ class CCTVToolkitApp:
         self.preview_label.pack()
         
         # ---- Triplett FTP Section ----
-        triplett_frame = ttk.LabelFrame(frame, text="📱 Send to Triplett", padding="10")
-        triplett_frame.pack(fill=tk.X, pady=(15, 0))
-        
-        # Instructions row
-        ttk.Label(triplett_frame, 
-                 text="Start FTP on the Triplett, then type the address shown on its screen.",
-                 foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-        
-        # Address input row
-        addr_row = ttk.Frame(triplett_frame)
-        addr_row.pack(fill=tk.X, pady=(8, 8))
-        
-        ttk.Label(addr_row, text="Triplett address:", font=('Helvetica', 10, 'bold')).pack(side=tk.LEFT)
-        
-        self.triplett_addr_var = tk.StringVar()
-        triplett_entry = ttk.Entry(addr_row, textvariable=self.triplett_addr_var, width=28, font=('Courier', 11))
-        triplett_entry.pack(side=tk.LEFT, padx=(10, 0))
-        
-        ttk.Label(addr_row, text="e.g. ftp://192.168.1.50:2121", 
-                 foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(10, 0))
-        
-        # Send buttons row
-        send_row = ttk.Frame(triplett_frame)
-        send_row.pack(fill=tk.X)
-        
-        self.triplett_cam_btn = tk.Button(send_row, text="📋 Send Camera List", 
-                                         command=self.triplett_send_cameras,
-                                         bg='#4CAF50', fg='white', font=('Helvetica', 10, 'bold'),
-                                         padx=12, pady=4, cursor='hand2')
-        self.triplett_cam_btn.pack(side=tk.LEFT, padx=(0, 8))
-        
-        self.triplett_pwd_btn = tk.Button(send_row, text="🔑 Send Passwords", 
-                                         command=self.triplett_send_passwords,
-                                         bg='#607D8B', fg='white', font=('Helvetica', 10, 'bold'),
-                                         padx=12, pady=4, cursor='hand2')
-        self.triplett_pwd_btn.pack(side=tk.LEFT, padx=(0, 8))
-        
-        self.triplett_file_btn = tk.Button(send_row, text="📁 Send File...", 
-                                          command=self.triplett_send_file,
-                                          bg='#795548', fg='white', font=('Helvetica', 10, 'bold'),
-                                          padx=12, pady=4, cursor='hand2')
-        self.triplett_file_btn.pack(side=tk.LEFT)
-        
-        # Retrieve row
-        recv_row = ttk.Frame(triplett_frame)
-        recv_row.pack(fill=tk.X, pady=(8, 0))
-        
-        self.triplett_recv_btn = tk.Button(recv_row, text="📥 Retrieve from Triplett", 
-                                           command=self.triplett_retrieve,
-                                           bg='#1976D2', fg='white', font=('Helvetica', 10, 'bold'),
-                                           padx=12, pady=4, cursor='hand2')
-        self.triplett_recv_btn.pack(side=tk.LEFT, padx=(0, 8))
-        
-        ttk.Label(recv_row, text="Downloads images, logs, passwords & results → data/triplett/",
-                 foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT)
+        # DORMANT in v4.1 — Triplett Android integration is coming in a future release.
+        # The UI is hidden; the implementation (send/retrieve/csv builders, see
+        # triplett_send_cameras / _send_passwords / _send_file / _retrieve / _build_triplett_csv_lines /
+        # _get_triplett_address / _ftp_push methods below) stays in the file and is
+        # re-exposed by flipping TRIPLETT_UI_ENABLED to True.
+        TRIPLETT_UI_ENABLED = False
+        if TRIPLETT_UI_ENABLED:
+            triplett_frame = ttk.LabelFrame(frame, text="📱 Send to Triplett", padding="10")
+            triplett_frame.pack(fill=tk.X, pady=(15, 0))
+
+            ttk.Label(triplett_frame,
+                     text="Start FTP on the Triplett, then type the address shown on its screen.",
+                     foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
+            addr_row = ttk.Frame(triplett_frame)
+            addr_row.pack(fill=tk.X, pady=(8, 8))
+            ttk.Label(addr_row, text="Triplett address:", font=('Helvetica', 10, 'bold')).pack(side=tk.LEFT)
+            self.triplett_addr_var = tk.StringVar()
+            triplett_entry = ttk.Entry(addr_row, textvariable=self.triplett_addr_var, width=28, font=('Courier', 11))
+            triplett_entry.pack(side=tk.LEFT, padx=(10, 0))
+            ttk.Label(addr_row, text="e.g. ftp://<device-ip>:2121",
+                     foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(10, 0))
+
+            send_row = ttk.Frame(triplett_frame)
+            send_row.pack(fill=tk.X)
+            self.triplett_cam_btn = tk.Button(send_row, text="📋 Send Camera List",
+                                             command=self.triplett_send_cameras,
+                                             bg='#4CAF50', fg='white', font=('Helvetica', 10, 'bold'),
+                                             padx=12, pady=4, cursor='hand2')
+            self.triplett_cam_btn.pack(side=tk.LEFT, padx=(0, 8))
+            self.triplett_pwd_btn = tk.Button(send_row, text="🔑 Send Passwords",
+                                             command=self.triplett_send_passwords,
+                                             bg='#607D8B', fg='white', font=('Helvetica', 10, 'bold'),
+                                             padx=12, pady=4, cursor='hand2')
+            self.triplett_pwd_btn.pack(side=tk.LEFT, padx=(0, 8))
+            self.triplett_file_btn = tk.Button(send_row, text="📁 Send File...",
+                                              command=self.triplett_send_file,
+                                              bg='#795548', fg='white', font=('Helvetica', 10, 'bold'),
+                                              padx=12, pady=4, cursor='hand2')
+            self.triplett_file_btn.pack(side=tk.LEFT)
+
+            recv_row = ttk.Frame(triplett_frame)
+            recv_row.pack(fill=tk.X, pady=(8, 0))
+            self.triplett_recv_btn = tk.Button(recv_row, text="📥 Retrieve from Triplett",
+                                               command=self.triplett_retrieve,
+                                               bg='#1976D2', fg='white', font=('Helvetica', 10, 'bold'),
+                                               padx=12, pady=4, cursor='hand2')
+            self.triplett_recv_btn.pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Label(recv_row, text="Downloads images, logs, passwords & results → <export folder>/triplett/",
+                     foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT)
+        else:
+            # Placeholder so the user sees the feature is on the roadmap.
+            placeholder = ttk.LabelFrame(frame, text="📱 Triplett Android Integration — Coming Soon",
+                                         padding="10")
+            placeholder.pack(fill=tk.X, pady=(15, 0))
+            ttk.Label(placeholder,
+                      text="Send camera lists, passwords, and files to the Triplett handheld over FTP, "
+                           "and pull back images / logs / results when you're done. Re-enabled in a future build.",
+                      foreground='gray', font=('Helvetica', 9), wraplength=720, justify=tk.LEFT).pack(anchor='w')
 
     # ========================================================================
     # PROGRAMMING STATUS TAB (live checklist for new wizard)
@@ -7127,7 +7263,7 @@ class CCTVToolkitApp:
             messagebox.showerror("File Error", f"Could not read file:\n\n{e}")
     
     def triplett_retrieve(self):
-        """Retrieve files from Triplett via FTP into data/triplett/."""
+        """Retrieve files from Triplett via FTP into the export folder's triplett/ subdir."""
         addr = self._get_triplett_address()
         if not addr:
             return
@@ -7179,11 +7315,11 @@ class CCTVToolkitApp:
                 
                 ftp.quit()
                 
-                summary = f"Retrieved {len(downloaded)} file(s) → data/triplett/\n\n"
+                summary = f"Retrieved {len(downloaded)} file(s) → {TRIPLETT_DIR}\n\n"
                 summary += '\n'.join(f"  • {fn}" for fn in downloaded)
-                
+
                 self.root.after(0, lambda: self.log(
-                    f"✓ Retrieved {len(downloaded)} file(s) from Triplett → data/triplett/"))
+                    f"✓ Retrieved {len(downloaded)} file(s) from Triplett → {TRIPLETT_DIR}"))
                 self.root.after(0, lambda: messagebox.showinfo("Retrieved", summary))
                 
             except ConnectionRefusedError:
@@ -7586,6 +7722,35 @@ https://buymeacoffee.com/thelostping""")
             entry.grid(row=i, column=1, sticky='w', padx=(15, 0), pady=5)
             settings_entries[key] = entry
         
+        # Export folder section
+        export_frame = ttk.LabelFrame(frame, text="Export Folder (CSVs, screenshots, FTP pulls)", padding="15")
+        export_frame.pack(fill=tk.X, pady=(0, 15))
+
+        current_export = self.settings.get('general', 'export_dir') or str(_default_export_dir())
+        export_var = tk.StringVar(value=current_export)
+        export_row = ttk.Frame(export_frame)
+        export_row.pack(fill=tk.X)
+        export_entry = ttk.Entry(export_row, textvariable=export_var, font=('Helvetica', 10))
+        export_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        def pick_export_dir():
+            chosen = filedialog.askdirectory(
+                parent=w,
+                title="Choose export folder",
+                initialdir=export_var.get() or str(Path.home()),
+            )
+            if chosen:
+                export_var.set(chosen)
+        ttk.Button(export_row, text="Browse…", command=pick_export_dir).pack(side=tk.LEFT, padx=(8, 0))
+
+        def reset_export_dir():
+            export_var.set(str(_default_export_dir()))
+        ttk.Button(export_row, text="Reset", command=reset_export_dir).pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(export_frame,
+                  text="Config (passwords, camera list, settings) always stays in your user profile and survives upgrades.",
+                  foreground='gray', font=('Helvetica', 9), wraplength=540, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
+
         # Warnings section
         warnings_frame = ttk.LabelFrame(frame, text="Show Warnings", padding="15")
         warnings_frame.pack(fill=tk.X, pady=(0, 15))
@@ -7608,17 +7773,37 @@ https://buymeacoffee.com/thelostping""")
                 self.settings.set('general', key, entry.get())
             for key, var in warning_vars.items():
                 self.settings.set('warnings', key, str(var.get()).lower())
+            # Export dir: blank = default
+            new_export = (export_var.get() or '').strip()
+            default_export = str(_default_export_dir())
+            persisted = '' if (not new_export or new_export == default_export) else new_export
+            self.settings.set('general', 'export_dir', persisted)
+            self.settings.apply_export_dir()
             w.destroy()
-            messagebox.showinfo("Saved", "Settings saved successfully")
+            messagebox.showinfo("Saved", f"Settings saved.\n\nExport folder: {EXPORT_DIR}")
         
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(pady=15)
         ttk.Button(btn_frame, text="💾 Save Settings", command=save_settings).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=w.destroy).pack(side=tk.LEFT, padx=5)
     
-    def open_data_folder(self):
-        os.makedirs(DATA_FOLDER, exist_ok=True)
-        os.startfile(DATA_FOLDER)
+    def open_export_folder(self):
+        """Open the folder where CSVs, screenshots, and FTP pulls land."""
+        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(EXPORT_DIR))
+        except AttributeError:
+            import subprocess
+            subprocess.Popen(['xdg-open' if sys.platform.startswith('linux') else 'open', str(EXPORT_DIR)])
+
+    def open_config_folder(self):
+        """Open the private folder with saved passwords, camera list, and settings."""
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(CONFIG_DIR))
+        except AttributeError:
+            import subprocess
+            subprocess.Popen(['xdg-open' if sys.platform.startswith('linux') else 'open', str(CONFIG_DIR)])
     
     # ========================================================================
     # OPERATION WIZARDS
