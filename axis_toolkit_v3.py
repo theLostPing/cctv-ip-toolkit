@@ -45,6 +45,7 @@ from io import BytesIO
 import configparser
 import ftplib
 import shutil
+import urllib.request
 from pathlib import Path
 
 try:
@@ -63,7 +64,9 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.1"
+APP_VERSION = "4.2"
+GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
+GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 
 # v4.1 split: config (private, survives upgrades) vs. exports (visible, user-configurable).
 #   CONFIG_DIR -> %APPDATA%\CCTVIPToolkit\       (passwords, cameras, settings)
@@ -209,6 +212,8 @@ DEFAULT_SETTINGS = {
         'brand': 'axis',
         'interface_index': '',
         'export_dir': '',  # blank = use default Documents/CCTV Toolkit
+        'last_seen_version': '',  # for "what's new" popup on first launch of a new version
+        'last_dismissed_version': '',  # suppresses nag when user chose "remind me later"
     },
     'warnings': {
         'show_incomplete_camera_warning': 'true',
@@ -4672,9 +4677,24 @@ class CCTVToolkitApp:
             self.settings.set('general', 'first_run', 'false')
         
         self.process_log_queue()
-        
+
         # Start background network scan
         self.root.after(500, self.background_scan)
+
+        # First-launch-of-this-version: show What's New popup once.
+        last_seen = self.settings.get('general', 'last_seen_version') or ''
+        if last_seen != APP_VERSION:
+            # Delay so main UI is visible first, then fire the what's-new popup.
+            self.root.after(1200, lambda: self.show_whats_new(APP_VERSION))
+            self.settings.set('general', 'last_seen_version', APP_VERSION)
+
+        # Silent update check on every launch. Runs off the UI thread so a slow
+        # network call can't block startup; if a newer version exists and the user
+        # hasn't dismissed that exact version, the dialog fires on the main thread.
+        threading.Thread(
+            target=lambda: self.root.after(2500, lambda: self.check_for_update(silent=True)),
+            daemon=True,
+        ).start()
     
     def create_menu(self):
         menubar = tk.Menu(self.root)
@@ -4701,6 +4721,8 @@ class CCTVToolkitApp:
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="Quick Start Guide", command=self.show_quick_start)
+        help_menu.add_command(label="What's New", command=self.show_whats_new)
+        help_menu.add_command(label="Check for Updates...", command=lambda: self.check_for_update(silent=False))
         help_menu.add_command(label="About", command=self.show_about)
         help_menu.add_separator()
         help_menu.add_command(label="Buy Me A Coffee ☕", command=lambda: __import__('webbrowser').open('https://buymeacoffee.com/thelostping'))
@@ -7660,6 +7682,146 @@ Email: axisprogrammer@thelostping.net
 """)
         t.config(state=tk.DISABLED)
     
+    # ------------------------------------------------------------------
+    # Update checking
+    # ------------------------------------------------------------------
+    def _fetch_latest_release(self, timeout=6):
+        """Return (tag, body, html_url) of the latest published release, or None."""
+        try:
+            req = urllib.request.Request(
+                GITHUB_LATEST_API,
+                headers={"User-Agent": f"CCTVIPToolkit/{APP_VERSION}",
+                         "Accept": "application/vnd.github+json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            tag = (data.get("tag_name") or "").lstrip("vV").strip()
+            body = (data.get("body") or "").strip()
+            url = data.get("html_url") or GITHUB_RELEASES_PAGE
+            return tag, body, url
+        except Exception:
+            return None
+
+    @staticmethod
+    def _version_tuple(v):
+        """'4.2' -> (4, 2). Handles 4.2.1, v4.2-beta1, etc. gracefully."""
+        parts = []
+        for chunk in re.split(r"[.\-+]", (v or "").lstrip("vV")):
+            m = re.match(r"^(\d+)", chunk)
+            if m:
+                parts.append(int(m.group(1)))
+        return tuple(parts) or (0,)
+
+    def check_for_update(self, silent=False):
+        """Hit GitHub's latest-release API, compare tags. If newer available, show
+        dialog with release notes + Download / Remind Later buttons. When silent=True,
+        stay quiet if there's nothing new (used for the startup auto-check)."""
+        result = self._fetch_latest_release()
+        if not result:
+            if not silent:
+                messagebox.showwarning(
+                    "Update Check Failed",
+                    "Couldn't reach GitHub to check for updates.\n\n"
+                    f"Running version: {APP_VERSION}\n\n"
+                    f"You can check manually at:\n{GITHUB_RELEASES_PAGE}",
+                )
+            return
+        latest_tag, body, url = result
+        latest_tup = self._version_tuple(latest_tag)
+        current_tup = self._version_tuple(APP_VERSION)
+
+        if latest_tup <= current_tup:
+            if not silent:
+                messagebox.showinfo(
+                    "You're Up to Date",
+                    f"Running v{APP_VERSION} - latest published is v{latest_tag}.\n\nYou're current.",
+                )
+            return
+
+        # Newer version exists. If user already dismissed this specific version, stay silent.
+        if silent and self.settings.get('general', 'last_dismissed_version') == latest_tag:
+            return
+
+        self._show_update_dialog(latest_tag, body, url)
+
+    def _show_update_dialog(self, latest_tag, body, url):
+        """Toplevel showing version diff + release notes + action buttons."""
+        w = tk.Toplevel(self.root)
+        w.title("Update Available")
+        w.geometry("640x520")
+        w.transient(self.root)
+        w.grab_set()
+        w.update_idletasks()
+        px = self.root.winfo_x() + (self.root.winfo_width() - 640) // 2
+        py = self.root.winfo_y() + (self.root.winfo_height() - 520) // 2
+        w.geometry(f"640x520+{max(px, 0)}+{max(py, 0)}")
+
+        ttk.Label(w, text=f"New version: v{latest_tag}",
+                  font=('Helvetica', 16, 'bold')).pack(pady=(18, 4))
+        ttk.Label(w, text=f"You're on v{APP_VERSION}",
+                  foreground='gray', font=('Helvetica', 10)).pack(pady=(0, 10))
+
+        notes_frame = ttk.LabelFrame(w, text="Release Notes", padding=8)
+        notes_frame.pack(fill=tk.BOTH, expand=True, padx=18, pady=6)
+        txt = scrolledtext.ScrolledText(notes_frame, wrap=tk.WORD, height=14,
+                                        font=('Helvetica', 10))
+        txt.pack(fill=tk.BOTH, expand=True)
+        txt.insert('1.0', body if body else "(no release notes published)")
+        txt.config(state=tk.DISABLED)
+
+        btns = ttk.Frame(w)
+        btns.pack(fill=tk.X, padx=18, pady=(6, 14))
+
+        def open_release():
+            import webbrowser
+            webbrowser.open(url)
+
+        def remind_later():
+            self.settings.set('general', 'last_dismissed_version', latest_tag)
+            w.destroy()
+
+        ttk.Button(btns, text="Download on GitHub", command=open_release).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Remind Me Later", command=remind_later).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(btns, text="Close", command=w.destroy).pack(side=tk.RIGHT)
+
+    # ------------------------------------------------------------------
+    # What's New (first launch of a new version)
+    # ------------------------------------------------------------------
+    WHATS_NEW = {
+        "4.2": (
+            "What's new in v4.2",
+            [
+                "• Built-in update checker — Help menu + silent check on startup.",
+                "• First-launch \"What's New\" popup (this dialog) so version bumps don't sneak past you.",
+                "• Data split in v4.1 carried forward: config in %APPDATA%, exports in Documents.",
+                "• Triplett Android integration stays dormant -- placeholder in the UI, code preserved for future re-enable.",
+                "• Dashboard and logger tweaks to quieten ambient IR from sunlight reaching the TSOP.",
+            ],
+        ),
+        "4.1": (
+            "What's new in v4.1",
+            [
+                "• Config moved to %APPDATA%\\CCTVIPToolkit\\ so upgrades never wipe your password list or camera list.",
+                "• Exports moved to Documents\\CCTV Toolkit (user-configurable in Settings).",
+                "• File menu: Open Export Folder + Open Config Folder replace the old Open Data Folder.",
+                "• One-time migration copies any legacy ./data/ next to the .exe into both new locations, leaves the original as a safety net.",
+                "• Triplett Android integration UI hidden pending a future release (code kept intact).",
+            ],
+        ),
+    }
+
+    def show_whats_new(self, version=None):
+        """Show the release notes for a specific version (default: current APP_VERSION).
+        Called automatically on first launch of a new version; also available from Help menu."""
+        v = version or APP_VERSION
+        entry = self.WHATS_NEW.get(v)
+        if not entry:
+            messagebox.showinfo("What's New",
+                                f"No local release notes for v{v}.\n\nFull changelog on GitHub:\n{GITHUB_RELEASES_PAGE}")
+            return
+        title, bullets = entry
+        messagebox.showinfo(title, "\n".join(bullets) + f"\n\nFull changelog: {GITHUB_RELEASES_PAGE}")
+
     def show_about(self):
         messagebox.showinfo("About", f"""CCTV IP Toolkit v{APP_VERSION}
 
