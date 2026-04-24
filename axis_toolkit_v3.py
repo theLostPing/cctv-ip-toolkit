@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.2.2"
+APP_VERSION = "4.2.3"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 
@@ -7788,6 +7788,14 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.2.3": (
+            "What's new in v4.2.3",
+            [
+                "• New canonical home: https://fieldtoolkit.com (was cctv.thelostping.net).",
+                "• The old URL still works — it 301 redirects to fieldtoolkit.com.",
+                "• No functional app changes from 4.2.2.",
+            ],
+        ),
         "4.2.2": (
             "What's new in v4.2.2",
             [
