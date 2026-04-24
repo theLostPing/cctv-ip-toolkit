@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.2.1"
+APP_VERSION = "4.2.2"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 
@@ -7788,6 +7788,13 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.2.2": (
+            "What's new in v4.2.2",
+            [
+                "• New app icon — cleaner, more professional mark.",
+                "• No functional changes from 4.2.1.",
+            ],
+        ),
         "4.2.1": (
             "What's new in v4.2.1",
             [
