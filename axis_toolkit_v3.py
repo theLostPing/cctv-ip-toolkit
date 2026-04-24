@@ -7795,7 +7795,6 @@ Email: axisprogrammer@thelostping.net
                 "• First-launch \"What's New\" popup (this dialog) so version bumps don't sneak past you.",
                 "• Data split in v4.1 carried forward: config in %APPDATA%, exports in Documents.",
                 "• Triplett Android integration stays dormant -- placeholder in the UI, code preserved for future re-enable.",
-                "• Dashboard and logger tweaks to quieten ambient IR from sunlight reaching the TSOP.",
             ],
         ),
         "4.1": (
