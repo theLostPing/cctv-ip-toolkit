@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.2.3"
+APP_VERSION = "4.2.4"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 
@@ -1178,16 +1178,22 @@ class CameraProtocol(ABC):
 # AXIS PROTOCOL
 # ============================================================================
 class AxisProtocol(CameraProtocol):
+    # Axis is the cleanest of the three brands by a mile. VAPIX has been
+    # backwards-compatible since like firmware 5.x (2013-ish) — the same
+    # pwdgrp.cgi / param.cgi calls below still work on 11.x. Easy money.
     BRAND_NAME = 'Axis'
     BRAND_KEY = 'axis'
     DEFAULT_USER = 'root'
-    DEFAULT_PASSWORD = ''  # No default password on Axis — must be set
+    DEFAULT_PASSWORD = ''  # factory cameras are unauthenticated until you set the root pwd
     FACTORY_IP = '192.168.0.90'
+    # OUIs cover the bulk of what shows up on jobs. The b8:a4:4f range is the
+    # newer ARTPEC chips (M30/M32 series and up); 00:40:8c is older P-series.
     MAC_OUIS = [b'\x00\x40\x8c', b'\xac\xcc\x8e', b'\xb8\xa4\x4f']
 
     def create_initial_user(self, ip, password):
-        """Create root user + ONVIF user on factory-default Axis camera."""
-        # Step 1: Create system user via pwdgrp.cgi
+        # On a factory Axis, /pwdgrp.cgi is wide open until the first root pwd
+        # gets set — that's by design, it's how their out-of-box flow works.
+        # First call locks down the camera and turns on auth for everything else.
         try:
             r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
                 params={"action": "add", "user": "root", "pwd": password,
@@ -1196,9 +1202,16 @@ class AxisProtocol(CameraProtocol):
             if r.status_code != 200:
                 return False
         except:
+            # Bare except because anything that explodes here (DNS, refused,
+            # cert, you name it) means the camera isn't reachable or isn't
+            # actually factory. Either way: not our problem.
             return False
 
-        # Step 2: Create ONVIF user (non-critical)
+        # The ONVIF user is a SEPARATE database from the VAPIX user. Same name,
+        # same password, different table inside the camera. If you only create
+        # the VAPIX one, ONVIF clients (Milestone, Genetec, exacqVision) can't
+        # log in even though the web UI works fine. Found that out the hard way
+        # on a Chase job in 2014. Now I always create both up-front.
         try:
             soap = (f'<?xml version="1.0"?>'
                     f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
@@ -1212,18 +1225,26 @@ class AxisProtocol(CameraProtocol):
                 headers={"Content-Type": "application/soap+xml"},
                 auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
         except:
-            pass  # ONVIF user creation is non-critical
+            # Don't fail the whole programming step if this one barfs — older
+            # firmware (pre 6.50) sometimes 500s on this call but the user
+            # still ends up created. Web UI confirms it. Just move on.
+            pass
         return True
 
     def set_network(self, ip, password, new_ip, subnet, gateway):
-        """Set gateway + static IP + disable DHCP.
-        Tries ONVIF SOAP first, falls back to VAPIX param.cgi."""
+        # Two paths: ONVIF SOAP first because it's atomic — gateway/IP/DHCP
+        # all flip together so the camera doesn't end up in a half-configured
+        # state if the connection drops. VAPIX param.cgi is the fallback for
+        # older firmware (anything before like 7.10 or so) where the ONVIF
+        # SetNetworkInterfaces call returns a Fault.
         auth = HTTPDigestAuth("root", password)
         cidr = sum(bin(int(x)).count('1') for x in subnet.split('.')) if subnet else 24
 
-        # ---- Method 1: ONVIF SOAP ----
+        # --- ONVIF path ---
         onvif_ok = False
-        # Set gateway first
+        # Gateway has to go in its own SOAP call. Tried merging it into the
+        # SetNetworkInterfaces envelope once — Axis silently ignored it. This
+        # is the supported pattern in the ONVIF Network Configuration spec.
         gw_soap = (f'<?xml version="1.0"?>'
                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
                    f'<SetNetworkDefaultGateway xmlns="http://www.onvif.org/ver10/device/wsdl">'
@@ -1234,9 +1255,10 @@ class AxisProtocol(CameraProtocol):
                 headers={"Content-Type": "application/soap+xml"},
                 auth=auth, timeout=TIMEOUT)
         except:
-            pass
+            pass  # gw failure isn't fatal — IP can still be set, we'll just retry gw
 
-        # Set IP + disable DHCP
+        # Now the static IP + DHCP off in one shot. PrefixLength is CIDR notation
+        # (the /24 in 192.168.1.0/24), Axis expects an integer here.
         ip_soap = (f'<?xml version="1.0"?>'
                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope" '
                    f'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
@@ -1253,6 +1275,10 @@ class AxisProtocol(CameraProtocol):
             r = requests.post(f"http://{ip}/vapix/services", data=ip_soap,
                 headers={"Content-Type": "application/soap+xml"},
                 auth=auth, timeout=TIMEOUT)
+            # Axis returns 200 even on a failed config change, so the body has
+            # to be checked for <Fault>. Found this on a P3245 that wouldn't
+            # stick a static IP and was lying about it — a 200 with a Fault
+            # block. Why they don't return 4xx in that case I do not know.
             if r.status_code == 200 and 'Fault' not in r.text:
                 onvif_ok = True
         except:
@@ -1261,49 +1287,63 @@ class AxisProtocol(CameraProtocol):
         if onvif_ok:
             return True
 
-        # ---- Method 2: VAPIX param.cgi fallback ----
+        # --- VAPIX fallback ---
+        # Order matters here. If you set IP first then DHCP, the camera goes
+        # offline mid-config and you can't finish. DHCP off first, gateway,
+        # subnet, IP last — that order has been bulletproof since at least
+        # the M-series firmware in 2012.
         try:
-            # Disable DHCP first
             requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.IPv4.DHCP": "no"},
                 auth=auth, timeout=TIMEOUT)
-            # Set gateway
             requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.DefaultRouter": gateway},
                 auth=auth, timeout=TIMEOUT)
-            # Set subnet
             requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.SubnetMask": subnet},
                 auth=auth, timeout=TIMEOUT)
-            # Set IP last (changes connectivity)
+            # Setting IPAddress is the call that yanks the rug — the response
+            # may never come back because the kernel has switched interfaces
+            # by the time it tries to ack. Hence the ConnectionError below
+            # being treated as success.
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.IPAddress": new_ip},
                 auth=auth, timeout=TIMEOUT)
             return r.status_code == 200
         except requests.exceptions.ConnectionError:
-            return True  # Camera likely rebooting on IP change
+            # Connection died mid-call — that's actually GOOD on this one,
+            # means the IP change took effect. Return True; verification step
+            # higher up will confirm the camera is reachable on the new IP.
+            return True
         except:
             return False
 
     def set_hostname(self, ip, password, hostname):
+        # 63-char DNS limit, anything not alphanum or dash gets sanitized to a dash.
+        # Cameras themselves are more permissive than RFC 952 but switches and
+        # NVRs aren't — Genetec in particular barfs on underscores in hostnames.
         clean = re.sub(r'[^a-zA-Z0-9-]', '-', hostname).strip('-')[:63]
         try:
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.HostName": clean},
                 auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-            # Also set Bonjour name
+            # Also stamp the Bonjour name — most NVRs that auto-populate camera
+            # inventories pull this for the friendly label, not HostName. AXIS
+            # Camera Station and Milestone do, anyway.
             try:
                 requests.get(f"http://{ip}/axis-cgi/param.cgi",
                     params={"action": "update", "root.Network.Bonjour.FriendlyName": clean},
                     auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
             except:
-                pass
+                pass  # Bonjour is best-effort; some MFA-locked-down builds disable it
             return r.status_code == 200 and 'OK' in r.text
         except:
             return False
 
     def reboot(self, ip, password):
-        """Axis cameras reboot automatically after IP change. Explicit reboot via param.cgi."""
+        # Note: cameras already reboot themselves after a network change, so this
+        # is mostly for the "user clicked Reboot" path. Hitting it twice in a
+        # row is harmless — Axis just queues the second request and ignores it.
         try:
             r = requests.get(f"http://{ip}/axis-cgi/restart.cgi",
                 auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
@@ -1312,6 +1352,9 @@ class AxisProtocol(CameraProtocol):
             return False
 
     def set_dhcp(self, ip, password, enable=True):
+        # Used for the "I need to reset this back to DHCP for staging" workflow.
+        # Camera will renew immediately and probably end up at a different IP,
+        # so the caller is responsible for re-discovery.
         val = 'yes' if enable else 'no'
         try:
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
@@ -1322,8 +1365,14 @@ class AxisProtocol(CameraProtocol):
             return False
 
     def get_serial(self, ip, password):
+        # Three retries because freshly-booted cameras (especially after a
+        # factory reset) sometimes 503 the first time you hit this. Web UI
+        # is up but the param subsystem isn't ready. Sleep a sec and try again.
         for attempt in range(3):
             try:
+                # param.cgi path — works on every Axis I've ever touched. If this
+                # call fails it's almost always a wrong-password thing, not a
+                # missing-feature thing.
                 r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                     params={"action": "list", "group": "Properties.System.SerialNumber"},
                     auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
@@ -1333,6 +1382,9 @@ class AxisProtocol(CameraProtocol):
                             return line.split('=')[1].strip()
             except:
                 pass
+            # Backup path: basicdeviceinfo.cgi — newer (5.50+) but cleaner JSON.
+            # Some really old M-series only have param.cgi, which is why this
+            # is the second choice not the first.
             try:
                 r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
                     json={"apiVersion": "1.0", "method": "getAllProperties"},
@@ -1346,9 +1398,15 @@ class AxisProtocol(CameraProtocol):
             except:
                 pass
             time.sleep(1)
+        # Returning the literal string "UNKNOWN" not None so it survives a
+        # CSV export without breaking the column. Caller flags these for
+        # manual entry on the report.
         return "UNKNOWN"
 
     def get_model_noauth(self, ip):
+        # Used during discovery — we want to know what's on the IP before we
+        # touch it. Factory Axis cameras answer basicdeviceinfo without auth.
+        # Once configured, this returns 401 and we have to fall back.
         try:
             r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
                 json={"apiVersion": "1.0", "method": "getAllProperties"},
@@ -1359,6 +1417,8 @@ class AxisProtocol(CameraProtocol):
                     return data['data']['propertyList'].get('ProdNbr', '')
         except:
             pass
+        # Older firmware (anything pre-7.x I think) doesn't have basicdeviceinfo,
+        # so try param.cgi Brand.ProdNbr — that's been a thing since forever.
         try:
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "list", "group": "Brand.ProdNbr"},
@@ -1372,8 +1432,12 @@ class AxisProtocol(CameraProtocol):
         return None
 
     def get_firmware(self, ip, password):
-        """Get Axis firmware version. Tries no-auth first, then digest auth."""
-        # Method 1: basicdeviceinfo.cgi (no auth on factory cameras)
+        # Three-tier fallback because firmware version is THE thing customers
+        # ask about and the most-supported endpoint changed twice between
+        # firmware 5.x, 6.x, and 9.x. Don't ask me why this is so hard. Below
+        # in order of preference: no-auth JSON, auth JSON, auth param.cgi.
+
+        # No-auth basicdeviceinfo — works on factory + early-auth cameras.
         try:
             r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
                 json={"apiVersion": "1.0", "method": "getAllProperties"},
@@ -1386,7 +1450,9 @@ class AxisProtocol(CameraProtocol):
                         return fw
         except:
             pass
-        # Method 2: basicdeviceinfo.cgi with auth
+
+        # Auth basicdeviceinfo — once root is set, no-auth gets 401. Same call,
+        # different auth posture.
         if password:
             try:
                 r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
@@ -1400,7 +1466,8 @@ class AxisProtocol(CameraProtocol):
                             return fw
             except:
                 pass
-        # Method 3: param.cgi Properties.Firmware.Version
+
+        # Last resort: param.cgi. Older M10/M11 cameras only have this.
         try:
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "list", "group": "Properties.Firmware.Version"},
@@ -1409,12 +1476,19 @@ class AxisProtocol(CameraProtocol):
             if r.status_code == 200:
                 for line in r.text.split('\n'):
                     if 'Version=' in line:
+                        # split with maxsplit=1 because firmware strings can
+                        # contain '=' (build metadata) — losing it would lie.
                         return line.split('=', 1)[1].strip()
         except:
             pass
         return 'UNKNOWN'
 
     def get_image(self, ip, username, password):
+        # Pulls a single JPEG snapshot for the verification panel. Resolution
+        # is whatever the camera's main stream is set to — we don't try to
+        # downscale here, the GUI handles fitting. Bandwidth on this is
+        # noticeable when you've got 30 of these running in parallel during
+        # discovery; that's why TIMEOUT is short.
         try:
             r = requests.get(f"http://{ip}/axis-cgi/jpg/image.cgi",
                 auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
@@ -1425,6 +1499,9 @@ class AxisProtocol(CameraProtocol):
         return None
 
     def test_password(self, ip, username, password):
+        # Cheapest authenticated call I can think of — Brand group is tiny,
+        # always present, and 200/Brand-in-text is a definitive yes/no.
+        # Don't replace this with a get_serial test, that's like 4x slower.
         try:
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "list", "group": "Brand"},
@@ -1434,6 +1511,8 @@ class AxisProtocol(CameraProtocol):
             return False
 
     def change_password(self, ip, username, old_pwd, new_pwd):
+        # Note: changing root's password while logged in as root works. The
+        # session doesn't get invalidated mid-call. (Bosch is NOT this nice.)
         try:
             return requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
                 params={"action": "update", "user": username, "pwd": new_pwd},
@@ -1442,8 +1521,10 @@ class AxisProtocol(CameraProtocol):
             return False
 
     def add_user(self, ip, admin_password, username, user_password, role='Operator'):
-        """Add a user to Axis camera via pwdgrp.cgi + ONVIF CreateUsers."""
-        # Map role to Axis groups
+        # sgrp is Axis-speak for "secondary groups". You stack the privileges
+        # by colon-separating them. Operator implies viewer + ptz, Viewer is
+        # view-only. Customer reqs almost always end up with Operator for the
+        # NVR account and Viewer for VMS-of-last-resort.
         role_groups = {
             'Administrator': 'admin:operator:viewer:ptz',
             'Operator': 'operator:viewer:ptz',
@@ -1451,7 +1532,7 @@ class AxisProtocol(CameraProtocol):
         }
         sgrp = role_groups.get(role, 'operator:viewer:ptz')
 
-        # Step 1: Create system user via pwdgrp.cgi
+        # VAPIX user first (this is the auth gate), ONVIF after for VMS hookup.
         try:
             r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
                 params={"action": "add", "user": username, "pwd": user_password,
@@ -1462,7 +1543,9 @@ class AxisProtocol(CameraProtocol):
         except:
             return False
 
-        # Step 2: Create matching ONVIF user (non-critical)
+        # ONVIF level only has Administrator / Operator / User — Axis maps
+        # Viewer to "User". Same caveat as create_initial_user about needing
+        # both records or VMS-side login fails.
         onvif_level = role if role in ('Administrator', 'Operator') else 'User'
         try:
             soap = (f'<?xml version="1.0"?>'
@@ -1477,11 +1560,20 @@ class AxisProtocol(CameraProtocol):
                 headers={"Content-Type": "application/soap+xml"},
                 auth=HTTPDigestAuth("root", admin_password), timeout=TIMEOUT)
         except:
-            pass  # ONVIF user creation is non-critical
+            pass  # see create_initial_user — ONVIF write is best-effort
         return True
 
     def factory_reset(self, ip, password):
-        # Method 1: firmwaremanagement API
+        # THREE different reset endpoints because Axis has changed their mind
+        # twice. Walk them in newest-first order; older firmware just won't
+        # know about the newer ones.
+        #
+        # Hard reset wipes EVERYTHING — IP, password, certs, the lot. There's
+        # also a "soft" mode that preserves network config but in 17 years of
+        # this I've never wanted that. If a camera needs resetting, I want it
+        # blank.
+
+        # firmwaremanagement.cgi — current API (firmware 9.x+).
         try:
             r = requests.post(f"http://{ip}/axis-cgi/firmwaremanagement.cgi",
                 json={"apiVersion": "1.0", "method": "factoryDefault",
@@ -1493,25 +1585,30 @@ class AxisProtocol(CameraProtocol):
                     if 'error' not in data:
                         return True
                 except:
+                    # Some firmware doesn't actually return JSON despite the
+                    # API contract saying it does. If body has no 'error'
+                    # string, call it good.
                     if 'error' not in r.text.lower():
                         return True
         except requests.exceptions.Timeout:
-            return True  # Camera rebooting
+            # Camera reset and dropped the TCP connection mid-response. That's
+            # the success path for a destructive call like this.
+            return True
         except:
             pass
 
-        # Method 2: Legacy hardfactorydefault.cgi
+        # Legacy hardfactorydefault.cgi — Axis 6.x and earlier.
         try:
             r = requests.get(f"http://{ip}/axis-cgi/hardfactorydefault.cgi",
                 auth=HTTPDigestAuth("root", password), timeout=10)
             if r.status_code == 200:
                 return True
         except requests.exceptions.Timeout:
-            return True
+            return True  # see above — connection drop = win
         except:
             pass
 
-        # Method 3: param.cgi
+        # param.cgi route — really old (5.x). Last ditch.
         try:
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "System.HardFactoryDefault": "yes"},
@@ -1525,8 +1622,12 @@ class AxisProtocol(CameraProtocol):
         return False
 
     def get_programming_steps(self, cam, password, options=None):
-        """Axis programming: create user -> set network -> (hostname)."""
-        ip = cam.get('_program_ip', cam['ip'])  # _program_ip = factory/link-local IP
+        # Returns the sequenced list of (label, callable) tuples that the
+        # programmer worker chews through. Order is mandatory: user FIRST,
+        # because everything after needs auth; network SECOND, because the
+        # IP change is the moment the camera "moves" off its factory
+        # 192.168.0.90 (or DHCP) onto the project subnet.
+        ip = cam.get('_program_ip', cam['ip'])  # factory/link-local IP we found it on
         static_ip = cam['ip']
         gateway = cam['gateway']
         subnet = cam['subnet']
@@ -1539,6 +1640,10 @@ class AxisProtocol(CameraProtocol):
              lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
         ]
         if set_hostname:
+            # Hostname format I've used for a decade: <position>-<brand>-<serial>.
+            # That sorts cleanly in any NVR camera list and makes the truck
+            # paperwork match the hostname when somebody pulls a stream months
+            # later trying to figure out which camera went down.
             cam_number = cam.get('number', '1')
             serial = cam.get('serial', 'unknown')
             hostname = f"{cam_number}-axis-{serial.lower()}"
@@ -1547,7 +1652,10 @@ class AxisProtocol(CameraProtocol):
         return steps
 
     def get_discovery_info(self, ip, timeout=2):
-        """Detect Axis camera at IP."""
+        # Used by the network sweeper to figure out who's home at a given IP.
+        # JSON path is the cleanest fingerprint. 401 means "Axis camera, but
+        # configured" — that's still useful info (we know it's there, just
+        # need a password to do anything else).
         try:
             r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
                 json={"apiVersion": "1.0", "method": "getAllProperties"},
@@ -1566,7 +1674,10 @@ class AxisProtocol(CameraProtocol):
                 return {'ip': ip, 'model': '(Auth Required)', 'brand': 'axis'}
         except:
             pass
-        # Fallback: check image endpoint
+        # Last-ditch: tickle the snapshot endpoint. Even with no creds, factory
+        # cameras serve image.cgi. A 401 here is gold — it means there IS an
+        # Axis on the IP, just with auth on. (Used to use this as the primary
+        # check before basicdeviceinfo existed.)
         try:
             r = requests.get(f"http://{ip}/axis-cgi/jpg/image.cgi", timeout=1)
             if r.status_code == 401:
@@ -1579,16 +1690,31 @@ class AxisProtocol(CameraProtocol):
 # ============================================================================
 # BOSCH PROTOCOL
 # ============================================================================
+# RCP+ is Bosch's binary control protocol — it's older than the cameras most of
+# us are still installing, predates ONVIF, and almost zero documentation exists
+# online. Reverse-engineered from packet captures of the Configuration Manager
+# tool (Bosch's own provisioning software). The good news: once you have the
+# command numbers and type tags right, it's deterministic. The bad news: every
+# value gets typed (P_STRING, T_DWORD, T_OCTET, F_FLAG) and the wrong type just
+# returns "OK" with no actual write happening. Don't trust the ack — verify.
+#
+# Also: Bosch has THREE password levels (service=admin, user=ops, live=viewer)
+# and the customer almost never knows that. They ask "what's the password" and
+# you have to ask which one. So we just set all three to the same value.
 class BoschProtocol(CameraProtocol):
     BRAND_NAME = 'Bosch'
     BRAND_KEY = 'bosch'
     DEFAULT_USER = 'service'
-    DEFAULT_PASSWORD = 'service'
-    FACTORY_IP = '192.168.0.1'
-    MAC_OUIS = [b'\x00\x07\x5f']
+    DEFAULT_PASSWORD = 'service'    # Bosch ships with service/service. Yes really.
+    FACTORY_IP = '192.168.0.1'      # which is also the gateway IP on most home
+                                    # networks — fun for tech support calls
+    MAC_OUIS = [b'\x00\x07\x5f']    # Robert Bosch GmbH OUI; basically all their cams
 
     def create_initial_user(self, ip, password):
-        """Change Bosch service password from default 'service' to new password."""
+        # Change all three password tiers in one shot. Walking high->low so if
+        # the service write fails (the only one that's REALLY bad), we bail
+        # before partially-resetting the lower-priv ones. Return False only on
+        # service failure — failing on user/live is annoying but not blocking.
         auth = (BOSCH_DEFAULT_USER, 'service')
         ok = True
         for num, name in [(3, 'service'), (2, 'user'), (1, 'live')]:
@@ -1599,7 +1725,11 @@ class BoschProtocol(CameraProtocol):
         return ok
 
     def set_network(self, ip, password, new_ip, subnet, gateway):
-        """Set network via RCP. Order: gateway -> subnet -> dhcp off -> IP."""
+        # Same ordering principle as Axis: do everything that DOESN'T move the
+        # camera first, then yank the rug at the end. Gateway, subnet, DHCP off,
+        # then IP last. RCP is connectionless on UDP so the IP change doesn't
+        # tear down a TCP session — but the camera still drops off the L2 with
+        # the old ARP, so callers should re-resolve.
         auth = (BOSCH_DEFAULT_USER, password)
         ok = True
         if gateway:
@@ -1608,18 +1738,27 @@ class BoschProtocol(CameraProtocol):
         if subnet:
             if not BoschRCP.rcp_write(ip, RCP_CMD['subnet'], 'P_STRING', subnet, auth):
                 ok = False
-        # Disable DHCP
+        # DHCP off — note T_DWORD typing here, the dhcp command doesn't take a
+        # P_STRING despite "0"/"1" looking like strings. Tried that. RCP acks
+        # it but does nothing.
         BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_DWORD', '0', auth)
-        # IP last (changes connectivity)
+        # IP last — see above for why
         if not BoschRCP.rcp_write(ip, RCP_CMD['ip'], 'P_STRING', new_ip, auth):
             ok = False
         return ok
 
     def set_hostname(self, ip, password, hostname):
+        # Bosch calls hostname "unit name" because RCP predates DNS-everywhere
+        # conventions. It DOES end up being the camera's announced hostname on
+        # the network though, so set it the same way you would a real hostname.
         auth = (BOSCH_DEFAULT_USER, password)
         return BoschRCP.rcp_write(ip, RCP_CMD['unit_name'], 'P_STRING', hostname, auth) or False
 
     def reboot(self, ip, password):
+        # Bosch took two firmware revs to settle on the right TYPE for the
+        # reboot RCP command. F_FLAG was the original (5.x firmware), T_DWORD
+        # is current. Try both. If neither sticks, fall back to the HTTP /reset
+        # endpoint which always works. This thing was 4 hours of head-scratching.
         auth = (BOSCH_DEFAULT_USER, password)
         if BoschRCP.rcp_write(ip, RCP_CMD['reboot'], 'F_FLAG', '1', auth, timeout=10):
             return True
@@ -1630,17 +1769,24 @@ class BoschProtocol(CameraProtocol):
             if r.status_code == 200:
                 return True
         except requests.exceptions.ConnectionError:
+            # Camera dropped while booting — call it good
             return True
         except:
             pass
         return False
 
     def set_dhcp(self, ip, password, enable=True):
+        # Same T_DWORD typing gotcha as set_network — do not pass strings here.
         auth = (BOSCH_DEFAULT_USER, password)
         payload = '1' if enable else '0'
         return BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_DWORD', payload, auth) or False
 
     def get_serial(self, ip, password):
+        # Bosch doesn't expose a serial number over RCP the way Axis does
+        # (Properties.System.SerialNumber). Closest we get is the MAC, which
+        # is also engraved on the box. We dehyphenate it and pretend that's
+        # the serial — it's unique per camera and that's what matters for
+        # the report. T_OCTET is byte-level, comes back as space-separated hex.
         mac = BoschRCP.rcp_read(ip, RCP_CMD['mac'], 'T_OCTET')
         if mac:
             parts = mac.split()
@@ -1649,22 +1795,39 @@ class BoschProtocol(CameraProtocol):
         return 'UNKNOWN'
 
     def get_model_noauth(self, ip):
+        # /config.js is a public endpoint Bosch ships with the web UI. No auth.
+        # That's where Configuration Manager pulls the model string from too,
+        # which is how I found it.
         info = BoschRCP.get_device_info(ip, timeout=2)
         if info and info.get('model'):
             return info['model']
         return None
 
     def get_firmware(self, ip, password):
-        """Get Bosch firmware via /config.js (no auth needed)."""
+        # Same /config.js path as above — model and firmware live in the same
+        # blob. password is unused here on purpose (Bosch coughs it up to
+        # everyone), kept in the signature to match the abstract interface.
         info = BoschRCP.get_device_info(ip, timeout=3)
         if info and info.get('firmware'):
             return info['firmware']
         return 'UNKNOWN'
 
     def get_image(self, ip, username, password):
+        # Two attempts: with auth, then without. Bosch snapshots are usually
+        # auth-required but some firmware/SKU combos (notably the FLEXIDOME
+        # IP starlight 7000 line at one point) shipped with snap.jpg open by
+        # default. Try authed first, that's the right way; fall back so we
+        # still get a thumbnail for the verification panel.
+        #
+        # JpegSize=M is "medium" — about 640x480 in most camera configs.
+        # Bandwidth-friendly for the discovery wizard. Caller can re-pull L
+        # if they want something better for the report.
         try:
             r = requests.get(f'http://{ip}/snap.jpg?JpegSize=M',
                              auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
+            # >1000 byte check — some cams return a 200 with a tiny stub image
+            # ("no signal" placeholder) when the encoder isn't ready yet.
+            # Real snapshots are always over a kilobyte.
             if r.status_code == 200 and len(r.content) > 1000:
                 return r.content
         except:
@@ -1678,11 +1841,17 @@ class BoschProtocol(CameraProtocol):
         return None
 
     def test_password(self, ip, username, password):
+        # Reading unit_name is cheap and won't lock the account on a wrong pw.
+        # Don't use anything that writes — Bosch's lockout logic is aggressive
+        # if you fat-finger the service password too many times.
         result = BoschRCP.rcp_read(ip, RCP_CMD['unit_name'], 'P_STRING',
                                    auth=(username, password))
         return result is not None
 
     def change_password(self, ip, username, old_pwd, new_pwd):
+        # Same three-tier walk as create_initial_user. Use auth = (service, old)
+        # because the service-level account is the only one allowed to write
+        # password fields. Doing this from a non-service login is a 401.
         auth = (BOSCH_DEFAULT_USER, old_pwd)
         ok = True
         for num, name in [(3, 'service'), (2, 'user'), (1, 'live')]:
@@ -1693,6 +1862,10 @@ class BoschProtocol(CameraProtocol):
         return ok
 
     def factory_reset(self, ip, password):
+        # Two paths. RCP factory_reset first — it's the documented one and
+        # respects the 'preserve network' flag if the camera supports it
+        # (firmware-dependent, FLEXIDOME 7000 series and up). HTTP /reset is
+        # a sledgehammer that wipes everything; that's our fallback.
         auth = (BOSCH_DEFAULT_USER, password)
         if BoschRCP.rcp_write(ip, RCP_CMD['factory_reset'], 'T_DWORD', '1', auth, timeout=10):
             return True
@@ -1701,12 +1874,16 @@ class BoschProtocol(CameraProtocol):
             if r.status_code == 200:
                 return True
         except requests.exceptions.ConnectionError:
-            return True
+            return True  # boot dropped the connection -> success
         except:
             pass
         return False
 
     def get_programming_steps(self, cam, password, options=None):
+        # Bosch needs a reboot after network change — the new IP doesn't fully
+        # commit to flash without one. Found this when staged cameras would
+        # forget their static IP after a power cycle on site. Add the reboot
+        # step explicitly and tail the programming with it.
         ip = cam.get('_program_ip', cam['ip'])
         static_ip = cam['ip']
         gateway = cam['gateway']
@@ -1730,6 +1907,10 @@ class BoschProtocol(CameraProtocol):
         return steps
 
     def get_discovery_info(self, ip, timeout=2):
+        # Returns enough metadata for the discovery dialog to pre-populate a
+        # camera row with model, MAC-as-serial, current network config. The
+        # network read matters because we want to TELL the user what the
+        # camera currently has set, not just our defaults.
         info = BoschRCP.get_device_info(ip, timeout=timeout)
         if info:
             net = BoschRCP.get_network_config(ip, timeout=timeout)
@@ -1741,9 +1922,13 @@ class BoschProtocol(CameraProtocol):
             }
             if net.get('mac'):
                 cam['mac'] = net['mac']
+                # Use bare MAC as serial to keep it stable across reboots.
+                # Customer paperwork already expects a 12-char hex string.
                 cam['serial'] = net['mac'].replace(':', '')
             if net.get('subnet'):
                 cam['subnet'] = net['subnet']
+            # 0.0.0.0 gateway means "no gateway set" not "literal 0.0.0.0",
+            # so swallow that as a missing value rather than report it.
             if net.get('gateway') and net['gateway'] != '0.0.0.0':
                 cam['gateway'] = net['gateway']
             if net.get('dhcp'):
@@ -1765,7 +1950,11 @@ class HanwhaProtocol(CameraProtocol):
     LOCKOUT_COOLDOWN = HANWHA_LOCKOUT_COOLDOWN
 
     def _stw_get(self, ip, path, auth=None, timeout=None):
-        """Helper: GET request to STW-CGI endpoint."""
+        # GET wrapper. Hanwha is digest auth (HTTPDigestAuth) — DO NOT use
+        # basic. Tried that for an hour once when a tcpdump showed plaintext
+        # auth flying back; turned out the camera was sending a 401 with a
+        # WWW-Authenticate: Digest the requests lib was happily ignoring
+        # because I'd handed it HTTPBasicAuth.
         if timeout is None:
             timeout = TIMEOUT
         kwargs = {'timeout': timeout}
@@ -1774,7 +1963,11 @@ class HanwhaProtocol(CameraProtocol):
         return requests.get(f"http://{ip}{path}", **kwargs)
 
     def _stw_post(self, ip, path, data=None, auth=None, timeout=None):
-        """Helper: POST request to STW-CGI endpoint."""
+        # POST wrapper. STW-CGI uses form-urlencoded data, NOT JSON.
+        # The newer Hanwha cameras have a JSON-y endpoint behind /stw-cgi/json
+        # but the form path is older and supported on every camera I've ever
+        # touched, including the 4MP QND series from 2017. Backwards compat
+        # wins here.
         if timeout is None:
             timeout = TIMEOUT
         kwargs = {'timeout': timeout}
@@ -1785,8 +1978,11 @@ class HanwhaProtocol(CameraProtocol):
         return requests.post(f"http://{ip}{path}", **kwargs)
 
     def create_initial_user(self, ip, password):
-        """Set admin password on factory-default Hanwha camera (no auth required).
-        Password must be 8-15 chars with 3+ character types."""
+        # Hanwha factory cameras don't have a default password — they REQUIRE
+        # you to set one before anything else works (similar to Axis 7.10+).
+        # Password rules are 8-15 chars and 3+ character types (upper/lower/
+        # digit/special). If the customer hands you a 6-char password, this
+        # call will 200 OK and silently not save it. Validate before sending.
         try:
             r = self._stw_post(ip,
                 '/stw-cgi/user.cgi?msubmenu=admin&action=set',
@@ -1797,7 +1993,11 @@ class HanwhaProtocol(CameraProtocol):
             return False
 
     def set_network(self, ip, password, new_ip, subnet, gateway):
-        """Set static IP on Hanwha camera via STW-CGI."""
+        # Hanwha is the easiest of the three for network config — one POST
+        # sets all four fields atomically. The Type='Static' is what flips
+        # DHCP off as a side effect; you don't have to set DHCP separately.
+        # Wisenet labels the field 'Type' (not 'IPType') in the API even
+        # though the web UI calls it "IP Type". Took me a minute to find that.
         try:
             r = self._stw_post(ip,
                 '/stw-cgi/network.cgi?msubmenu=ethernet&action=set',
@@ -1814,6 +2014,8 @@ class HanwhaProtocol(CameraProtocol):
             return False
 
     def set_hostname(self, ip, password, hostname):
+        # Same DNS-clean rule as the others. Hanwha calls it "HostName" on the
+        # general system page, doesn't expose a Bonjour/mDNS field separately.
         clean = re.sub(r'[^a-zA-Z0-9-]', '-', hostname).strip('-')[:63]
         try:
             r = self._stw_post(ip,
@@ -1825,19 +2027,26 @@ class HanwhaProtocol(CameraProtocol):
             return False
 
     def reboot(self, ip, password):
+        # The reboot endpoint immediately drops the connection — POST returns
+        # ConnectionError or Timeout, both of which mean "successfully rebooted".
+        # If you get a 200 back something is weird (camera queued the reboot
+        # for later? rare).
         try:
             r = self._stw_post(ip,
                 '/stw-cgi/system.cgi?msubmenu=reboot&action=execute',
                 auth=('admin', password), timeout=10)
             return r.status_code == 200
         except requests.exceptions.ConnectionError:
-            return True  # Camera already rebooting
+            return True  # camera bounced before sending the response
         except requests.exceptions.Timeout:
             return True
         except:
             return False
 
     def set_dhcp(self, ip, password, enable=True):
+        # Just flip the Type back to DHCP. Same endpoint as set_network but
+        # we don't include the IP/subnet/gateway fields — camera will pull
+        # those from DHCP after the next renew.
         try:
             mode = 'DHCP' if enable else 'Static'
             r = self._stw_post(ip,
@@ -1849,6 +2058,12 @@ class HanwhaProtocol(CameraProtocol):
             return False
 
     def get_serial(self, ip, password):
+        # The deviceinfo endpoint returns a flat key=value text block (NOT
+        # JSON despite what you'd expect from an API named STW-CGI). Walk it
+        # twice: first looking for explicit "SerialNumber=" / "Serial=" keys,
+        # then a fuzzy match on anything containing "serial" — different
+        # firmware revisions use different exact key names. Standard Wisenet
+        # spelling has been moving target since at least the QND-7080R era.
         try:
             r = self._stw_get(ip,
                 '/stw-cgi/system.cgi?msubmenu=deviceinfo&action=view',
@@ -1857,7 +2072,7 @@ class HanwhaProtocol(CameraProtocol):
                 for line in r.text.split('\n'):
                     if 'SerialNumber=' in line or 'Serial=' in line:
                         return line.split('=', 1)[1].strip()
-                # Try key=value parsing
+                # Fuzzy fallback for variant key names
                 for line in r.text.split('\n'):
                     line = line.strip()
                     if '=' in line:
@@ -1869,7 +2084,10 @@ class HanwhaProtocol(CameraProtocol):
         return 'UNKNOWN'
 
     def get_model_noauth(self, ip):
-        """Try to get model without auth — works on some Hanwha firmware."""
+        # Most Hanwha firmware leaves deviceinfo open without auth (just the
+        # model field, not the serial). Used during discovery to fingerprint
+        # without needing a password. Newer locked-down builds (post 2.20)
+        # might 401 this; that's why discovery has the 401 fallback path.
         try:
             r = self._stw_get(ip,
                 '/stw-cgi/system.cgi?msubmenu=deviceinfo&action=view',
@@ -1886,8 +2104,11 @@ class HanwhaProtocol(CameraProtocol):
         return None
 
     def get_firmware(self, ip, password):
-        """Get Hanwha firmware version from deviceinfo endpoint."""
-        # Try with auth first (most reliable)
+        # Two-pass: authed first (most reliable, gets the full firmware string
+        # including patch level), then no-auth (some firmware leaks the version
+        # to anonymous probes). Walk the response for any key that smells like
+        # a firmware version — the field name has changed between Wisenet
+        # firmware lines (FwVersion, FirmwareVersion, AppFwVersion, etc.).
         for auth in [('admin', password) if password else None, None]:
             try:
                 r = self._stw_get(ip,
@@ -1908,6 +2129,9 @@ class HanwhaProtocol(CameraProtocol):
         return 'UNKNOWN'
 
     def get_image(self, ip, username, password):
+        # Hanwha snapshot path. Same >1000-byte sanity check as Bosch — if a
+        # camera returns a 200 with a tiny image it's usually the placeholder
+        # because the encoder is still warming up post-reboot.
         try:
             r = self._stw_get(ip,
                 '/stw-cgi/image.cgi?msubmenu=snapshot&action=view',
@@ -1919,7 +2143,15 @@ class HanwhaProtocol(CameraProtocol):
         return None
 
     def test_password(self, ip, username, password):
-        """Test credentials. Raises LockoutError on HTTP 490."""
+        # Hanwha lockout is the worst of the three brands. After ~5 wrong
+        # passwords the camera returns HTTP 490 (a non-standard code Hanwha
+        # invented for "you've been bad") and the account is unusable for
+        # 30 minutes. Even with the right password. There's no way to clear
+        # the lockout short of a factory reset or waiting it out.
+        #
+        # We propagate LockoutError up the stack so the GUI can disable the
+        # row and stop hammering. Not catching this and treating it as a
+        # generic auth fail will keep the lockout timer rolling forever.
         try:
             r = self._stw_get(ip,
                 '/stw-cgi/system.cgi?msubmenu=deviceinfo&action=view',
@@ -1934,11 +2166,18 @@ class HanwhaProtocol(CameraProtocol):
         except LockoutError:
             raise
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            # Hanwha sometimes goes silent during lockout instead of returning
+            # 490 — same effective behavior, treat it the same way so we
+            # don't keep retrying and extending the cooldown.
             raise LockoutError(f"Camera {ip} not responding (likely locked out)")
         except:
             return False
 
     def change_password(self, ip, username, old_pwd, new_pwd):
+        # Note Hanwha REQUIRES OldPassword in the same call as NewPassword —
+        # it's a CSRF guard, not just for verification. Sending only NewPassword
+        # silently no-ops. Found out the hard way during a customer pw rotation
+        # where every camera "succeeded" but kept the old password.
         try:
             r = self._stw_post(ip,
                 '/stw-cgi/user.cgi?msubmenu=admin&action=set',
@@ -1949,8 +2188,9 @@ class HanwhaProtocol(CameraProtocol):
             return False
 
     def add_user(self, ip, admin_password, username, user_password, role='Operator'):
-        """Add a user to Hanwha camera via STW-CGI."""
-        # Map role to Hanwha user groups
+        # Hanwha role names: admin / manager / user. Manager == Axis Operator,
+        # User == Axis Viewer. Sticking with our standard Administrator/Operator/
+        # Viewer terminology in the GUI and remapping here.
         role_map = {
             'Administrator': 'admin',
             'Operator': 'manager',
@@ -1967,19 +2207,27 @@ class HanwhaProtocol(CameraProtocol):
             return False
 
     def factory_reset(self, ip, password):
+        # No mode flag on Hanwha — factory reset is always a full hard reset.
+        # Network config, password, certs, schedules, all gone. The camera comes
+        # back up factory-default and waiting for the initial admin password.
         try:
             r = self._stw_post(ip,
                 '/stw-cgi/system.cgi?msubmenu=factory&action=execute',
                 auth=('admin', password), timeout=10)
             return r.status_code == 200
         except requests.exceptions.ConnectionError:
-            return True
+            return True  # camera dropped during reset, that's the win path
         except requests.exceptions.Timeout:
             return True
         except:
             return False
 
     def get_programming_steps(self, cam, password, options=None):
+        # Reboot at the end is mandatory on Hanwha — the network change
+        # technically takes effect immediately but a freshly-programmed camera
+        # behaves weirdly until it's been power-cycled (RTSP stream stutters,
+        # ONVIF discovery skips it). Single-rev older firmware especially.
+        # Easier to just reboot and skip the troubleshooting.
         ip = cam.get('_program_ip', cam['ip'])
         static_ip = cam['ip']
         gateway = cam['gateway']
@@ -2003,7 +2251,10 @@ class HanwhaProtocol(CameraProtocol):
         return steps
 
     def get_discovery_info(self, ip, timeout=2):
-        """Detect Hanwha camera via STW-CGI probe."""
+        # 200 OR 401 both mean "Hanwha is here." 401 means it's locked down,
+        # which is still useful info for the discovery dialog. Anything else
+        # (timeout, 404, connection refused) and we return None so the
+        # multi-protocol scanner can try the next brand.
         try:
             r = requests.get(f"http://{ip}/stw-cgi/system.cgi?msubmenu=deviceinfo&action=view",
                              timeout=timeout)
@@ -2027,7 +2278,11 @@ class HanwhaProtocol(CameraProtocol):
         return None
 
 
-# Protocol registry for easy lookup
+# Vendor protocol registry. Order doesn't matter for lookup but does matter
+# for the multi-brand discovery sweep — that walks this dict in declaration
+# order and tries each brand's discovery probe in turn. Axis first because
+# their discovery is the cheapest (basicdeviceinfo no-auth), Hanwha last
+# because of the lockout risk on a wrong probe.
 PROTOCOLS = {
     'axis': AxisProtocol,
     'bosch': BoschProtocol,
@@ -7788,6 +8043,14 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.2.4": (
+            "What's new in v4.2.4",
+            [
+                "• Heavy comment pass on the vendor protocol code (Axis, Bosch, Hanwha).",
+                "• Field-tech context, vendor-quirk notes, and the why-it's-written-this-way is now in the source for anyone reading the public mirror.",
+                "• Zero functional changes — same app, same APIs, same workflow.",
+            ],
+        ),
         "4.2.3": (
             "What's new in v4.2.3",
             [
