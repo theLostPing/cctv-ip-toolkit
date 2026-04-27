@@ -67,6 +67,10 @@ except ImportError:
 APP_VERSION = "4.2.4"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
+# In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
+# show up in the same download analytics as the website. The tracker 302s
+# straight to the GitHub release asset.
+FIELDTOOLKIT_DOWNLOAD_URL = "https://fieldtoolkit.com/download.php?asset=CCTVIPToolkit.exe"
 
 # v4.1 split: config (private, survives upgrades) vs. exports (visible, user-configurable).
 #   CONFIG_DIR -> %APPDATA%\CCTVIPToolkit\       (passwords, cameras, settings)
@@ -8027,7 +8031,14 @@ Email: axisprogrammer@thelostping.net
         btns = ttk.Frame(w)
         btns.pack(fill=tk.X, padx=18, pady=(6, 14))
 
-        def open_release():
+        def open_download():
+            # Route through fieldtoolkit.com tracker so upgrades count in analytics
+            # the same as fresh downloads. The tracker 302s to the GitHub asset.
+            import webbrowser
+            tracked_url = f"{FIELDTOOLKIT_DOWNLOAD_URL}&v=v{latest_tag}"
+            webbrowser.open(tracked_url)
+
+        def open_release_notes():
             import webbrowser
             webbrowser.open(url)
 
@@ -8035,7 +8046,8 @@ Email: axisprogrammer@thelostping.net
             self.settings.set('general', 'last_dismissed_version', latest_tag)
             w.destroy()
 
-        ttk.Button(btns, text="Download on GitHub", command=open_release).pack(side=tk.LEFT)
+        ttk.Button(btns, text=f"Download v{latest_tag}", command=open_download).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Release Notes on GitHub", command=open_release_notes).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(btns, text="Remind Me Later", command=remind_later).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(btns, text="Close", command=w.destroy).pack(side=tk.RIGHT)
 
