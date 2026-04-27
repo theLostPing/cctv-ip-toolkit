@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.2.5"
+APP_VERSION = "4.2.6"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -8055,8 +8055,8 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
-        "4.2.5": (
-            "What's new in v4.2.5",
+        "4.2.6": (
+            "What's new in v4.2.6",
             [
                 "• Update dialog: 'Download' button now pulls the new EXE directly from fieldtoolkit.com instead of routing you to the GitHub release page.",
                 "• 'Release Notes on GitHub' added as a separate button so you can read the changelog without grabbing the EXE.",
