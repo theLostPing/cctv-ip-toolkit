@@ -127,7 +127,7 @@ python -m PyInstaller --onefile --windowed ^
     --uac-admin ^
     %ICON_ARGS% ^
     --clean ^
-    axis_toolkit_v3.py
+    cctv_toolkit.py
 
 echo.
 echo ========================================
@@ -157,9 +157,9 @@ if exist "dist\CCTVIPToolkit.exe" (
     echo BUILD FAILED
     echo.
     echo Common fixes:
-    echo   - Make sure axis_toolkit_v3.py is in this folder
+    echo   - Make sure cctv_toolkit.py is in this folder
     echo   - Make sure app.ico is in this folder
-    echo   - Try: python -m PyInstaller --onefile axis_toolkit_v3.py
+    echo   - Try: python -m PyInstaller --onefile cctv_toolkit.py
     echo ========================================
 )
 echo.

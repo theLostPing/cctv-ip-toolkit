@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['axis_toolkit_v3.py'],
+    ['cctv_toolkit.py'],
     pathex=[],
     binaries=[],
     datas=[('logo.ico', '.')],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='AxisCameraToolkit',
+    name='CCTVIPToolkit',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

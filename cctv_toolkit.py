@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.2.4"
+APP_VERSION = "4.2.5"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -8055,6 +8055,15 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.2.5": (
+            "What's new in v4.2.5",
+            [
+                "• In-app Download button now goes through fieldtoolkit.com — upgrades count in the same download analytics as fresh installs.",
+                "• Source file renamed: axis_toolkit_v3.py → cctv_toolkit.py. The 'axis_' prefix was a holdover from when this tool only spoke VAPIX; the multi-brand reality (Axis + Bosch + Hanwha) is now reflected in the filename. Spec, build script, README, and CI updated accordingly.",
+                "• 'Release Notes on GitHub' added as a separate button so you can read the changelog without going through the download tracker.",
+                "• Zero functional changes to the camera-side workflow — same APIs, same UI.",
+            ],
+        ),
         "4.2.4": (
             "What's new in v4.2.4",
             [

@@ -62,7 +62,7 @@ Windows with Python 3.10 or newer:
 
 ```
 pip install requests pillow openpyxl pyinstaller
-pyinstaller --onefile --icon=app.ico --name=CCTVIPToolkit axis_toolkit_v3.py
+pyinstaller --onefile --icon=app.ico --name=CCTVIPToolkit cctv_toolkit.py
 ```
 
 Or use the included `build.bat` — it handles dependency install + PyInstaller bundling and drops `CCTVIPToolkit.exe` into `dist/`.
