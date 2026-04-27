@@ -8058,10 +8058,9 @@ Email: axisprogrammer@thelostping.net
         "4.2.5": (
             "What's new in v4.2.5",
             [
-                "• In-app Download button now goes through fieldtoolkit.com — upgrades count in the same download analytics as fresh installs.",
-                "• Source file renamed: axis_toolkit_v3.py → cctv_toolkit.py. The 'axis_' prefix was a holdover from when this tool only spoke VAPIX; the multi-brand reality (Axis + Bosch + Hanwha) is now reflected in the filename. Spec, build script, README, and CI updated accordingly.",
-                "• 'Release Notes on GitHub' added as a separate button so you can read the changelog without going through the download tracker.",
-                "• Zero functional changes to the camera-side workflow — same APIs, same UI.",
+                "• Update dialog: 'Download' button now pulls the new EXE directly from fieldtoolkit.com instead of routing you to the GitHub release page.",
+                "• 'Release Notes on GitHub' added as a separate button so you can read the changelog without grabbing the EXE.",
+                "• Internal: source file renamed to cctv_toolkit.py to match the multi-brand reality (Axis + Bosch + Hanwha). No effect on the app or your data.",
             ],
         ),
         "4.2.4": (
