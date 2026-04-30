@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.2.6"
+APP_VERSION = "4.2.7"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -8055,6 +8055,15 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.2.7": (
+            "What's new in v4.2.7",
+            [
+                "• Bug fix: when a previously-programmed camera was still rebooting on the factory IP, the toolkit appeared to flash through cameras every 3 seconds (\"Waiting for camera 17: KBW-005\" incrementing rapidly even though only one camera had been done).",
+                "• Root cause: the \"already programmed, waiting for reboot\" branch was bouncing back to the outer loop, which re-printed the banner and bumped the camera counter on every retry.",
+                "• Fix: the wait now happens IN PLACE — the toolkit silently waits for the old camera to leave the factory IP (with a heartbeat log every 30s), then re-enters discovery for the SAME slot. The camera number stays accurate.",
+                "• Same fix applied to both the auto-name-from-list flow and the unprogrammed-cameras flow.",
+            ],
+        ),
         "4.2.6": (
             "What's new in v4.2.6",
             [
@@ -8412,26 +8421,30 @@ https://buymeacoffee.com/thelostping""")
             programmed_count = 0
             seen_macs = set()  # Track MACs we've already programmed to avoid re-hitting same camera
             consecutive_skips = 0
+            # Suppress banner re-print + counter bump when re-entering the outer
+            # loop after a wait-for-reboot wait (2026-04-30 bug fix).
+            last_announced_remaining_count = None
 
             while remaining and not self.cancel_flag:
-                programmed_count += 1
                 pinned_mac = None
                 camera_ip = None  # Will be factory_ip OR link-local from discovery
 
-                self.root.after(0, lambda: self.update_display("Waiting...",
-                    f"{len(remaining)} cameras remaining"))
-                self.log(f"\n{'='*50}")
-                self.log(f"Waiting for unprogrammed camera...")
-
-                # Log what we're checking based on discovery mode
-                if discovery_mode == 'mdns':
-                    self.log(f"  Checking: DHCP + mDNS discovery (link-local)")
-                elif discovery_mode == 'factory':
-                    self.log(f"  Checking: factory IP ({factory_ip}) only")
-                else:
-                    self.log(f"  Checking: factory IP ({factory_ip}) + DHCP/mDNS (link-local)")
-                self.log(f"{len(remaining)} cameras remaining to program")
-                self.log(f"{'='*50}")
+                # Only bump counter + re-announce when remaining shrinks (real new slot).
+                if len(remaining) != last_announced_remaining_count:
+                    programmed_count += 1
+                    self.root.after(0, lambda: self.update_display("Waiting...",
+                        f"{len(remaining)} cameras remaining"))
+                    self.log(f"\n{'='*50}")
+                    self.log(f"Waiting for unprogrammed camera...")
+                    if discovery_mode == 'mdns':
+                        self.log(f"  Checking: DHCP + mDNS discovery (link-local)")
+                    elif discovery_mode == 'factory':
+                        self.log(f"  Checking: factory IP ({factory_ip}) only")
+                    else:
+                        self.log(f"  Checking: factory IP ({factory_ip}) + DHCP/mDNS (link-local)")
+                    self.log(f"{len(remaining)} cameras remaining to program")
+                    self.log(f"{'='*50}")
+                    last_announced_remaining_count = len(remaining)
 
                 # Wait for a camera based on discovery mode
                 while not self.cancel_flag:
@@ -8531,11 +8544,27 @@ https://buymeacoffee.com/thelostping""")
                 if pinned_mac:
                     # Check if we already programmed this MAC (camera hasn't rebooted yet)
                     if pinned_mac.upper().replace(':', '').replace('-', '') in seen_macs:
-                        self.log(f"Camera {pinned_mac} already programmed — waiting for it to reboot...")
+                        # Wait IN PLACE for the old camera to leave factory IP. Don't bounce
+                        # back to the outer while — that increments programmed_count and
+                        # re-prints "Waiting for camera N" on every 3s tick, which looks
+                        # like the toolkit is flashing through cameras (2026-04-30 bug).
+                        self.log(f"Camera {pinned_mac} just programmed — waiting for it to leave factory IP {camera_ip}...")
                         self.arp_unpin(camera_ip)
-                        time.sleep(3)
+                        wait_start = time.time()
+                        last_heartbeat = wait_start
+                        while not self.cancel_flag:
+                            if not self.ping_camera(camera_ip, timeout_ms=800):
+                                self.log(f"  Old camera left factory IP after {int(time.time() - wait_start)}s — ready for next one")
+                                break
+                            now_t = time.time()
+                            if now_t - last_heartbeat >= 30:
+                                self.log(f"  ...still rebooting ({int(now_t - wait_start)}s elapsed). Plug in next camera if ready.")
+                                last_heartbeat = now_t
+                            time.sleep(2)
+                        camera_ip = None
+                        pinned_mac = None
                         continue
-                    
+
                     if self.arp_pin(camera_ip, pinned_mac):
                         self.log(f"Camera detected! ARP pinned to {pinned_mac}")
                     else:
@@ -8953,26 +8982,40 @@ https://buymeacoffee.com/thelostping""")
             seen_macs = set()
             consecutive_skips = 0
 
+            # Banner suppression: only print "Waiting for camera N" once per real new
+            # camera. When we re-enter the outer loop after waiting for the previous
+            # camera to leave factory IP (already-programmed branch below), the slot
+            # hasn't changed and the user shouldn't see "Waiting for camera 17: KBW-005"
+            # flashing past — that was the 2026-04-30 bug. last_announced_name tracks
+            # what we last announced; only re-announce when remaining[0] actually changes.
+            last_announced_name = None
+
             while remaining and not self.cancel_flag:
-                programmed_count += 1
                 pinned_mac = None
                 camera_ip = None
 
-                # Banner: waiting for next camera
                 next_cam = remaining[0]
                 next_name = next_cam['name']
                 next_model = next_cam.get('model', '')
-                _ui(self.status_set_banner, 'PLUG IN CAMERA',
-                    f"Plug in: {next_name}" + (f"  ({next_model})" if next_model else ''),
-                    '#FF9800')
-                _ui(self.status_set_camera, next_name,
-                    f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
-                _ui(self.status_reset_steps, used_steps)
-                _ui(self.status_set_step, 'discover', 'active')
 
-                self.status_log(f"\n{'=' * 50}")
-                self.status_log(f"Waiting for camera {programmed_count}: {next_name}")
-                self.status_log(f"{'=' * 50}")
+                if next_name != last_announced_name:
+                    # Real new slot — bump counter, print banner + log header.
+                    programmed_count += 1
+                    _ui(self.status_set_banner, 'PLUG IN CAMERA',
+                        f"Plug in: {next_name}" + (f"  ({next_model})" if next_model else ''),
+                        '#FF9800')
+                    _ui(self.status_set_camera, next_name,
+                        f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
+                    _ui(self.status_reset_steps, used_steps)
+                    _ui(self.status_set_step, 'discover', 'active')
+                    self.status_log(f"\n{'=' * 50}")
+                    self.status_log(f"Waiting for camera {programmed_count}: {next_name}")
+                    self.status_log(f"{'=' * 50}")
+                    last_announced_name = next_name
+                else:
+                    # Re-entry after wait-for-reboot. Stay quiet, just put discover step
+                    # back to active state.
+                    _ui(self.status_set_step, 'discover', 'active')
 
                 # ---- Discovery phase ----
                 while not self.cancel_flag:
@@ -9062,11 +9105,32 @@ https://buymeacoffee.com/thelostping""")
                     pinned_mac = self.get_mac_from_arp(camera_ip)
                 if pinned_mac:
                     if pinned_mac.upper().replace(':', '').replace('-', '') in seen_macs:
-                        self.status_log(f"MAC {pinned_mac} already programmed, waiting for reboot...")
+                        # Previously-programmed camera is still on the factory IP because it
+                        # hasn't finished rebooting yet. Wait IN PLACE until it's gone — DO NOT
+                        # bounce back to the outer loop, that re-banners and increments the
+                        # camera counter every 3s ("Waiting for camera 17: KBW-005" flashing).
+                        # Bug fix 2026-04-30 — Brian saw the toolkit appear to flash through
+                        # 17 cameras in seconds after one real success.
+                        self.status_log(f"MAC {pinned_mac} just programmed — waiting for it to leave factory IP {camera_ip}...")
                         self.arp_unpin(camera_ip)
-                        time.sleep(3)
-                        _ui(self.status_set_step, 'pin', 'pending')
-                        _ui(self.status_set_step, 'discover', 'pending')
+                        _ui(self.status_set_step, 'pin', 'pending', 'reboot...')
+                        wait_start = time.time()
+                        last_heartbeat = wait_start
+                        while not self.cancel_flag:
+                            # Camera off factory IP? -> previous one rebooted, retry discovery
+                            if not self.ping_camera(camera_ip, timeout_ms=800):
+                                self.status_log(f"  Old camera left factory IP after {int(time.time() - wait_start)}s — ready for next one")
+                                break
+                            # Same MAC still there? Heartbeat every 30s, then keep waiting.
+                            now_t = time.time()
+                            if now_t - last_heartbeat >= 30:
+                                self.status_log(f"  ...still rebooting ({int(now_t - wait_start)}s elapsed). Plug in next camera if ready.")
+                                last_heartbeat = now_t
+                            time.sleep(2)
+                        # Reset state and re-enter discovery for THIS slot (no counter bump).
+                        camera_ip = None
+                        pinned_mac = None
+                        _ui(self.status_set_step, 'discover', 'active')
                         continue
                     if self.arp_pin(camera_ip, pinned_mac):
                         self.status_log(f"ARP pinned to {pinned_mac}")
