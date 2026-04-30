@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.2.7"
+APP_VERSION = "4.2.8"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -8055,6 +8055,17 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.2.8": (
+            "What's new in v4.2.8",
+            [
+                "• Critical bug fix: after a successful programming, if the user hadn't yet unplugged the previous camera (still on factory IP), the toolkit would IMMEDIATELY try to program the next slot onto that same camera — auth would fail, the network step would appear to succeed but actually do nothing useful, and the script would bail with PROGRAMMING COMPLETE: 1 succeeded.",
+                "• Root cause #1: ARP query (the seen_macs check from v4.2.7) returned None because arp_unpin had cleared the static entry and the OS dynamic ARP cache had aged out — bypassing the seen_macs guard entirely.",
+                "• Root cause #2: even with ARP working, there was no positive 'wait for previous camera to leave' before next discovery.",
+                "• Fix #1: get_mac_from_arp now actively pings the IP first to force ARP resolution, and retries up to 3 times. ARP-based detection is reliable again.",
+                "• Fix #2: after every successful camera completion, the toolkit now waits for the factory IP to become unreachable before starting the next discovery. Logs a heartbeat every 30 seconds during the wait. Cancel-aware. Applied to BOTH the named-list flow and the unprogrammed-cameras flow (with continue-dialog confirmation).",
+                "• Net effect: even if you click \"continue\" on the dialog before unplugging the camera, the toolkit will not advance until the previous camera is physically gone from factory IP.",
+            ],
+        ),
         "4.2.7": (
             "What's new in v4.2.7",
             [
@@ -8882,7 +8893,30 @@ https://buymeacoffee.com/thelostping""")
                         self.cancel_flag = True
                         break
                     self.clear_preview()
-            
+
+                    # 2026-04-30 hot fix: even after user confirms continue, ensure
+                    # the previous camera has actually left factory IP before next
+                    # discovery. Otherwise a too-quick "yes" click while the camera
+                    # is still plugged in causes the next slot to program onto it.
+                    if factory_ip:
+                        wait_start = time.time()
+                        last_heartbeat = wait_start
+                        announced = False
+                        while not self.cancel_flag:
+                            if not self.ping_camera(factory_ip, timeout_ms=800):
+                                if announced:
+                                    self.log(f"  Previous camera left factory IP after {int(time.time() - wait_start)}s")
+                                break
+                            now_t = time.time()
+                            if not announced and now_t - wait_start >= 5:
+                                self.log(f"  Waiting for {cam_name} to leave factory IP {factory_ip} (unplug it / let it reboot)...")
+                                announced = True
+                                last_heartbeat = now_t
+                            elif announced and now_t - last_heartbeat >= 30:
+                                self.log(f"  ...still at factory IP ({int(now_t - wait_start)}s elapsed)")
+                                last_heartbeat = now_t
+                            time.sleep(2)
+
             # Clean up link-local route if we added one
             self.remove_linklocal_route()
 
@@ -9440,6 +9474,35 @@ https://buymeacoffee.com/thelostping""")
                         f'{programmed_count} of {len(cameras)} done · {len(remaining)} remaining')
                     time.sleep(2)  # brief pause so user can see "DONE" before "PLUG IN"
 
+                    # 2026-04-30 hot fix: wait for the just-programmed camera to leave
+                    # factory IP before entering next discovery. Without this guard, if
+                    # the user hasn't unplugged yet, the next iteration finds the SAME
+                    # camera at factory IP, ARP query (post-unpin) returns None so the
+                    # seen_macs check is bypassed, and we try to program the next slot
+                    # onto the previous still-plugged-in camera. Auth fails, network
+                    # call appears to "succeed" but actually does nothing useful, then
+                    # the script bails. Belt-and-suspenders: ping is the source of truth
+                    # for "is the previous camera still here", since ARP cache is stale
+                    # after arp_unpin.
+                    if factory_ip:
+                        wait_start = time.time()
+                        last_heartbeat = wait_start
+                        announced = False
+                        while not self.cancel_flag:
+                            if not self.ping_camera(factory_ip, timeout_ms=800):
+                                if announced:
+                                    self.status_log(f"  Previous camera left factory IP after {int(time.time() - wait_start)}s")
+                                break
+                            now_t = time.time()
+                            if not announced and now_t - wait_start >= 5:
+                                self.status_log(f"  Waiting for {cam_name} to leave factory IP {factory_ip} (unplug it / let it reboot)...")
+                                announced = True
+                                last_heartbeat = now_t
+                            elif announced and now_t - last_heartbeat >= 30:
+                                self.status_log(f"  ...still at factory IP ({int(now_t - wait_start)}s elapsed)")
+                                last_heartbeat = now_t
+                            time.sleep(2)
+
             self.remove_linklocal_route()
 
             self.status_log(f"\n{'=' * 50}")
@@ -9927,26 +9990,44 @@ https://buymeacoffee.com/thelostping""")
         return sum(bin(int(x)).count('1') for x in subnet.split('.'))
     
     def get_mac_from_arp(self, ip):
-        """Get MAC address from ARP table after pinging an IP"""
+        """Get MAC address from ARP table after actively resolving the IP.
+
+        Hardened 2026-04-30: previously returned None when arp_unpin had cleared
+        the static entry and the dynamic ARP cache had aged out. Now does an
+        active ping FIRST to force the OS to ARP-resolve, then reads the table.
+        Retries up to 3 times because Windows occasionally needs more than one
+        ping to populate the table.
+        """
         import subprocess
-        try:
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            result = subprocess.run(['arp', '-a', ip],
-                capture_output=True, text=True, timeout=5, startupinfo=startupinfo,
-                creationflags=subprocess.CREATE_NO_WINDOW)
-            if result.returncode == 0:
-                for line in result.stdout.split('\n'):
-                    line = line.strip()
-                    if ip in line:
-                        # Windows ARP output: "192.168.0.90  aa-bb-cc-dd-ee-ff  dynamic"
-                        parts = line.split()
-                        for part in parts:
-                            if len(part.replace('-', '').replace(':', '')) == 12 and part != ip:
-                                return part.upper().replace('-', ':')
-        except:
-            pass
+        for attempt in range(3):
+            try:
+                # Force ARP resolution by pinging. Windows populates the ARP cache
+                # only when traffic is exchanged with the IP.
+                self.ping_camera(ip, timeout_ms=600)
+            except Exception:
+                pass
+            try:
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                result = subprocess.run(['arp', '-a', ip],
+                    capture_output=True, text=True, timeout=5, startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+                if result.returncode == 0:
+                    for line in result.stdout.split('\n'):
+                        line = line.strip()
+                        if ip in line:
+                            # Windows ARP output: "192.168.0.90  aa-bb-cc-dd-ee-ff  dynamic"
+                            parts = line.split()
+                            for part in parts:
+                                if len(part.replace('-', '').replace(':', '')) == 12 and part != ip:
+                                    return part.upper().replace('-', ':')
+            except Exception:
+                pass
+            # Brief backoff before retry
+            if attempt < 2:
+                import time as _t
+                _t.sleep(0.4)
         return None
     
     def arp_pin(self, ip, mac):
