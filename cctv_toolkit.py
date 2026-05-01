@@ -2968,14 +2968,11 @@ class SmartImportDialog(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
         
-        # Make it big - nearly full screen
-        sw = parent.winfo_screenwidth()
-        sh = parent.winfo_screenheight()
-        w = min(sw - 100, 1400)
-        h = min(sh - 100, 800)
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
+        # Center on PARENT monitor (not monitor 1) — multi-monitor fix 2026-04-30.
+        # Use _center_on_parent which uses parent.winfo_rootx/y to track which
+        # screen the parent is on. winfo_screenwidth() is the PRIMARY screen,
+        # not the screen that contains parent.
+        _center_on_parent(self, parent, 1400, 800)
         
         self.rows = []
         self.column_mappings = {}
@@ -4002,8 +3999,12 @@ class ProgramWizardDialog(tk.Toplevel):
         self.show_step(0)
 
         self.bind("<Escape>", lambda e: self.cancel())
-        # Auto-size dialog to content
-        _center_on_parent(self, parent, 640, 460)
+        # Min size 720x600 — bumped from 640x460 because Step 2's content
+        # (network dropdown + 3 radio explanations + factory IP field) was
+        # taller than 460 and clipped the Next button. Brian flagged 2026-04-30
+        # via screenshot. _center_on_parent treats these as MINIMUMS so it
+        # grows further if content needs more.
+        _center_on_parent(self, parent, 720, 600)
         self.wait_window(self)
 
     # ------------------------------------------------------------------
@@ -4503,7 +4504,6 @@ class LldpDiscoveryDialog(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
         self.resizable(True, True)
-        self.geometry("580x500")
         self._thread = None
         self._cancel = threading.Event()
         self._temp_files = []
@@ -4553,10 +4553,8 @@ class LldpDiscoveryDialog(tk.Toplevel):
         ttk.Button(bottom, text="Close",
                    command=self._on_close).pack(side=tk.RIGHT, padx=(0, 8))
 
-        self.update_idletasks()
-        px = parent.winfo_rootx() + (parent.winfo_width() - 580) // 2
-        py = parent.winfo_rooty() + (parent.winfo_height() - 500) // 2
-        self.geometry(f"+{max(0, px)}+{max(0, py)}")
+        # Use _center_on_parent for multi-monitor correctness + content-aware sizing
+        _center_on_parent(self, parent, 580, 500)
 
     def _start(self):
         self._cancel.clear()
