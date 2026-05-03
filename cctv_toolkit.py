@@ -4170,8 +4170,10 @@ class ProgramOptionsDialog(tk.Toplevel):
             row=r, column=0, columnspan=2, sticky='ew', pady=10)
         r += 1
 
-        # Hostname checkbox
-        self.hostname_var = tk.BooleanVar(value=False)
+        # Hostname checkbox — default ON 2026-05-03 (Brian's beta found the
+        # off default confusing; auto-set is the better default for almost
+        # every install workflow).
+        self.hostname_var = tk.BooleanVar(value=True)
         self.hostname_check = ttk.Checkbutton(frame,
             text="Change network hostname",
             variable=self.hostname_var)
@@ -4278,13 +4280,19 @@ class ProgramWizardDialog(tk.Toplevel):
         self.password_confirm_var = tk.StringVar()
         self.discovery_var = tk.StringVar(value='both')
         self.factory_ip_var = tk.StringVar(value=factory_ip)
-        self.hostname_var = tk.BooleanVar(value=False)
+        # Default hostname-set to ON 2026-05-03 (per Brian beta-run feedback)
+        self.hostname_var = tk.BooleanVar(value=True)
         self.additional_users_var = tk.BooleanVar(value=False)
         # v4.3 #10: by default the wizard creates an ONVIF root user (required
         # by set_network's ONVIF SOAP) AND deletes it after programming so the
         # camera ends with VAPIX root only. Operator can opt to keep it (e.g.
         # customer requires ONVIF account for VMS handoff).
         self.keep_onvif_user_var = tk.BooleanVar(value=False)
+        # Default hostname-set to ON 2026-05-03 — Brian's first beta run
+        # showed the empty Hostname column was confusing because the box
+        # defaulted off. Auto-set is the better default for nearly every
+        # workflow. Operator can uncheck if they have a different naming
+        # scheme they're applying manually.
         # v4.3 #10b — optional custom ONVIF user/password. If both are filled
         # AND keep_onvif_user is checked, the wizard deletes the transient
         # ONVIF root and creates this named user instead (rename pattern).
@@ -9599,6 +9607,18 @@ https://buymeacoffee.com/thelostping""")
                                 self.log(f"Camera firmware: {actual_firmware}")
                         except Exception:
                             pass
+                    # 2026-05-03 — always read hostname back so the camera list
+                    # populates even when "Set hostname" wasn't checked OR when
+                    # set_hostname returned False but the change actually persisted.
+                    # Brian's beta-run feedback: empty Hostname column was confusing.
+                    if hasattr(self.protocol, 'verify_camera_state'):
+                        try:
+                            vstate = self.protocol.verify_camera_state(static_ip, password)
+                            if vstate.get('actual_hostname') and not cam.get('hostname'):
+                                cam['hostname'] = vstate['actual_hostname']
+                                self.log(f"Backfilled hostname from camera: {cam['hostname']}")
+                        except Exception:
+                            pass
 
                 cam['firmware'] = actual_firmware
 
@@ -10418,6 +10438,17 @@ https://buymeacoffee.com/thelostping""")
                                 actual_firmware = fw
                                 self.status_log(f"Firmware: {actual_firmware}")
                                 _ui(self.status_set_step, 'firmware', 'ok', actual_firmware)
+                        except Exception:
+                            pass
+                    # 2026-05-03 — always read hostname back so the camera list
+                    # populates even when "Set hostname" wasn't checked OR when
+                    # set_hostname returned False but the change actually persisted.
+                    if hasattr(self.protocol, 'verify_camera_state'):
+                        try:
+                            vstate = self.protocol.verify_camera_state(static_ip, password)
+                            if vstate.get('actual_hostname') and not cam.get('hostname'):
+                                cam['hostname'] = vstate['actual_hostname']
+                                self.status_log(f"Backfilled hostname from camera: {cam['hostname']}")
                         except Exception:
                             pass
 
