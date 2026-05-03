@@ -4470,8 +4470,33 @@ class ProgramWizardDialog(tk.Toplevel):
         self.ip_entry.pack(side=tk.LEFT, padx=(10, 0), ipady=3)
 
     def _build_step_extras(self):
-        f = self._new_step("Step 3 of 4 — Extras",
-                           "Optional things to do during programming.")
+        # 2026-05-03 — Step 3 grew to ~6 options × 3-4 lines of help text each
+        # in the v4.3-pre work. Fixed-pixel sizing breaks on laptops + DPI
+        # scaling (Brian's beta-run on Windows 11 with display zoom clipped
+        # the bottom 2 checkboxes). Wrap the content in a scrollable Canvas
+        # so any window size handles all options. Mousewheel binding scoped
+        # to this canvas only — global bind would conflict with other tabs.
+        outer = self._new_step("Step 3 of 4 — Extras",
+                               "Optional things to do during programming.")
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        vbar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        vbar.pack(side='right', fill='y')
+        f = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=f, anchor='nw')
+        # Resize the inner frame to match canvas width so widgets wrap
+        # naturally instead of getting their right edge clipped.
+        def _on_canvas_resize(event):
+            canvas.itemconfigure(win_id, width=event.width)
+        canvas.bind('<Configure>', _on_canvas_resize)
+        # Update scroll region whenever the inner frame changes size
+        f.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        # Mousewheel — bind only when pointer is over the canvas
+        def _on_mw(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        canvas.bind('<Enter>', lambda e: canvas.bind_all('<MouseWheel>', _on_mw))
+        canvas.bind('<Leave>', lambda e: canvas.unbind_all('<MouseWheel>'))
 
         ttk.Checkbutton(f, text="Set network hostname automatically",
                         variable=self.hostname_var).pack(anchor='w', pady=(20, 2))
