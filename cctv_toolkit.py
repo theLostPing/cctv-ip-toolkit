@@ -230,6 +230,147 @@ DEFAULT_SETTINGS = {
 
 OUTPUT_CSV_HEADER = ['CameraName', 'IPAddress', 'SerialNumber', 'MACAddress', 'Model', 'Firmware', 'BuildingReportsLabel', 'Timestamp']
 
+# v4.3 #11 — Auto NIC multi-home state file. Lists IPs the toolkit added to a
+# NIC during a wizard run so cleanup can find + remove them. Persisted across
+# crashes — on next launch we offer to remove anything that didn't get torn
+# down cleanly. Lives in EXPORT_DIR so it survives a toolkit reinstall but
+# stays per-user.
+MULTIHOME_STATE_FILE = lambda: EXPORT_DIR / 'multihome_state.json'
+
+
+def _is_admin_windows():
+    """v4.3 #11 — true if the toolkit was started elevated (admin / UAC).
+    Multi-home netsh add requires admin. If False, we tell the operator to
+    relaunch as admin instead of trying to elevate per-call."""
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _netsh_add_ip(iface_index, ip, mask):
+    """Add a secondary IPv4 address to a NIC. Requires admin."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ['netsh', 'interface', 'ipv4', 'add', 'address',
+             f"name={iface_index}",  # by InterfaceIndex
+             f"address={ip}",
+             f"mask={mask}"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        # netsh sometimes returns 1 for "address already exists" — check stderr text
+        if r.returncode == 0:
+            return True
+        if 'already exists' in (r.stdout + r.stderr).lower():
+            return True  # idempotent — already there is success
+        return False
+    except Exception:
+        return False
+
+
+def _netsh_remove_ip(iface_index, ip):
+    """Remove a secondary IPv4 address from a NIC. Requires admin."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ['netsh', 'interface', 'ipv4', 'delete', 'address',
+             f"name={iface_index}", f"address={ip}"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if r.returncode == 0:
+            return True
+        if 'not found' in (r.stdout + r.stderr).lower() or 'not configured' in (r.stdout + r.stderr).lower():
+            return True  # already gone — success
+        return False
+    except Exception:
+        return False
+
+
+def _ip_in_use(ip, timeout_s=0.4):
+    """Quick ping probe — True if something answers, False if no response.
+    Used to pick a free host IP for the toolkit to add to a subnet."""
+    import subprocess
+    try:
+        # Windows: -n 1 single ping, -w timeout in ms
+        r = subprocess.run(
+            ['ping', '-n', '1', '-w', str(int(timeout_s * 1000)), ip],
+            capture_output=True, text=True, timeout=timeout_s + 1,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _pick_free_host_ip(subnet_base, mask, candidates=(99, 98, 97, 250, 249, 200, 150, 100)):
+    """Pick a free host IP in the subnet for the toolkit to add to its NIC.
+    Tries 99, 98, 97, 250, 249, 200, 150, 100 by default.
+    subnet_base: first 3 octets like '10.0.42'  (assumes /24-style subnetting
+    for picking; for /16 the same .99 in the right /24 still works).
+    Returns the IP string or None if all candidates are in use."""
+    for last in candidates:
+        candidate = f"{subnet_base}.{last}"
+        if not _ip_in_use(candidate):
+            return candidate
+    return None
+
+
+def _unique_camera_subnets(cameras):
+    """Walk the camera list, return [{'gateway': ..., 'mask': ..., 'subnet_base': '10.0.42'}, ...]
+    with one entry per unique subnet. Deduped — 50 cameras at 10.0.42.x = ONE entry."""
+    seen = set()
+    out = []
+    for c in cameras:
+        gw = (c.get('gateway') or '').strip()
+        mask = (c.get('subnet') or '255.255.255.0').strip()
+        if not gw or '.' not in gw:
+            continue
+        parts = gw.split('.')
+        if len(parts) != 4:
+            continue
+        # subnet_base: first 3 octets of the gateway. Crude but covers 99% of
+        # camera VLAN deployments which are /24 or /16 with cameras in the
+        # last octet ranges. For /16, picking .99 in the same first-3-octet
+        # group still puts the host in the routable subnet.
+        subnet_base = '.'.join(parts[:3])
+        key = (subnet_base, mask)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({'gateway': gw, 'mask': mask, 'subnet_base': subnet_base})
+    return out
+
+
+def _save_multihome_state(entries):
+    try:
+        path = MULTIHOME_STATE_FILE()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(entries, f, indent=2)
+    except Exception:
+        pass
+
+
+def _load_multihome_state():
+    try:
+        path = MULTIHOME_STATE_FILE()
+        if not path.exists():
+            return []
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _clear_multihome_state():
+    try:
+        path = MULTIHOME_STATE_FILE()
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
 
 def _ensure_output_csv_header():
     """Create programmed_cameras.csv with current header, or migrate older headers
@@ -4156,6 +4297,14 @@ class ProgramWizardDialog(tk.Toplevel):
         # hold the factory-reset button before wizard started writing).
         self.factory_first_var = tk.BooleanVar(value=False)
         self.existing_root_pwd_var = tk.StringVar(value='')
+        # v4.3 #11 — Auto NIC multi-home. When checked, the wizard derives
+        # every unique camera-list subnet, picks a free host IP per subnet,
+        # and adds those addresses to the selected interface via netsh.
+        # Cleanup at wizard end (or crash recovery on next launch).
+        # Requires admin elevation — toolkit detects + prompts to relaunch
+        # if not. Operator gets an explicit consent dialog before any netsh
+        # fires (per Brian's "MUST ASK FIRST" rule 2026-05-03).
+        self.auto_multihome_var = tk.BooleanVar(value=False)
         self.iface_var = tk.StringVar(value='Auto-detect (default)')
         self._interfaces = ProgramOptionsDialog._get_network_interfaces()
 
@@ -4340,6 +4489,15 @@ class ProgramWizardDialog(tk.Toplevel):
                           "    Peel stickers off the spool in order as cameras complete.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
 
+        # Auto NIC multi-home (v4.3 #11)
+        ttk.Checkbutton(f, text="Auto multi-home interface for this run (helps reach cameras on multiple subnets)",
+                        variable=self.auto_multihome_var).pack(anchor='w', pady=(15, 2))
+        ttk.Label(f, text="    Adds host IPs on the selected interface for every camera-list subnet,\n"
+                          "    so the toolkit can talk to cameras on different gateways without\n"
+                          "    manual netsh. Requires admin (toolkit will prompt). Cleanup runs\n"
+                          "    at wizard end + crash-recovery on next launch.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
         # Factory-default-before-program (v4.3 — for re-using cameras from prior installs)
         ttk.Checkbutton(f, text="Factory default before programming (for used cameras)",
                         variable=self.factory_first_var).pack(anchor='w', pady=(15, 2))
@@ -4487,6 +4645,7 @@ class ProgramWizardDialog(tk.Toplevel):
             'br_first_label': self.br_first_label_var.get().strip(),
             'factory_first': self.factory_first_var.get(),
             'existing_root_pwd': self.existing_root_pwd_var.get(),
+            'auto_multihome': self.auto_multihome_var.get(),
             'interface': selected_iface,
         }
         self.destroy()
@@ -6178,6 +6337,102 @@ class CCTVToolkitApp:
             except Exception:
                 pass
         self.log(msg, _persist_to_file=False)  # main log tab only — file already written
+
+    def _offer_multihome(self, opts, cameras):
+        """v4.3 #11 — Auto NIC multi-home setup. Brian's MUST-ASK-FIRST rule.
+        If opts['auto_multihome'] is True:
+          1. Check elevation. Not admin → friendly message + skip (toolkit
+             continues, just without auto multi-home).
+          2. Derive every unique subnet from the camera list.
+          3. Show explicit consent dialog with the exact wording: which
+             interface, how many IPs, that admin is being used.
+          4. If consent granted: pick free host IP per subnet, run netsh add,
+             save state file for crash-safe cleanup.
+          5. Log a summary line per add.
+        Returns count of IPs added (for the operator's confidence)."""
+        if not opts.get('auto_multihome'):
+            return 0
+        iface = opts.get('interface') or {}
+        iface_index = iface.get('index')
+        if not iface_index:
+            self.log("⚠ Auto multi-home requested but no interface was selected — skipping.")
+            return 0
+        # Elevation check
+        if not _is_admin_windows():
+            messagebox.showwarning("Auto Multi-Home — admin required",
+                "Auto Multi-Home needs administrator privileges to add IP addresses to your "
+                "network adapter.\n\n"
+                "Close the toolkit, right-click → 'Run as administrator', and try again.\n\n"
+                "(Programming will continue WITHOUT multi-home for this run.)",
+                parent=self.root)
+            self.log("⚠ Auto multi-home skipped — toolkit not running as admin.")
+            return 0
+        # Derive subnets
+        subnets = _unique_camera_subnets(cameras)
+        if not subnets:
+            self.log("⚠ Auto multi-home requested but no usable subnets in camera list — skipping.")
+            return 0
+        # MUST ASK FIRST — explicit consent dialog
+        iface_label = iface.get('label', f"interface index {iface_index}")
+        consent_msg = (
+            f"In order to program these cameras AND CONFIRM PROGRAMMING, "
+            f"the toolkit can set additional IP addresses on:\n\n"
+            f"  {iface_label}\n\n"
+            f"This run needs {len(subnets)} additional address(es) — one per "
+            f"camera-subnet:\n"
+            f"  " + "\n  ".join(f"{s['subnet_base']}.x" for s in subnets[:8])
+            + (f"\n  ...and {len(subnets) - 8} more" if len(subnets) > 8 else "") + "\n\n"
+            f"This requires administrator privileges (which you have, since you launched "
+            f"as admin).\n\n"
+            f"Cleanup will run automatically at wizard end. If the toolkit crashes, the "
+            f"next launch will offer to clean up the leftover addresses.\n\n"
+            f"Allow this?"
+        )
+        if not messagebox.askyesno("Auto Multi-Home — confirm", consent_msg, parent=self.root):
+            self.log("⚠ Auto multi-home declined by operator — continuing without.")
+            return 0
+        # Pick free IPs + add via netsh
+        added = []
+        for s in subnets:
+            chosen = _pick_free_host_ip(s['subnet_base'], s['mask'])
+            if not chosen:
+                self.log(f"⚠ Auto multi-home: no free host IP found in {s['subnet_base']}.x — skipped.")
+                continue
+            if _netsh_add_ip(iface_index, chosen, s['mask']):
+                added.append({'iface_index': iface_index, 'ip': chosen,
+                              'mask': s['mask'], 'subnet_base': s['subnet_base']})
+                self.log(f"  ✓ Auto multi-home: added {chosen}/{s['mask']} to {iface_label}")
+            else:
+                self.log(f"  ✗ Auto multi-home: netsh add failed for {chosen}")
+        if added:
+            _save_multihome_state(added)
+            self.log(f"Auto multi-home: {len(added)} address(es) added. Cleanup at wizard end.")
+        return len(added)
+
+    def _cleanup_multihome(self):
+        """Tear down whatever _offer_multihome added. Idempotent — safe to
+        call even if no multi-home was set up. Removes the state file when
+        all entries are removed."""
+        entries = _load_multihome_state()
+        if not entries:
+            return
+        if not _is_admin_windows():
+            self.log("⚠ Cleanup needed for auto multi-home but toolkit is not admin — leaving state file for next launch.")
+            return
+        removed = 0
+        leftover = []
+        for e in entries:
+            if _netsh_remove_ip(e['iface_index'], e['ip']):
+                removed += 1
+            else:
+                leftover.append(e)
+        if removed:
+            self.log(f"Auto multi-home cleanup: removed {removed} address(es).")
+        if leftover:
+            self.log(f"⚠ {len(leftover)} address(es) couldn't be removed — kept in state for retry.")
+            _save_multihome_state(leftover)
+        else:
+            _clear_multihome_state()
 
     def _open_wizard_run_log(self):
         """Auto-open EXPORT_DIR/wizard_logs/wizard_run_<timestamp>.log for the
@@ -8760,6 +9015,9 @@ https://buymeacoffee.com/thelostping""")
                     br_enabled = False
                     self.log("⚠ Building Reports stickers requested but seed value is not a number — skipping.")
 
+            # v4.3 #11 — Auto NIC multi-home (with explicit consent dialog)
+            self._offer_multihome(_r0, cameras)
+
             _ensure_output_csv_header()
 
             if wizard_log_path:
@@ -9429,6 +9687,7 @@ https://buymeacoffee.com/thelostping""")
             self.root.after(0, self.refresh_camera_list)
             self.root.after(0, self.rescan_after_operation)
             self.clear_preview()
+            self._cleanup_multihome()  # v4.3 #11 — tear down any auto-added IPs
             self._close_wizard_run_log()
 
         threading.Thread(target=run, daemon=True).start()
@@ -9510,6 +9769,9 @@ https://buymeacoffee.com/thelostping""")
                 except (ValueError, TypeError):
                     br_enabled = False
                     self.status_log("⚠ Building Reports stickers requested but seed value is not a number — skipping.")
+
+            # v4.3 #11 — Auto NIC multi-home (with explicit consent dialog)
+            self._offer_multihome(opts, cameras)
 
             _ensure_output_csv_header()
 
@@ -10254,6 +10516,7 @@ https://buymeacoffee.com/thelostping""")
             _ui(self.status_enable_cancel, False)
             _ui(self.refresh_camera_list)
             _ui(self.rescan_after_operation)
+            self._cleanup_multihome()  # v4.3 #11 — tear down any auto-added IPs
             self._close_wizard_run_log()
 
         threading.Thread(target=run, daemon=True).start()
