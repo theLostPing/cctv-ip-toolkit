@@ -610,6 +610,10 @@ class PasswordDataManager:
 
 class AdditionalUsersDataManager:
     """Manages additional camera users - stored as JSON list of {username, password, role}"""
+    # ROLES — Axis ONVIF UserLevel options. add_user() creates the user in BOTH
+    # VAPIX and ONVIF databases for these levels. (v4.3 #10 future work: add an
+    # 'ONVIF-only Operator' that skips the VAPIX side, for VMS service accounts
+    # that don't need web-UI access. Needs add_user refactor — deferred.)
     ROLES = ['Administrator', 'Operator', 'Viewer']
 
     def __init__(self):
@@ -1232,6 +1236,10 @@ class AxisProtocol(CameraProtocol):
         # the VAPIX one, ONVIF clients (Milestone, Genetec, exacqVision) can't
         # log in even though the web UI works fine. Found that out the hard way
         # on a Chase job in 2014. Now I always create both up-front.
+        # 2026-05-02 v4.3 #10: this ONVIF "root" user is REQUIRED for set_network
+        # SOAP. After programming, the wizard calls delete_onvif_user(static_ip)
+        # to remove it (unless the operator opted to keep it). Net effect:
+        # camera ends with VAPIX root only, no leftover ONVIF account.
         try:
             soap = (f'<?xml version="1.0"?>'
                     f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
@@ -1250,6 +1258,33 @@ class AxisProtocol(CameraProtocol):
             # still ends up created. Web UI confirms it. Just move on.
             pass
         return True
+
+    def delete_onvif_user(self, ip, password, username='root'):
+        """v4.3 #10 — security cleanup after programming completes. The ONVIF
+        user that create_initial_user added is a transient TOOL needed for
+        set_network's ONVIF SOAP call; once set_network is done it's just a
+        leftover account. Delete via ONVIF DeleteUsers SOAP. Idempotent —
+        if the user is already gone, returns True (no-op).
+        Returns True on success or already-absent, False on a real failure
+        (auth fail, network unreachable, SOAP fault). Non-fatal at the wizard
+        level — wizard logs a warning if False but keeps going."""
+        try:
+            soap = (f'<?xml version="1.0"?>'
+                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                    f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
+                    f'<Username>{username}</Username>'
+                    f'</DeleteUsers></Body></Envelope>')
+            r = requests.post(f"http://{ip}/vapix/services", data=soap,
+                headers={"Content-Type": "application/soap+xml"},
+                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+            if r.status_code in (200, 204):
+                return True
+            # 4xx with "user not found" SOAP fault = already deleted; treat as ok
+            if 'NoSuchUser' in r.text or 'not found' in r.text.lower():
+                return True
+            return False
+        except Exception:
+            return False
 
     def set_network(self, ip, password, new_ip, subnet, gateway):
         # Two paths: ONVIF SOAP first because it's atomic — gateway/IP/DHCP
@@ -3993,6 +4028,11 @@ class ProgramWizardDialog(tk.Toplevel):
         self.factory_ip_var = tk.StringVar(value=factory_ip)
         self.hostname_var = tk.BooleanVar(value=False)
         self.additional_users_var = tk.BooleanVar(value=False)
+        # v4.3 #10: by default the wizard creates an ONVIF root user (required
+        # by set_network's ONVIF SOAP) AND deletes it after programming so the
+        # camera ends with VAPIX root only. Operator can opt to keep it (e.g.
+        # customer requires ONVIF account for VMS handoff).
+        self.keep_onvif_user_var = tk.BooleanVar(value=False)
         self.iface_var = tk.StringVar(value='Auto-detect (default)')
         self._interfaces = ProgramOptionsDialog._get_network_interfaces()
 
@@ -4143,6 +4183,13 @@ class ProgramWizardDialog(tk.Toplevel):
         ttk.Label(f, text="    Sets hostname to <number>-<brand>-<serial> on each camera.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
 
+        ttk.Checkbutton(f, text="Keep ONVIF user after programming (don't delete)",
+                        variable=self.keep_onvif_user_var).pack(anchor='w', pady=(15, 2))
+        ttk.Label(f, text="    Default: ONVIF user is deleted after set_network completes,\n"
+                          "    leaving VAPIX root only. Check this if your customer/VMS\n"
+                          "    requires the ONVIF user to remain.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
         if self.additional_users_count > 0:
             label = f"Create additional user accounts ({self.additional_users_count} defined)"
             state = 'normal'
@@ -4269,6 +4316,7 @@ class ProgramWizardDialog(tk.Toplevel):
             'discovery_mode': mode,
             'set_hostname': self.hostname_var.get(),
             'add_additional_users': self.additional_users_var.get(),
+            'keep_onvif_user': self.keep_onvif_user_var.get(),
             'interface': selected_iface,
         }
         self.destroy()
@@ -5617,9 +5665,12 @@ class CCTVToolkitApp:
         self.users_tree.heading('username', text='Username')
         self.users_tree.heading('password', text='Password')
         self.users_tree.heading('role', text='Role')
-        self.users_tree.column('username', width=150)
-        self.users_tree.column('password', width=150)
-        self.users_tree.column('role', width=120)
+        # anchor='center' on data columns matches the default-centered headings
+        # — without this, headers center but data left-aligns (Brian flagged
+        # 2026-05-02: visual mismatch, alignment bug)
+        self.users_tree.column('username', width=150, anchor='center')
+        self.users_tree.column('password', width=150, anchor='center')
+        self.users_tree.column('role', width=120, anchor='center')
         users_scroll = ttk.Scrollbar(users_top, orient=tk.VERTICAL, command=self.users_tree.yview)
         self.users_tree.configure(yscrollcommand=users_scroll.set)
         self.users_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -8980,6 +9031,22 @@ https://buymeacoffee.com/thelostping""")
                     self.log(f"Camera online at {static_ip} (after {wait_count + 3}s)")
                     time.sleep(1)
 
+                # v4.3 #10: ONVIF user teardown — security cleanup. The ONVIF
+                # root user that create_initial_user added was needed for
+                # set_network's SOAP. Now that the camera is reachable at its
+                # new IP, delete it unless operator explicitly opted to keep
+                # (classic wizard's older options dialog has no checkbox so it
+                # always defaults to delete; new wizard exposes the option).
+                if camera_reachable and hasattr(self.protocol, 'delete_onvif_user'):
+                    keep_onvif = bool(prog_opts.result.get('keep_onvif_user', False)) if prog_opts and prog_opts.result else False
+                    if not keep_onvif:
+                        if self.protocol.delete_onvif_user(static_ip, password, 'root'):
+                            self.log("ONVIF user deleted — camera ends with VAPIX root only.")
+                        else:
+                            self.log("⚠ ONVIF user delete failed — leftover ONVIF account on camera.")
+                    else:
+                        self.log("ONVIF user kept (operator-requested).")
+
                 # Get serial/MAC if camera is reachable
                 serial = 'UNKNOWN'
                 if camera_reachable:
@@ -9674,6 +9741,19 @@ https://buymeacoffee.com/thelostping""")
                     self.status_log(f"Camera online at {static_ip} (after {wait_count + 3}s)")
                     _ui(self.status_set_step, 'verify_online', 'ok', f'{wait_count + 3}s')
                     time.sleep(1)
+
+                # v4.3 #10: ONVIF user teardown — see classic wizard for full
+                # rationale. New wizard's ProgramWizardDialog exposes the
+                # "Keep ONVIF user" checkbox; default is delete.
+                if camera_reachable and hasattr(self.protocol, 'delete_onvif_user'):
+                    keep_onvif = bool(opts.get('keep_onvif_user', False))
+                    if not keep_onvif:
+                        if self.protocol.delete_onvif_user(static_ip, password, 'root'):
+                            self.status_log("ONVIF user deleted — camera ends with VAPIX root only.")
+                        else:
+                            self.status_log("⚠ ONVIF user delete failed — leftover ONVIF account on camera.")
+                    else:
+                        self.status_log("ONVIF user kept (operator-requested).")
 
                 # ---- Capture serial / MAC / image ----
                 _ui(self.status_set_step, 'capture', 'active')
