@@ -8781,10 +8781,39 @@ https://buymeacoffee.com/thelostping""")
                         time.sleep(2)  # Brief delay before trying again
                         continue
                 else:
-                    # Couldn't query model — just take the first remaining entry
+                    # Probe returned no model — same v4.3 #8 confirm dialog as
+                    # new wizard (askyesnocancel: Try Again / Proceed Anyway / Cancel)
+                    next_name = remaining[0].get('name', '?')
+                    next_model = remaining[0].get('model', '(any)') or '(any)'
+                    result = [None]
+                    def show_no_model_classic():
+                        msg = (f"Could not identify the camera at {camera_ip}.\n\n"
+                               f"Probe returned no model — camera may be rebooting, "
+                               f"unreachable on HTTP, or have firmware that doesn't "
+                               f"answer basicdeviceinfo.cgi.\n\n"
+                               f"Yes    → Try again (re-probe — camera may respond now)\n"
+                               f"No     → Proceed anyway, treat as: {next_name} ({next_model})\n"
+                               f"Cancel → Bail the whole wizard run")
+                        result[0] = messagebox.askyesnocancel(
+                            "Cannot Confirm Camera Model", msg)
+                    self.root.after(0, show_no_model_classic)
+                    while result[0] is None and not self.cancel_flag:
+                        time.sleep(0.1)
+                    if self.cancel_flag or result[0] is None:
+                        self.cancel_flag = True
+                        self.log("Cancelled by user — bailing wizard.")
+                        break
+                    if result[0] is True:
+                        self.log("Retrying probe for this camera slot...")
+                        self.arp_unpin(camera_ip)
+                        camera_ip = None
+                        pinned_mac = None
+                        time.sleep(2)
+                        continue
+                    self.log(f"Proceeding without model verification — assuming {next_name}.")
                     cam = remaining[0]
                     cam_idx = 0
-                
+
                 consecutive_skips = 0  # Reset skip counter on match
                 
                 cam_name = cam['name']
@@ -9440,6 +9469,46 @@ https://buymeacoffee.com/thelostping""")
                         time.sleep(2)
                         continue
                 else:
+                    # Probe returned no model at all — camera mid-reboot, weird
+                    # firmware, network glitch, etc. v4.3 #8: replace the silent
+                    # "take first remaining" fallback with an explicit confirm
+                    # so the operator chooses what to do. askyesnocancel:
+                    #   Yes    = Try again (re-probe the same slot — camera
+                    #            may respond on the next pass)
+                    #   No     = Proceed anyway, assume next-in-list
+                    #   Cancel = Bail the whole run
+                    next_name = remaining[0].get('name', '?')
+                    next_model = remaining[0].get('model', '(any)') or '(any)'
+                    result = [None]
+                    def show_no_model():
+                        msg = (f"Could not identify the camera at {camera_ip}.\n\n"
+                               f"Probe returned no model — camera may be rebooting, "
+                               f"unreachable on HTTP, or have firmware that doesn't "
+                               f"answer basicdeviceinfo.cgi.\n\n"
+                               f"Yes    → Try again (re-probe — camera may respond now)\n"
+                               f"No     → Proceed anyway, treat as: {next_name} ({next_model})\n"
+                               f"Cancel → Bail the whole wizard run")
+                        result[0] = messagebox.askyesnocancel(
+                            "Cannot Confirm Camera Model", msg)
+                    self.root.after(0, show_no_model)
+                    while result[0] is None and not self.cancel_flag:
+                        time.sleep(0.1)
+                    if self.cancel_flag or result[0] is None:
+                        # Cancel pressed — bail
+                        self.cancel_flag = True
+                        self.status_log("Cancelled by user — bailing wizard.")
+                        break
+                    if result[0] is True:
+                        # Try again — re-loop discovery for this slot
+                        self.status_log("Retrying probe for this camera slot...")
+                        self.arp_unpin(camera_ip)
+                        camera_ip = None
+                        pinned_mac = None
+                        _ui(self.status_set_step, 'discover', 'active')
+                        time.sleep(2)
+                        continue
+                    # result[0] is False → Proceed anyway with first remaining
+                    self.status_log(f"Proceeding without model verification — assuming {next_name}.")
                     cam = remaining[0]
                     cam_idx = 0
 
