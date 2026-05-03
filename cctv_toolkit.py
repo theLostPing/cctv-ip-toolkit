@@ -8603,7 +8603,20 @@ https://buymeacoffee.com/thelostping""")
                     
                 if self.cancel_flag:
                     break
-                
+
+                # Pre-pin probe (race guard) — same fix as new wizard. If
+                # discovery snagged a freshly-programmed camera at its
+                # transient link-local 169.254.x.x address before ARP cache
+                # caught up, ARP would have returned no MAC and the seen_macs
+                # check below would be skipped, causing a phantom re-program.
+                # Probe via no-auth basicdeviceinfo gives us the MAC reliably
+                # (Axis serial == MAC). 2026-04-30 CMH field-log bug.
+                if not pinned_mac:
+                    pre_probe = self.protocol.probe_unrestricted(camera_ip)
+                    if pre_probe.get('mac'):
+                        pinned_mac = pre_probe['mac']
+                        self.log(f"Pre-pin probe MAC: {pinned_mac}")
+
                 # ARP pin — lock onto this specific camera's MAC
                 if not pinned_mac:
                     pinned_mac = self.get_mac_from_arp(camera_ip)
@@ -9192,6 +9205,28 @@ https://buymeacoffee.com/thelostping""")
                 _ui(self.status_set_step, 'discover', 'ok', camera_ip)
                 _ui(self.status_set_banner, 'PROGRAMMING…',
                     f"{next_name}  →  working on it", '#2196F3')
+
+                # ---- Pre-pin probe (race-condition guard) ----
+                # The new wizard previously relied on ARP cache to identify the
+                # MAC of a freshly-discovered camera. Race condition (Brian's CMH
+                # field log 2026-04-30): a JUST-PROGRAMMED camera that's still
+                # rebooting briefly comes up on a fresh link-local 169.254.x.x
+                # address before settling on its new static IP. Discovery snags
+                # that link-local IP, ARP cache hasn't warmed up to it yet so
+                # pinned_mac is empty, so the seen_macs check below is skipped,
+                # so the wizard happily re-programs the previously-programmed
+                # camera. Result: phantom retries, "got ?" model, double-runs.
+                #
+                # Fix: probe the camera no-auth FIRST. probe_unrestricted gives
+                # us model + serial + MAC + firmware in one round trip without
+                # depending on ARP. Whatever MAC we get from probe is canonical
+                # — Axis serial IS the MAC. Backfill pinned_mac so the existing
+                # seen_macs guard fires correctly.
+                if not pinned_mac:
+                    pre_probe = self.protocol.probe_unrestricted(camera_ip)
+                    if pre_probe.get('mac'):
+                        pinned_mac = pre_probe['mac']
+                        self.status_log(f"Pre-pin probe MAC: {pinned_mac}")
 
                 # ---- ARP pin ----
                 _ui(self.status_set_step, 'pin', 'active')
