@@ -228,18 +228,19 @@ DEFAULT_SETTINGS = {
     }
 }
 
-OUTPUT_CSV_HEADER = ['CameraName', 'IPAddress', 'SerialNumber', 'MACAddress', 'Model', 'Firmware', 'Timestamp']
+OUTPUT_CSV_HEADER = ['CameraName', 'IPAddress', 'SerialNumber', 'MACAddress', 'Model', 'Firmware', 'BuildingReportsLabel', 'Timestamp']
 
 
 def _ensure_output_csv_header():
-    """Create programmed_cameras.csv with current header, or migrate an old header
-    in-place by adding the Firmware column. Existing rows get a blank Firmware cell."""
+    """Create programmed_cameras.csv with current header, or migrate older headers
+    in-place. Migrations supported (newest-first):
+      - 7-col (no BuildingReportsLabel) → add blank cell before Timestamp
+      - 6-col (no Firmware, no BuildingReportsLabel) → add both blanks"""
     if not os.path.exists(OUTPUT_CSV):
         os.makedirs(os.path.dirname(OUTPUT_CSV) or '.', exist_ok=True)
         with open(OUTPUT_CSV, 'w', newline='') as f:
             csv.writer(f).writerow(OUTPUT_CSV_HEADER)
         return
-    # File exists — check the header
     try:
         with open(OUTPUT_CSV, 'r', newline='') as f:
             rows = list(csv.reader(f))
@@ -252,19 +253,19 @@ def _ensure_output_csv_header():
     header = rows[0]
     if header == OUTPUT_CSV_HEADER:
         return
-    # Old header (no Firmware column) — migrate
-    if 'Firmware' not in header and len(header) >= 6:
-        # Old: CameraName,IPAddress,SerialNumber,MACAddress,Model,Timestamp
-        # New: CameraName,IPAddress,SerialNumber,MACAddress,Model,Firmware,Timestamp
-        new_rows = [OUTPUT_CSV_HEADER]
-        for row in rows[1:]:
-            if len(row) >= 6:
-                # Insert blank Firmware before the timestamp
-                new_rows.append(row[:5] + [''] + row[5:])
-            else:
-                new_rows.append(row)
-        with open(OUTPUT_CSV, 'w', newline='') as f:
-            csv.writer(f).writerows(new_rows)
+    # Migrate
+    new_rows = [OUTPUT_CSV_HEADER]
+    for row in rows[1:]:
+        if len(row) == 7 and 'Firmware' in header:
+            # 7-col: CameraName,IPAddress,SerialNumber,MACAddress,Model,Firmware,Timestamp
+            new_rows.append(row[:6] + [''] + row[6:])
+        elif len(row) == 6:
+            # 6-col: CameraName,IPAddress,SerialNumber,MACAddress,Model,Timestamp
+            new_rows.append(row[:5] + ['', ''] + row[5:])
+        else:
+            new_rows.append(row)
+    with open(OUTPUT_CSV, 'w', newline='') as f:
+        csv.writer(f).writerows(new_rows)
 
 
 # ============================================================================
@@ -4084,6 +4085,14 @@ class ProgramWizardDialog(tk.Toplevel):
         # If empty, the kept ONVIF user remains as 'root'/(VAPIX password).
         self.onvif_username_var = tk.StringVar(value='')
         self.onvif_password_var = tk.StringVar(value='')
+        # v4.3 #13 — Building Reports sticker numbering. If enabled, each
+        # successfully-programmed camera gets the next sequential sticker
+        # number assigned (8-digit per Brian's rolls), starting from the
+        # operator-supplied seed. Saved into the OUTPUT_CSV's
+        # BuildingReportsLabel column. Operator peels stickers off the
+        # spool in order as cameras complete.
+        self.add_br_stickers_var = tk.BooleanVar(value=False)
+        self.br_first_label_var = tk.StringVar(value='')
         self.iface_var = tk.StringVar(value='Auto-detect (default)')
         self._interfaces = ProgramOptionsDialog._get_network_interfaces()
 
@@ -4255,6 +4264,19 @@ class ProgramWizardDialog(tk.Toplevel):
                           "Keep is unchecked.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
 
+        # Building Reports stickers (v4.3 #13)
+        ttk.Checkbutton(f, text="Add Building Reports stickers (sequential 8-digit labels)",
+                        variable=self.add_br_stickers_var).pack(anchor='w', pady=(15, 2))
+        br_row = ttk.Frame(f)
+        br_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(br_row, text="    First sticker number on roll:",
+                  font=('Helvetica', 9)).pack(side=tk.LEFT)
+        ttk.Entry(br_row, textvariable=self.br_first_label_var, width=14).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(f, text="    Each programmed camera gets the next sequential number assigned.\n"
+                          "    Saved in the BuildingReportsLabel column of the success CSV.\n"
+                          "    Peel stickers off the spool in order as cameras complete.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
         if self.additional_users_count > 0:
             label = f"Create additional user accounts ({self.additional_users_count} defined)"
             state = 'normal'
@@ -4384,6 +4406,8 @@ class ProgramWizardDialog(tk.Toplevel):
             'keep_onvif_user': self.keep_onvif_user_var.get(),
             'onvif_username': self.onvif_username_var.get().strip(),
             'onvif_password': self.onvif_password_var.get().strip(),
+            'add_br_stickers': self.add_br_stickers_var.get(),
+            'br_first_label': self.br_first_label_var.get().strip(),
             'interface': selected_iface,
         }
         self.destroy()
@@ -8642,10 +8666,23 @@ https://buymeacoffee.com/thelostping""")
             username = self.protocol.DEFAULT_USER
             total_ok = total_fail = 0
 
+            # v4.3 #13 — Building Reports sticker counter
+            _r0 = (prog_opts.result if (prog_opts and prog_opts.result) else {})
+            br_enabled = bool(_r0.get('add_br_stickers', False))
+            br_counter = None
+            if br_enabled:
+                try:
+                    br_counter = int(str(_r0.get('br_first_label', '')).strip())
+                except (ValueError, TypeError):
+                    br_enabled = False
+                    self.log("⚠ Building Reports stickers requested but seed value is not a number — skipping.")
+
             _ensure_output_csv_header()
 
             if wizard_log_path:
                 self.log(f"Wizard run log: {wizard_log_path}")
+            if br_enabled:
+                self.log(f"Building Reports stickers: starting at #{br_counter}")
             self.log(f"Discovery mode: {discovery_mode}")
             if factory_ip:
                 self.log(f"Factory IP: {factory_ip}")
@@ -9173,11 +9210,22 @@ https://buymeacoffee.com/thelostping""")
                 self.camera_data.save()
                 self.root.after(0, self.refresh_camera_list)
 
+                # v4.3 #13 — assign Building Reports sticker number if enabled.
+                # Assigned BEFORE CSV write so the row carries the label. Only
+                # increments on successful programming (errors → no sticker
+                # assigned, no counter bump, operator can re-program later).
+                br_label = ''
+                if br_enabled and br_counter is not None and not errors:
+                    br_label = str(br_counter)
+                    self.log(f"Building Reports sticker: #{br_label}  ← peel and apply to {cam.get('name', cam_name)}")
+                    br_counter += 1
+
                 # Save to output CSV (always — success or partial fail)
                 cam_mac = cam.get('mac', pinned_mac or '')
                 with open(OUTPUT_CSV, 'a', newline='') as f:
                     csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac,
                                            actual_model or expected_model, actual_firmware,
+                                           br_label,
                                            datetime.now().isoformat()])
 
                 # Mark based on results
@@ -9328,10 +9376,22 @@ https://buymeacoffee.com/thelostping""")
             username = self.protocol.DEFAULT_USER
             total_ok = total_fail = 0
 
+            # v4.3 #13 — Building Reports sticker counter
+            br_enabled = bool(opts.get('add_br_stickers', False))
+            br_counter = None
+            if br_enabled:
+                try:
+                    br_counter = int(str(opts.get('br_first_label', '')).strip())
+                except (ValueError, TypeError):
+                    br_enabled = False
+                    self.status_log("⚠ Building Reports stickers requested but seed value is not a number — skipping.")
+
             _ensure_output_csv_header()
 
             if wizard_log_path:
                 self.status_log(f"Wizard run log: {wizard_log_path}")
+            if br_enabled:
+                self.status_log(f"Building Reports stickers: starting at #{br_counter}")
             self.status_log(f"Discovery mode: {discovery_mode}")
             if factory_ip:
                 self.status_log(f"Factory IP: {factory_ip}")
@@ -9898,11 +9958,19 @@ https://buymeacoffee.com/thelostping""")
                 self.camera_data.save()
                 _ui(self.refresh_camera_list)
 
+                # v4.3 #13 — assign Building Reports sticker number if enabled
+                br_label = ''
+                if br_enabled and br_counter is not None and not errors:
+                    br_label = str(br_counter)
+                    self.status_log(f"Building Reports sticker: #{br_label}  ← peel and apply to {cam.get('name', cam_name)}")
+                    br_counter += 1
+
                 # ---- Write CSV row ----
                 cam_mac = cam.get('mac', pinned_mac or '')
                 with open(OUTPUT_CSV, 'a', newline='') as f:
                     csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac,
                                            actual_model or expected_model, actual_firmware,
+                                           br_label,
                                            datetime.now().isoformat()])
 
                 # ---- Mark success/fail ----
