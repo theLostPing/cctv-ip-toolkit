@@ -5936,14 +5936,56 @@ class CCTVToolkitApp:
             w['detail'].config(text=detail)
 
     def status_log(self, msg):
-        """Append a line to the embedded detailed log + the main log tab."""
+        """Append a line to the embedded detailed log + the main log tab + the
+        wizard-run log file (if a run is active — see _open_wizard_run_log)."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         try:
             self._status_log_text.insert(tk.END, f"[{timestamp}] {msg}\n")
             self._status_log_text.see(tk.END)
         except Exception:
             pass
-        self.log(msg)  # also goes to main log tab
+        # Auto-persist to disk for the active wizard run (#11)
+        fh = getattr(self, '_wizard_run_log_fh', None)
+        if fh:
+            try:
+                fh.write(f"[{timestamp}] {msg}\n")
+                fh.flush()
+            except Exception:
+                pass
+        self.log(msg, _persist_to_file=False)  # main log tab only — file already written
+
+    def _open_wizard_run_log(self):
+        """Auto-open EXPORT_DIR/wizard_logs/wizard_run_<timestamp>.log for the
+        duration of a wizard run. Every status_log/log line is also written to
+        disk so a crashed/interrupted run still leaves a complete log artifact.
+        Brian's CMH 2026-04-30 ask (v4.3 list item k / #11): the manual Save
+        Log button is fine but operators forget to click it, and a crash mid-
+        run loses everything. This makes persistence automatic.
+        Returns path string or None on failure."""
+        try:
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime('%Y%m%d_%H%M%S')
+            log_dir = EXPORT_DIR / 'wizard_logs'
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / f'wizard_run_{ts}.log'
+            self._wizard_run_log_fh = open(path, 'w', encoding='utf-8', buffering=1)
+            self._wizard_run_log_fh.write(f"=== Wizard run started {_dt.now().isoformat()} ===\n")
+            self._wizard_run_log_fh.flush()
+            return str(path)
+        except Exception:
+            self._wizard_run_log_fh = None
+            return None
+
+    def _close_wizard_run_log(self):
+        fh = getattr(self, '_wizard_run_log_fh', None)
+        if fh:
+            try:
+                from datetime import datetime as _dt
+                fh.write(f"=== Wizard run ended {_dt.now().isoformat()} ===\n")
+                fh.close()
+            except Exception:
+                pass
+            self._wizard_run_log_fh = None
 
     def status_set_preview(self, image_data=None):
         if not HAS_PIL:
@@ -7770,8 +7812,18 @@ class CCTVToolkitApp:
     # ========================================================================
     # LOGGING
     # ========================================================================
-    def log(self, message):
+    def log(self, message, _persist_to_file=True):
         self.log_queue.put(message)
+        # Auto-persist to wizard-run log file (#11). status_log() passes
+        # _persist_to_file=False because it already wrote — avoids double lines.
+        if _persist_to_file:
+            fh = getattr(self, '_wizard_run_log_fh', None)
+            if fh:
+                try:
+                    fh.write(f"[{datetime.now().strftime('%H:%M:%S')}] {message}\n")
+                    fh.flush()
+                except Exception:
+                    pass
     
     def process_log_queue(self):
         try:
@@ -8468,11 +8520,14 @@ https://buymeacoffee.com/thelostping""")
         self.enable_cancel(True)
 
         def run():
+            wizard_log_path = self._open_wizard_run_log()
             username = self.protocol.DEFAULT_USER
             total_ok = total_fail = 0
-            
+
             _ensure_output_csv_header()
 
+            if wizard_log_path:
+                self.log(f"Wizard run log: {wizard_log_path}")
             self.log(f"Discovery mode: {discovery_mode}")
             if factory_ip:
                 self.log(f"Factory IP: {factory_ip}")
@@ -9004,6 +9059,7 @@ https://buymeacoffee.com/thelostping""")
             self.root.after(0, self.refresh_camera_list)
             self.root.after(0, self.rescan_after_operation)
             self.clear_preview()
+            self._close_wizard_run_log()
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -9071,11 +9127,14 @@ https://buymeacoffee.com/thelostping""")
             self.root.after(0, lambda: fn(*args, **kwargs))
 
         def run():
+            wizard_log_path = self._open_wizard_run_log()
             username = self.protocol.DEFAULT_USER
             total_ok = total_fail = 0
 
             _ensure_output_csv_header()
 
+            if wizard_log_path:
+                self.status_log(f"Wizard run log: {wizard_log_path}")
             self.status_log(f"Discovery mode: {discovery_mode}")
             if factory_ip:
                 self.status_log(f"Factory IP: {factory_ip}")
@@ -9640,6 +9699,7 @@ https://buymeacoffee.com/thelostping""")
             _ui(self.status_enable_cancel, False)
             _ui(self.refresh_camera_list)
             _ui(self.rescan_after_operation)
+            self._close_wizard_run_log()
 
         threading.Thread(target=run, daemon=True).start()
 
