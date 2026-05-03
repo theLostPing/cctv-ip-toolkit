@@ -8814,18 +8814,41 @@ https://buymeacoffee.com/thelostping""")
                 if self.cancel_flag:
                     break
 
-                # Pre-pin probe (race guard) — same fix as new wizard. If
-                # discovery snagged a freshly-programmed camera at its
-                # transient link-local 169.254.x.x address before ARP cache
-                # caught up, ARP would have returned no MAC and the seen_macs
-                # check below would be skipped, causing a phantom re-program.
-                # Probe via no-auth basicdeviceinfo gives us the MAC reliably
-                # (Axis serial == MAC). 2026-04-30 CMH field-log bug.
-                if not pinned_mac:
+                # ---- MAC freshness gate (v4.3 #9) ----
+                # Backend-only loop. Don't announce "programming new camera"
+                # to the operator until probe_unrestricted has confirmed the
+                # discovered MAC is NOT in seen_macs. Brian 2026-05-03 spec:
+                # "I see a camera ip-(no matter what it is), scan- Can I see
+                # the mac? yes, Mac is/is not pre-existing, if not pre-existing
+                # 'Hey User! I found a new camera, programming now!'"
+                # This eliminates the phantom-reprogram race where a just-
+                # programmed camera transients through factory/link-local IPs
+                # during its reboot and the wizard would have re-grabbed it.
+                mac_settled = False
+                last_heartbeat = time.time()
+                while not self.cancel_flag and not mac_settled:
                     pre_probe = self.protocol.probe_unrestricted(camera_ip)
-                    if pre_probe.get('mac'):
-                        pinned_mac = pre_probe['mac']
-                        self.log(f"Pre-pin probe MAC: {pinned_mac}")
+                    mac = pre_probe.get('mac')
+                    if mac:
+                        mac_norm = mac.upper().replace(':', '').replace('-', '')
+                        if mac_norm not in seen_macs:
+                            pinned_mac = mac
+                            mac_settled = True
+                            break
+                    if not self.ping_camera(camera_ip, timeout_ms=1000):
+                        self.log(f"Camera left {camera_ip} — re-running discovery...")
+                        camera_ip = None
+                        pinned_mac = None
+                        break
+                    now_t = time.time()
+                    if now_t - last_heartbeat >= 30:
+                        seen_str = (mac.upper() if mac else 'unreadable')
+                        self.log(f"  Waiting for new camera... (current at {camera_ip}: {seen_str} — already programmed; unplug + plug next)")
+                        last_heartbeat = now_t
+                    time.sleep(2)
+
+                if not mac_settled:
+                    continue
 
                 # ARP pin — lock onto this specific camera's MAC
                 if not pinned_mac:
@@ -9518,31 +9541,53 @@ https://buymeacoffee.com/thelostping""")
                 if self.cancel_flag:
                     break
 
+                # ---- MAC freshness gate (v4.3 #9) ----
+                # Don't announce "programming new camera" until the backend has
+                # confirmed the discovered camera's MAC is NOT in seen_macs.
+                # Brian 2026-05-03: previous fix (pre_probe + seen_macs) leaked
+                # because if probe FAILED to return a MAC at all, the seen_macs
+                # check was silently bypassed. Inverted logic: REQUIRE a fresh
+                # MAC before proceeding. No fresh MAC → keep polling silently.
+                # This also covers the "camera doing a quick reset, transient
+                # appearance during reboot" case Brian flagged: the just-
+                # programmed cam keeps showing up, but its MAC stays in
+                # seen_macs, so the wizard quietly waits until operator
+                # actually unplugs A and plugs in B.
+                mac_settled = False
+                last_heartbeat = time.time()
+                while not self.cancel_flag and not mac_settled:
+                    pre_probe = self.protocol.probe_unrestricted(camera_ip)
+                    mac = pre_probe.get('mac')
+                    if mac:
+                        mac_norm = mac.upper().replace(':', '').replace('-', '')
+                        if mac_norm not in seen_macs:
+                            # Fresh camera! Proceed.
+                            pinned_mac = mac
+                            mac_settled = True
+                            break
+                    # MAC unreachable OR stale → keep waiting silently
+                    if not self.ping_camera(camera_ip, timeout_ms=1000):
+                        # Camera left this IP — re-discover (might be a new IP now)
+                        self.status_log(f"Camera left {camera_ip} — re-running discovery...")
+                        camera_ip = None
+                        pinned_mac = None
+                        _ui(self.status_set_step, 'discover', 'active')
+                        break
+                    # Heartbeat every 30s so operator knows we're alive
+                    now_t = time.time()
+                    if now_t - last_heartbeat >= 30:
+                        seen_str = (mac.upper() if mac else 'unreadable')
+                        self.status_log(f"  Waiting for new camera... (current at {camera_ip}: {seen_str} — already programmed; unplug + plug next)")
+                        last_heartbeat = now_t
+                    time.sleep(2)
+
+                if not mac_settled:
+                    # Inner loop bailed via re-discover OR cancel — outer loop continues
+                    continue
+
                 _ui(self.status_set_step, 'discover', 'ok', camera_ip)
                 _ui(self.status_set_banner, 'PROGRAMMING…',
                     f"{next_name}  →  working on it", '#2196F3')
-
-                # ---- Pre-pin probe (race-condition guard) ----
-                # The new wizard previously relied on ARP cache to identify the
-                # MAC of a freshly-discovered camera. Race condition (Brian's CMH
-                # field log 2026-04-30): a JUST-PROGRAMMED camera that's still
-                # rebooting briefly comes up on a fresh link-local 169.254.x.x
-                # address before settling on its new static IP. Discovery snags
-                # that link-local IP, ARP cache hasn't warmed up to it yet so
-                # pinned_mac is empty, so the seen_macs check below is skipped,
-                # so the wizard happily re-programs the previously-programmed
-                # camera. Result: phantom retries, "got ?" model, double-runs.
-                #
-                # Fix: probe the camera no-auth FIRST. probe_unrestricted gives
-                # us model + serial + MAC + firmware in one round trip without
-                # depending on ARP. Whatever MAC we get from probe is canonical
-                # — Axis serial IS the MAC. Backfill pinned_mac so the existing
-                # seen_macs guard fires correctly.
-                if not pinned_mac:
-                    pre_probe = self.protocol.probe_unrestricted(camera_ip)
-                    if pre_probe.get('mac'):
-                        pinned_mac = pre_probe['mac']
-                        self.status_log(f"Pre-pin probe MAC: {pinned_mac}")
 
                 # ---- ARP pin ----
                 _ui(self.status_set_step, 'pin', 'active')
