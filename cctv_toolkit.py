@@ -1435,18 +1435,21 @@ class AxisProtocol(CameraProtocol):
           - reachable      : probe_unrestricted got something back
           - mac/model/firmware : from no-auth probe (Axis serial == MAC)
           - auth_ok        : root+password gets 200 from param.cgi (Network)
-          - dhcp_off       : Network.eth0.BootProto == 'static' (most installs
-                             on a camera VLAN need DHCP off; on, only safe
-                             with MAC reservations)
-          - actual_ip / actual_gateway / actual_subnet : what the camera says
-                             its config is, for diff against expected entry
-        Returns a dict with all fields; missing/unread fields are None or False."""
+          - dhcp_off       : Network.BootProto != 'dhcp'
+          - actual_ip / actual_gateway / actual_subnet / actual_hostname :
+                             what the camera says its config is, for diff
+                             against expected entry
+        Returns a dict with all fields; missing/unread fields are None/False.
+        2026-05-03 fix: substring matching on Network.BootProto/HostName/etc
+        — Axis returns lines prefixed `root.` (e.g. `root.Network.BootProto=
+        dhcp`), the previous strict startswith check missed every one of
+        them and dhcp_off always came back None."""
         out = {
             'reachable': False, 'mac': None, 'model': None, 'firmware': None,
             'auth_ok': False, 'dhcp_off': None,
             'actual_ip': None, 'actual_gateway': None, 'actual_subnet': None,
+            'actual_hostname': None,
         }
-        # Quick no-auth probe — also covers reachability + identity
         probe = self.probe_unrestricted(ip)
         if probe.get('mac') or probe.get('model'):
             out['reachable'] = True
@@ -1455,7 +1458,6 @@ class AxisProtocol(CameraProtocol):
             out['firmware'] = probe.get('firmware')
         if not out['reachable']:
             return out
-        # Auth + network config
         try:
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "list", "group": "Network"},
@@ -1466,15 +1468,26 @@ class AxisProtocol(CameraProtocol):
                     line = line.strip()
                     if not line or '=' not in line:
                         continue
-                    if 'Network.eth0.IPAddress=' in line or line.startswith('Network.IPAddress='):
-                        out['actual_ip'] = line.split('=', 1)[1].strip()
+                    val = line.split('=', 1)[1].strip()
+                    # Substring matches — Axis prefixes lines with `root.`
+                    # so startswith() was missing them. Use eth0 variant
+                    # preferentially when both exist on a multi-iface cam.
+                    if 'Network.eth0.IPAddress=' in line:
+                        out['actual_ip'] = val
+                    elif 'Network.IPAddress=' in line and not out['actual_ip']:
+                        out['actual_ip'] = val
                     elif 'Network.eth0.DefaultRouter=' in line:
-                        out['actual_gateway'] = line.split('=', 1)[1].strip()
+                        out['actual_gateway'] = val
+                    elif 'Network.Routing.DefaultRouter=' in line and not out['actual_gateway']:
+                        out['actual_gateway'] = val
                     elif 'Network.eth0.SubnetMask=' in line:
-                        out['actual_subnet'] = line.split('=', 1)[1].strip()
-                    elif 'Network.eth0.BootProto=' in line or line.startswith('Network.BootProto='):
-                        proto = line.split('=', 1)[1].strip().lower()
-                        out['dhcp_off'] = (proto != 'dhcp')
+                        out['actual_subnet'] = val
+                    elif 'Network.SubnetMask=' in line and not out['actual_subnet']:
+                        out['actual_subnet'] = val
+                    elif 'Network.BootProto=' in line:
+                        out['dhcp_off'] = (val.lower() != 'dhcp')
+                    elif 'Network.HostName=' in line or 'Network.eth0.HostName=' in line:
+                        out['actual_hostname'] = val
         except Exception:
             pass
         return out
@@ -10625,6 +10638,7 @@ https://buymeacoffee.com/thelostping""")
             EXPORT_DIR.mkdir(parents=True, exist_ok=True)
             header = ['CameraName', 'ExpectedIP', 'ActualIP', 'IPMatch', 'AuthOK',
                       'DHCPOff', 'ActualMAC', 'ExpectedMAC', 'MACMatch',
+                      'ActualHostname', 'ExpectedHostname', 'HostnameMatch',
                       'Model', 'Firmware', 'Status', 'Timestamp']
             ok_count = warn_count = fail_count = 0
             self.log(f"\n{'='*60}")
@@ -10641,17 +10655,22 @@ https://buymeacoffee.com/thelostping""")
                     name = cam.get('name', '?')
                     expected_ip = cam.get('ip', '')
                     expected_mac = (cam.get('mac') or '').upper().replace('-', ':')
+                    expected_hostname = (cam.get('hostname') or '').strip()
                     self.log(f"\n--- {name} (expected {expected_ip}) ---")
                     if not expected_ip:
                         self.log("  ⚠ No expected IP in list — skipping.")
-                        w.writerow([name, '', '', '', '', '', '', expected_mac, '', '', '', 'NO_EXPECTED_IP', _dt.now().isoformat()])
+                        w.writerow([name, '', '', '', '', '', '', expected_mac, '',
+                                    '', expected_hostname, '',
+                                    '', '', 'NO_EXPECTED_IP', _dt.now().isoformat()])
                         warn_count += 1
                         continue
                     state = self.protocol.verify_camera_state(expected_ip, password)
                     actual_mac = (state.get('mac') or '').upper()
                     actual_ip = state.get('actual_ip') or ''
+                    actual_hostname = (state.get('actual_hostname') or '').strip()
                     ip_match = (actual_ip == expected_ip) if actual_ip else state.get('reachable', False)
                     mac_match = (actual_mac and expected_mac and actual_mac == expected_mac)
+                    hostname_match = (actual_hostname and expected_hostname and actual_hostname.lower() == expected_hostname.lower())
                     # Status decision
                     issues = []
                     if not state['reachable']:
@@ -10664,11 +10683,13 @@ https://buymeacoffee.com/thelostping""")
                         issues.append('MAC_MISMATCH')
                     if state['reachable'] and actual_ip and actual_ip != expected_ip:
                         issues.append('IP_MISMATCH')
+                    if expected_hostname and actual_hostname and not hostname_match:
+                        issues.append('HOSTNAME_MISMATCH')
                     status = 'OK' if not issues else ('FAIL' if 'UNREACHABLE' in issues or 'AUTH_FAIL' in issues or 'MAC_MISMATCH' in issues else 'WARN')
                     # Log
                     self.log(f"  reachable={state['reachable']}  auth_ok={state['auth_ok']}  "
                              f"dhcp_off={state['dhcp_off']}  actual_ip={actual_ip or '?'}  "
-                             f"actual_mac={actual_mac or '?'}")
+                             f"actual_mac={actual_mac or '?'}  actual_hostname={actual_hostname or '?'}")
                     if status == 'OK':
                         self.log(f"  ✓ OK")
                         ok_count += 1
@@ -10684,6 +10705,8 @@ https://buymeacoffee.com/thelostping""")
                                 'Y' if state['dhcp_off'] else ('N' if state['dhcp_off'] is False else '?'),
                                 actual_mac, expected_mac,
                                 'Y' if mac_match else ('N' if expected_mac and actual_mac else '?'),
+                                actual_hostname, expected_hostname,
+                                'Y' if hostname_match else ('N' if expected_hostname and actual_hostname else '?'),
                                 state.get('model') or '', state.get('firmware') or '',
                                 status, _dt.now().isoformat()])
             self.log(f"\n{'='*60}")
@@ -10692,6 +10715,19 @@ https://buymeacoffee.com/thelostping""")
             self.log(f"{'='*60}")
             self.root.after(0, lambda: self.update_display("DONE", f"✓{ok_count} ⚠{warn_count} ✗{fail_count}"))
             self.root.after(0, lambda: self.enable_cancel(False))
+            # v4.3 — switch to Log tab so operator sees results without
+            # having to navigate, then summary popup so they don't miss it.
+            def _show_summary():
+                try:
+                    self.notebook.select(self.log_tab)
+                except Exception:
+                    pass
+                tone = ('Verification complete' if fail_count == 0 else 'Verification — issues found')
+                messagebox.showinfo(tone,
+                    f"✓ {ok_count} OK\n⚠ {warn_count} warnings\n✗ {fail_count} failed\n\n"
+                    f"Details in the Log tab.\nFull CSV: {report_path}",
+                    parent=self.root)
+            self.root.after(0, _show_summary)
 
         threading.Thread(target=run, daemon=True).start()
 
