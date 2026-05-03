@@ -610,11 +610,14 @@ class PasswordDataManager:
 
 class AdditionalUsersDataManager:
     """Manages additional camera users - stored as JSON list of {username, password, role}"""
-    # ROLES — Axis ONVIF UserLevel options. add_user() creates the user in BOTH
-    # VAPIX and ONVIF databases for these levels. (v4.3 #10 future work: add an
-    # 'ONVIF-only Operator' that skips the VAPIX side, for VMS service accounts
-    # that don't need web-UI access. Needs add_user refactor — deferred.)
-    ROLES = ['Administrator', 'Operator', 'Viewer']
+    # ROLES — Axis user role options.
+    # 'Administrator', 'Operator', 'Viewer' = added to BOTH VAPIX and ONVIF
+    #   databases. Standard for users who need web-UI access AND VMS pickup.
+    # 'ONVIF-only Operator' (v4.3 #10c) = added ONLY to the ONVIF database,
+    #   not VAPIX. For VMS service accounts (Milestone, Genetec, exacqVision)
+    #   that don't need web-UI access. add_user() detects this role and
+    #   skips the VAPIX pwdgrp.cgi POST.
+    ROLES = ['Administrator', 'Operator', 'Viewer', 'ONVIF-only Operator']
 
     def __init__(self):
         self.users = []
@@ -1259,6 +1262,29 @@ class AxisProtocol(CameraProtocol):
             pass
         return True
 
+    def add_onvif_user(self, ip, password, new_username, new_password, level='Operator'):
+        """v4.3 #10b — create a NAMED ONVIF user (e.g. for VMS service account)
+        AFTER programming completes. Used in the rename pattern: the wizard
+        deletes the transient ONVIF root, then calls this to create the
+        operator-specified named user. Auths via VAPIX root (same admin creds
+        the rest of the wizard uses). level: 'Administrator' / 'Operator' /
+        'User'. Returns True on success."""
+        try:
+            soap = (f'<?xml version="1.0"?>'
+                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                    f'<CreateUsers xmlns="http://www.onvif.org/ver10/device/wsdl" '
+                    f'xmlns:tt="http://www.onvif.org/ver10/schema">'
+                    f'<User><tt:Username>{new_username}</tt:Username>'
+                    f'<tt:Password>{new_password}</tt:Password>'
+                    f'<tt:UserLevel>{level}</tt:UserLevel>'
+                    f'</User></CreateUsers></Body></Envelope>')
+            r = requests.post(f"http://{ip}/vapix/services", data=soap,
+                headers={"Content-Type": "application/soap+xml"},
+                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+            return r.status_code in (200, 204)
+        except Exception:
+            return False
+
     def delete_onvif_user(self, ip, password, username='root'):
         """v4.3 #10 — security cleanup after programming completes. The ONVIF
         user that create_initial_user added is a transient TOOL needed for
@@ -1611,21 +1637,33 @@ class AxisProtocol(CameraProtocol):
         }
         sgrp = role_groups.get(role, 'operator:viewer:ptz')
 
-        # VAPIX user first (this is the auth gate), ONVIF after for VMS hookup.
-        try:
-            r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
-                params={"action": "add", "user": username, "pwd": user_password,
-                        "grp": "users", "sgrp": sgrp},
-                auth=HTTPDigestAuth("root", admin_password), timeout=TIMEOUT)
-            if r.status_code != 200:
+        # v4.3 #10c — 'ONVIF-only Operator' role skips the VAPIX side entirely.
+        # The user only exists in the ONVIF user database, so they can hit the
+        # camera via ONVIF (Milestone/Genetec/exacqVision) but cannot log into
+        # the web UI. Useful for VMS service accounts where you want zero
+        # human-facing creds.
+        onvif_only = (role == 'ONVIF-only Operator')
+
+        if not onvif_only:
+            # VAPIX user first (this is the auth gate), ONVIF after for VMS hookup.
+            try:
+                r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
+                    params={"action": "add", "user": username, "pwd": user_password,
+                            "grp": "users", "sgrp": sgrp},
+                    auth=HTTPDigestAuth("root", admin_password), timeout=TIMEOUT)
+                if r.status_code != 200:
+                    return False
+            except:
                 return False
-        except:
-            return False
 
         # ONVIF level only has Administrator / Operator / User — Axis maps
-        # Viewer to "User". Same caveat as create_initial_user about needing
-        # both records or VMS-side login fails.
-        onvif_level = role if role in ('Administrator', 'Operator') else 'User'
+        # Viewer to "User". 'ONVIF-only Operator' maps to 'Operator'. Same
+        # caveat as create_initial_user about needing both records or VMS-side
+        # login fails.
+        if role in ('Administrator', 'Operator', 'ONVIF-only Operator'):
+            onvif_level = 'Administrator' if role == 'Administrator' else 'Operator'
+        else:
+            onvif_level = 'User'
         try:
             soap = (f'<?xml version="1.0"?>'
                     f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
@@ -1635,11 +1673,18 @@ class AxisProtocol(CameraProtocol):
                     f'<tt:Password>{user_password}</tt:Password>'
                     f'<tt:UserLevel>{onvif_level}</tt:UserLevel>'
                     f'</User></CreateUsers></Body></Envelope>')
-            requests.post(f"http://{ip}/vapix/services", data=soap,
+            r = requests.post(f"http://{ip}/vapix/services", data=soap,
                 headers={"Content-Type": "application/soap+xml"},
                 auth=HTTPDigestAuth("root", admin_password), timeout=TIMEOUT)
+            # For ONVIF-only role, ONVIF write must succeed (it's the ONLY user
+            # creation). For dual-write roles, ONVIF is best-effort (VAPIX is
+            # already gold-pathed).
+            if onvif_only and r.status_code not in (200, 204):
+                return False
         except:
-            pass  # see create_initial_user — ONVIF write is best-effort
+            if onvif_only:
+                return False  # ONVIF write failed AND it's our only user creation path
+            pass  # dual-write: ONVIF best-effort
         return True
 
     def factory_reset(self, ip, password):
@@ -4033,6 +4078,12 @@ class ProgramWizardDialog(tk.Toplevel):
         # camera ends with VAPIX root only. Operator can opt to keep it (e.g.
         # customer requires ONVIF account for VMS handoff).
         self.keep_onvif_user_var = tk.BooleanVar(value=False)
+        # v4.3 #10b — optional custom ONVIF user/password. If both are filled
+        # AND keep_onvif_user is checked, the wizard deletes the transient
+        # ONVIF root and creates this named user instead (rename pattern).
+        # If empty, the kept ONVIF user remains as 'root'/(VAPIX password).
+        self.onvif_username_var = tk.StringVar(value='')
+        self.onvif_password_var = tk.StringVar(value='')
         self.iface_var = tk.StringVar(value='Auto-detect (default)')
         self._interfaces = ProgramOptionsDialog._get_network_interfaces()
 
@@ -4190,6 +4241,20 @@ class ProgramWizardDialog(tk.Toplevel):
                           "    requires the ONVIF user to remain.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
 
+        # ONVIF custom-creds row — only meaningful if Keep is checked
+        onvif_creds = ttk.Frame(f)
+        onvif_creds.pack(fill=tk.X, pady=(4, 2))
+        ttk.Label(onvif_creds, text="    Custom ONVIF user (optional):",
+                  font=('Helvetica', 9)).pack(side=tk.LEFT)
+        ttk.Entry(onvif_creds, textvariable=self.onvif_username_var, width=14).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(onvif_creds, text="Password:", font=('Helvetica', 9)).pack(side=tk.LEFT)
+        ttk.Entry(onvif_creds, textvariable=self.onvif_password_var, width=14).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(f, text="    Both filled → wizard deletes ONVIF root and creates this user "
+                          "after programming.\n"
+                          "    Empty → if Keep is checked, ONVIF root remains as-is. Ignored if "
+                          "Keep is unchecked.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
         if self.additional_users_count > 0:
             label = f"Create additional user accounts ({self.additional_users_count} defined)"
             state = 'normal'
@@ -4317,6 +4382,8 @@ class ProgramWizardDialog(tk.Toplevel):
             'set_hostname': self.hostname_var.get(),
             'add_additional_users': self.additional_users_var.get(),
             'keep_onvif_user': self.keep_onvif_user_var.get(),
+            'onvif_username': self.onvif_username_var.get().strip(),
+            'onvif_password': self.onvif_password_var.get().strip(),
             'interface': selected_iface,
         }
         self.destroy()
@@ -9744,16 +9811,30 @@ https://buymeacoffee.com/thelostping""")
 
                 # v4.3 #10: ONVIF user teardown — see classic wizard for full
                 # rationale. New wizard's ProgramWizardDialog exposes the
-                # "Keep ONVIF user" checkbox; default is delete.
+                # "Keep ONVIF user" checkbox + optional custom user/password.
+                # Behavior matrix:
+                #   keep=False           → delete ONVIF root (default — clean state)
+                #   keep=True, no creds  → don't delete, root remains
+                #   keep=True, custom    → delete root, create custom (rename)
                 if camera_reachable and hasattr(self.protocol, 'delete_onvif_user'):
                     keep_onvif = bool(opts.get('keep_onvif_user', False))
+                    custom_u = (opts.get('onvif_username') or '').strip()
+                    custom_p = (opts.get('onvif_password') or '').strip()
                     if not keep_onvif:
                         if self.protocol.delete_onvif_user(static_ip, password, 'root'):
                             self.status_log("ONVIF user deleted — camera ends with VAPIX root only.")
                         else:
                             self.status_log("⚠ ONVIF user delete failed — leftover ONVIF account on camera.")
+                    elif custom_u and custom_p and hasattr(self.protocol, 'add_onvif_user'):
+                        # Rename pattern: delete transient root, create operator-named user
+                        if not self.protocol.delete_onvif_user(static_ip, password, 'root'):
+                            self.status_log("⚠ Could not delete ONVIF root before custom-user create — proceeding anyway.")
+                        if self.protocol.add_onvif_user(static_ip, password, custom_u, custom_p):
+                            self.status_log(f"ONVIF user replaced: 'root' → '{custom_u}'.")
+                        else:
+                            self.status_log(f"⚠ Could not create ONVIF user '{custom_u}' — camera may have NO ONVIF user.")
                     else:
-                        self.status_log("ONVIF user kept (operator-requested).")
+                        self.status_log("ONVIF user kept as 'root' (operator-requested).")
 
                 # ---- Capture serial / MAC / image ----
                 _ui(self.status_set_step, 'capture', 'active')
