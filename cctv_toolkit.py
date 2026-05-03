@@ -4372,12 +4372,14 @@ class ProgramWizardDialog(tk.Toplevel):
         self.show_step(0)
 
         self.bind("<Escape>", lambda e: self.cancel())
-        # Min size 720x600 — bumped from 640x460 because Step 2's content
-        # (network dropdown + 3 radio explanations + factory IP field) was
-        # taller than 460 and clipped the Next button. Brian flagged 2026-04-30
-        # via screenshot. _center_on_parent treats these as MINIMUMS so it
-        # grows further if content needs more.
-        _center_on_parent(self, parent, 720, 600)
+        # Min size 800x820 — Step 3 (Extras) accumulated a lot of options in
+        # v4.3-pre work (hostname / extra users / Keep ONVIF + custom creds /
+        # Building Reports stickers / Auto multi-home / factory-default-before-
+        # program), each with a help-text block. 600 high clipped the bottom
+        # checkboxes. Brian flagged 2026-05-03. Bumped wider too so the
+        # custom-ONVIF inline username/password row doesn't push the Next
+        # button off the right edge.
+        _center_on_parent(self, parent, 800, 820)
         self.wait_window(self)
 
     # ------------------------------------------------------------------
