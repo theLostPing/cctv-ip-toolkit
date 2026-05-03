@@ -8830,7 +8830,11 @@ https://buymeacoffee.com/thelostping""")
                 total_steps += extra_count
                 step_num = 0
 
+                # Cancel checks at every step boundary (#12 hard-bail). Same as
+                # new wizard: check before each step within phase + after each
+                # phase to bail outer while.
                 for desc, step_fn in auth_steps:
+                    if self.cancel_flag: break
                     step_num += 1
                     self.log(f"[{step_num}/{total_steps}] {desc}")
                     if step_fn():
@@ -8838,12 +8842,16 @@ https://buymeacoffee.com/thelostping""")
                     else:
                         self.log(f"      ✗ {desc} failed")
                         errors.append(desc.lower().split()[0])
+                if self.cancel_flag:
+                    self.log("Cancelled by user — bailing wizard.")
+                    break
 
                 # Phase 2: Additional users + hostname at CURRENT IP (before network change)
                 if add_additional_users:
                     extra_users = self.additional_users_data.get_all()
                     if extra_users:
                         for eu in extra_users:
+                            if self.cancel_flag: break
                             step_num += 1
                             eu_name = eu['username']
                             eu_pwd = eu['password']
@@ -8855,6 +8863,9 @@ https://buymeacoffee.com/thelostping""")
                             else:
                                 self.log(f"      ✗ Failed (may not be supported for {self.protocol.BRAND_NAME})")
                                 errors.append(f"user:{eu_name}")
+                if self.cancel_flag:
+                    self.log("Cancelled by user — bailing wizard.")
+                    break
 
                 # Try to get serial while still at factory IP
                 try:
@@ -8867,7 +8878,7 @@ https://buymeacoffee.com/thelostping""")
                 except:
                     pass
 
-                if set_hostname:
+                if set_hostname and not self.cancel_flag:
                     step_num += 1
                     brand_prefix = self.protocol.BRAND_KEY
                     cam_number = cam.get('number', str(programmed_count))
@@ -8885,9 +8896,17 @@ https://buymeacoffee.com/thelostping""")
                     else:
                         self.log("      ✗ Hostname failed")
                         errors.append("hostname")
+                if self.cancel_flag:
+                    self.log("Cancelled by user — bailing wizard.")
+                    break
 
-                # Phase 3: Network change — LAST (camera may become unreachable)
+                # Phase 3: Network change — LAST (camera may become unreachable).
+                # Cancel mid-network-change can leave camera in partial state but
+                # we still honor the operator's choice.
                 for desc, step_fn in network_steps:
+                    if self.cancel_flag:
+                        self.log("  ⚠ Cancelled mid-network-change — camera may be in partial state.")
+                        break
                     step_num += 1
                     self.log(f"[{step_num}/{total_steps}] {desc}")
                     if step_fn():
@@ -8895,6 +8914,9 @@ https://buymeacoffee.com/thelostping""")
                     else:
                         self.log(f"      ✗ {desc} failed")
                         errors.append(desc.lower().split()[0])
+                if self.cancel_flag:
+                    self.log("Cancelled by user — bailing wizard.")
+                    break
 
                 # Track this MAC as programmed and release ARP pin
                 if pinned_mac:
@@ -9451,9 +9473,15 @@ https://buymeacoffee.com/thelostping""")
                         auth_steps.append((desc, fn))
 
                 # ---- Phase 1: Auth ----
+                # Cancel checks at every step boundary (#12 hard-bail). Brian's
+                # 2026-04-30 complaint: cancel was advancing to the next step
+                # ("Cancel" mid-"Attempting to write user" → moved to "Setting
+                # IP" anyway). Now: check before each step, and check after the
+                # phase to bail the outer while loop immediately.
                 _ui(self.status_set_step, 'auth', 'active')
                 auth_ok = True
                 for desc, step_fn in auth_steps:
+                    if self.cancel_flag: break
                     self.status_log(f"  {desc}")
                     if step_fn():
                         self.status_log("    ✓ Done.")
@@ -9462,6 +9490,9 @@ https://buymeacoffee.com/thelostping""")
                         errors.append(desc.lower().split()[0])
                         auth_ok = False
                 _ui(self.status_set_step, 'auth', 'ok' if auth_ok else 'fail')
+                if self.cancel_flag:
+                    self.status_log("Cancelled by user — bailing wizard.")
+                    break
 
                 # ---- Phase 2a: Additional users ----
                 if add_additional_users:
@@ -9470,6 +9501,7 @@ https://buymeacoffee.com/thelostping""")
                         _ui(self.status_set_step, 'extra_users', 'active')
                         eu_ok = True
                         for eu in extra_users:
+                            if self.cancel_flag: break
                             self.status_log(f"  Creating user '{eu['username']}' ({eu['role']})")
                             if self.protocol.add_user(camera_ip, password,
                                                        eu['username'], eu['password'], eu['role']):
@@ -9479,6 +9511,9 @@ https://buymeacoffee.com/thelostping""")
                                 errors.append(f"user:{eu['username']}")
                                 eu_ok = False
                         _ui(self.status_set_step, 'extra_users', 'ok' if eu_ok else 'fail')
+                        if self.cancel_flag:
+                            self.status_log("Cancelled by user — bailing wizard.")
+                            break
 
                 # Try to get serial while still at factory IP
                 try:
@@ -9492,7 +9527,7 @@ https://buymeacoffee.com/thelostping""")
                     pass
 
                 # ---- Phase 2b: Hostname ----
-                if set_hostname:
+                if set_hostname and not self.cancel_flag:
                     _ui(self.status_set_step, 'hostname', 'active')
                     brand_prefix = self.protocol.BRAND_KEY
                     cam_number = cam.get('number', str(programmed_count))
@@ -9511,11 +9546,20 @@ https://buymeacoffee.com/thelostping""")
                         self.status_log("    ✗ Hostname failed")
                         errors.append("hostname")
                         _ui(self.status_set_step, 'hostname', 'fail')
+                if self.cancel_flag:
+                    self.status_log("Cancelled by user — bailing wizard.")
+                    break
 
                 # ---- Phase 3: Network change ----
+                # Network change is the riskiest cancel point — partial set_network
+                # leaves the camera in a half-configured state. Still honor the
+                # cancel; operator chose to bail. Camera may need factory reset.
                 _ui(self.status_set_step, 'network', 'active')
                 net_ok = True
                 for desc, step_fn in network_steps:
+                    if self.cancel_flag:
+                        self.status_log("  ⚠ Cancelled mid-network-change — camera may be in partial state.")
+                        break
                     self.status_log(f"  {desc}")
                     if step_fn():
                         self.status_log("    ✓ Done.")
@@ -9524,6 +9568,9 @@ https://buymeacoffee.com/thelostping""")
                         errors.append(desc.lower().split()[0])
                         net_ok = False
                 _ui(self.status_set_step, 'network', 'ok' if net_ok else 'fail')
+                if self.cancel_flag:
+                    self.status_log("Cancelled by user — bailing wizard.")
+                    break
 
                 # Track this MAC and release pin
                 if pinned_mac:
