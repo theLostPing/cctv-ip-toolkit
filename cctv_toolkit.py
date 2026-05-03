@@ -4145,6 +4145,17 @@ class ProgramWizardDialog(tk.Toplevel):
         # spool in order as cameras complete.
         self.add_br_stickers_var = tk.BooleanVar(value=False)
         self.br_first_label_var = tk.StringVar(value='')
+        # v4.3 — "Factory default before programming" workflow. For the case
+        # where Brian gets a USED camera (already configured for a previous
+        # site, has a known root password) and wants to wipe + reprogram for
+        # the new install. If checked + existing pwd is filled, the wizard
+        # fires factory_reset(camera_ip, existing_pwd) right after MAC-
+        # freshness gate, waits for the camera to come back into factory
+        # state, THEN proceeds with create_initial_user + set_network.
+        # Also addresses the eager-grab problem (operator couldn't physically
+        # hold the factory-reset button before wizard started writing).
+        self.factory_first_var = tk.BooleanVar(value=False)
+        self.existing_root_pwd_var = tk.StringVar(value='')
         self.iface_var = tk.StringVar(value='Auto-detect (default)')
         self._interfaces = ProgramOptionsDialog._get_network_interfaces()
 
@@ -4329,6 +4340,20 @@ class ProgramWizardDialog(tk.Toplevel):
                           "    Peel stickers off the spool in order as cameras complete.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
 
+        # Factory-default-before-program (v4.3 — for re-using cameras from prior installs)
+        ttk.Checkbutton(f, text="Factory default before programming (for used cameras)",
+                        variable=self.factory_first_var).pack(anchor='w', pady=(15, 2))
+        fact_row = ttk.Frame(f)
+        fact_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(fact_row, text="    Existing root password:",
+                  font=('Helvetica', 9)).pack(side=tk.LEFT)
+        ttk.Entry(fact_row, textvariable=self.existing_root_pwd_var, show='*', width=20).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(f, text="    Wipes the camera (using the existing password) before applying\n"
+                          "    new programming. For cameras you're reprovisioning from a\n"
+                          "    previous site. Also gives you time to physically hold the\n"
+                          "    factory-reset button if needed — programming pauses for the wipe.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
+
         if self.additional_users_count > 0:
             label = f"Create additional user accounts ({self.additional_users_count} defined)"
             state = 'normal'
@@ -4460,6 +4485,8 @@ class ProgramWizardDialog(tk.Toplevel):
             'onvif_password': self.onvif_password_var.get().strip(),
             'add_br_stickers': self.add_br_stickers_var.get(),
             'br_first_label': self.br_first_label_var.get().strip(),
+            'factory_first': self.factory_first_var.get(),
+            'existing_root_pwd': self.existing_root_pwd_var.get(),
             'interface': selected_iface,
         }
         self.destroy()
@@ -5864,6 +5891,8 @@ class CCTVToolkitApp:
              self.start_program_wizard, "#4CAF50"),
             ("✅ Confirm Programming", "Audit each camera in the list:\nIP / auth / DHCP-off match expected",
              self.start_confirm_wizard, "#00ACC1"),
+            ("♻️ Factory Default", "Wipe a camera back to factory state\n(prompts for IP + existing password)",
+             self.start_factory_default_wizard, "#E91E63"),
             ("🔄 Update Cameras", "Push changes (IP, hostname, DHCP)\nfrom Camera List to cameras",
              self.start_update_wizard, "#2196F3"),
             ("📷 Capture Images", "Download snapshot images from\nall cameras in the list",
@@ -9643,6 +9672,46 @@ https://buymeacoffee.com/thelostping""")
                 _ui(self.status_set_banner, 'PROGRAMMING…',
                     f"{next_name}  →  working on it", '#2196F3')
 
+                # ---- Factory-default-before-program (v4.3 reuse-camera workflow) ----
+                # Operator opted to wipe the camera before applying the new
+                # config. Wipes via the existing root password they provided.
+                # Solves the case where Brian's reusing a camera from a prior
+                # site (has old password + old config) and wants a clean program.
+                # Also addresses the "couldn't hold the factory-reset button
+                # before wizard wrote to it" race — wizard does the wipe FOR you.
+                factory_first = bool(opts.get('factory_first', False))
+                existing_pwd = opts.get('existing_root_pwd') or ''
+                if factory_first and existing_pwd and hasattr(self.protocol, 'factory_reset'):
+                    self.status_log(f"Factory-resetting {pinned_mac} via existing password...")
+                    if self.protocol.factory_reset(camera_ip, existing_pwd):
+                        self.status_log("  ✓ Reset issued. Waiting for camera to come back...")
+                        # Camera reboots, loses everything. Try original IP first
+                        # (might come back same via DHCP), then 192.168.0.90 fallback.
+                        old_ip = camera_ip
+                        target_mac_norm = pinned_mac.upper().replace(':', '').replace('-', '')
+                        camera_ip = None
+                        for attempt in range(60):  # up to 120s
+                            if self.cancel_flag: break
+                            for try_ip in (old_ip, '192.168.0.90'):
+                                if self.ping_camera(try_ip, timeout_ms=1000):
+                                    p = self.protocol.probe_unrestricted(try_ip)
+                                    p_mac = (p.get('mac') or '').upper().replace(':', '').replace('-', '')
+                                    if p_mac == target_mac_norm:
+                                        camera_ip = try_ip
+                                        break
+                            if camera_ip:
+                                break
+                            time.sleep(2)
+                        if not camera_ip:
+                            self.status_log("  ✗ Camera didn't reappear within 120s — bailing this slot")
+                            errors.append('factory_reset_no_return')
+                            continue
+                        self.status_log(f"  ✓ Camera back at {camera_ip} (factory state)")
+                    else:
+                        self.status_log("  ✗ Factory reset failed — wrong existing password? bailing this slot")
+                        errors.append('factory_reset_failed')
+                        continue
+
                 # ---- ARP pin ----
                 _ui(self.status_set_step, 'pin', 'active')
                 if not pinned_mac:
@@ -10156,6 +10225,79 @@ https://buymeacoffee.com/thelostping""")
             _ui(self.refresh_camera_list)
             _ui(self.rescan_after_operation)
             self._close_wizard_run_log()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def start_factory_default_wizard(self):
+        """v4.3 — Standalone factory default. Asks for IP + existing root
+        password, fires factory_reset, polls for camera to come back. Useful
+        for one-off cleanups outside the programming flow (camera came in
+        from a prior site and needs to be wiped before it goes on the shelf
+        as inventory)."""
+        if not hasattr(self.protocol, 'factory_reset'):
+            messagebox.showinfo("Factory Default",
+                                f"{self.protocol.BRAND_NAME} protocol does not support factory_reset yet.")
+            return
+        ip = simpledialog.askstring("Factory Default",
+            "Camera IP to wipe:", parent=self.root)
+        if not ip:
+            return
+        ip = ip.strip()
+        password = simpledialog.askstring("Factory Default",
+            f"Existing root password for {ip}:", show='*', parent=self.root)
+        if password is None:
+            return
+        if not messagebox.askyesno("Factory Default — confirm",
+            f"This will WIPE the camera at {ip} back to factory state. ALL config, "
+            f"users, network settings, certs will be lost. Continue?"):
+            return
+
+        self.cancel_flag = False
+        self.enable_cancel(True)
+
+        def run():
+            self.log(f"\n{'='*60}")
+            self.log(f"FACTORY DEFAULT — {ip}")
+            self.log(f"{'='*60}")
+            # Capture identity before reset so we can recognize the camera coming back
+            probe = self.protocol.probe_unrestricted(ip)
+            target_mac = (probe.get('mac') or '').upper().replace(':', '').replace('-', '')
+            if target_mac:
+                self.log(f"Camera identified: {probe.get('model','?')}  serial={probe.get('serial','?')}")
+            else:
+                self.log("⚠ Could not identify camera before reset (continuing anyway)")
+            self.log(f"Firing factory_reset on {ip}...")
+            ok = self.protocol.factory_reset(ip, password)
+            if not ok:
+                self.log("✗ Factory reset call failed (wrong password? unsupported endpoint?)")
+                self.root.after(0, lambda: self.enable_cancel(False))
+                return
+            self.log("  ✓ Reset issued. Waiting for camera to come back (up to 120s)...")
+            found_at = None
+            for attempt in range(60):
+                if self.cancel_flag:
+                    self.log("Cancelled by user.")
+                    break
+                for try_ip in (ip, '192.168.0.90'):
+                    if self.ping_camera(try_ip, timeout_ms=1000):
+                        p = self.protocol.probe_unrestricted(try_ip)
+                        p_mac = (p.get('mac') or '').upper().replace(':', '').replace('-', '')
+                        if not target_mac or p_mac == target_mac:
+                            found_at = try_ip
+                            break
+                if found_at:
+                    break
+                time.sleep(2)
+            if found_at:
+                self.log(f"\n✓ Camera back at {found_at} (factory state — no users yet)")
+                self.log("  Use 'Program New Cameras' to apply a new config.")
+                self.root.after(0, lambda: self.update_display("DONE", f"Camera factory-reset, now at {found_at}"))
+            else:
+                self.log("\n⚠ Camera didn't reappear within 120s")
+                self.log("  Reset may have succeeded but camera is on a different IP.")
+                self.log("  Check the network or wait + scan manually.")
+                self.root.after(0, lambda: self.update_display("DONE", "Reset issued, camera not seen"))
+            self.root.after(0, lambda: self.enable_cancel(False))
 
         threading.Thread(target=run, daemon=True).start()
 
