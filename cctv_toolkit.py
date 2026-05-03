@@ -9216,16 +9216,35 @@ https://buymeacoffee.com/thelostping""")
                         cam['mac'] = pinned_mac
                 self.arp_unpin(camera_ip)
 
-                # Wait for camera to come back at new IP
+                # Wait for camera to come back at new IP.
+                # v4.3 #15 fix — Brian's empirical test 2026-05-03 confirmed
+                # set_network DOES persist (HTTP responds at new IP within 15s
+                # of the SOAP call), but pure-ICMP ping_camera was sometimes
+                # failing the 45s window — likely some firmwares delay ICMP
+                # echo response longer than HTTP comes up. Try ICMP first
+                # (cheap), fall back to a no-auth HTTP probe via
+                # protocol.probe_unrestricted (all brand classes implement it
+                # — Axis returns rich data, others return model via base-class
+                # fallback to get_model_noauth). Either succeeding proves the
+                # camera is alive at the new IP.
                 camera_reachable = False
                 self.log(f"Waiting for camera at new IP ({static_ip})...")
-                # Brief delay — camera needs time to apply network changes
                 time.sleep(3)
                 wait_count = 0
-                while not self.cancel_flag and wait_count < 45:
-                    if self.ping_camera(static_ip, timeout_ms=2000):
+                while not self.cancel_flag and wait_count < 60:
+                    if self.ping_camera(static_ip, timeout_ms=1500):
                         camera_reachable = True
                         break
+                    # ICMP didn't answer — try HTTP probe (some firmwares
+                    # serve HTTP before ICMP, or never serve ICMP)
+                    try:
+                        p = self.protocol.probe_unrestricted(static_ip)
+                        if p and (p.get('mac') or p.get('model')):
+                            camera_reachable = True
+                            self.log(f"  Camera answered HTTP probe at {static_ip} (ICMP silent)")
+                            break
+                    except Exception:
+                        pass
                     wait_count += 1
                     if wait_count % 10 == 0:
                         self.log(f"  Still waiting... ({wait_count}s)")
@@ -10023,15 +10042,26 @@ https://buymeacoffee.com/thelostping""")
                 self.arp_unpin(camera_ip)
 
                 # ---- Wait for camera at new IP ----
+                # v4.3 #15 fix — see classic wizard for full rationale. ICMP
+                # first (cheap), HTTP probe via protocol.probe_unrestricted
+                # as the reliable backup (works on all brands).
                 _ui(self.status_set_step, 'verify_online', 'active')
                 camera_reachable = False
                 self.status_log(f"Waiting for camera at {static_ip}...")
                 time.sleep(3)
                 wait_count = 0
-                while not self.cancel_flag and wait_count < 45:
-                    if self.ping_camera(static_ip, timeout_ms=2000):
+                while not self.cancel_flag and wait_count < 60:
+                    if self.ping_camera(static_ip, timeout_ms=1500):
                         camera_reachable = True
                         break
+                    try:
+                        p = self.protocol.probe_unrestricted(static_ip)
+                        if p and (p.get('mac') or p.get('model')):
+                            camera_reachable = True
+                            self.status_log(f"  Camera answered HTTP probe at {static_ip} (ICMP silent)")
+                            break
+                    except Exception:
+                        pass
                     wait_count += 1
                     if wait_count % 10 == 0:
                         self.status_log(f"  Still waiting... ({wait_count}s)")
