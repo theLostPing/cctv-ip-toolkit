@@ -1137,6 +1137,22 @@ class CameraProtocol(ABC):
     def get_model_noauth(self, ip):
         """Query model without authentication. Returns string or None."""
 
+    def probe_unrestricted(self, ip):
+        """Single no-auth probe returning model + serial + MAC + firmware +
+        hardware in one dict. Brands that don't have an unauthenticated
+        rich-info endpoint return what they can. AxisProtocol overrides with
+        the basicdeviceinfo.cgi getAllUnrestrictedProperties call which works
+        on factory AND password-locked cameras.
+        Returns dict with keys: model, model_full, serial, mac, firmware,
+        hardware, brand. Any/all may be None on failure."""
+        out = {'model': None, 'model_full': None, 'serial': None, 'mac': None,
+               'firmware': None, 'hardware': None, 'brand': None}
+        try:
+            out['model'] = self.get_model_noauth(ip)
+        except Exception:
+            pass
+        return out
+
     def get_firmware(self, ip, password):
         """Get firmware version. Returns string or 'UNKNOWN'.
         Default implementation returns 'UNKNOWN' — subclasses should override."""
@@ -1408,21 +1424,13 @@ class AxisProtocol(CameraProtocol):
         return "UNKNOWN"
 
     def get_model_noauth(self, ip):
-        # Used during discovery — we want to know what's on the IP before we
-        # touch it. Factory Axis cameras answer basicdeviceinfo without auth.
-        # Once configured, this returns 401 and we have to fall back.
-        try:
-            r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
-                json={"apiVersion": "1.0", "method": "getAllProperties"},
-                timeout=TIMEOUT)
-            if r.status_code == 200:
-                data = r.json()
-                if 'data' in data and 'propertyList' in data['data']:
-                    return data['data']['propertyList'].get('ProdNbr', '')
-        except:
-            pass
-        # Older firmware (anything pre-7.x I think) doesn't have basicdeviceinfo,
-        # so try param.cgi Brand.ProdNbr — that's been a thing since forever.
+        # Backward-compatible thin wrapper around probe_unrestricted — returns
+        # just the ProdNbr string. New code should call probe_unrestricted
+        # directly to get model + serial + MAC + firmware in one call.
+        m = self.probe_unrestricted(ip).get('model')
+        if m:
+            return m
+        # Fallback for pre-7.x firmware — basicdeviceinfo.cgi doesn't exist there
         try:
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "list", "group": "Brand.ProdNbr"},
@@ -1435,16 +1443,48 @@ class AxisProtocol(CameraProtocol):
             pass
         return None
 
+    def probe_unrestricted(self, ip):
+        """Single no-auth probe via basicdeviceinfo.cgi getAllUnrestrictedProperties.
+        Works on factory AND password-locked cameras (the *Unrestricted* variant
+        doesn't require auth even when root is set; plain getAllProperties returns
+        401 on configured cams). Returns model + serial + MAC + firmware + hardware
+        in one round trip. For Axis the SerialNumber IS the MAC (12-char hex).
+        Used by the wizard's verify_model step so MAC and model are both captured
+        together, eliminating the "expected model, got ?" path when ARP pin missed
+        AND the legacy single-method getModel fell through."""
+        out = {'model': None, 'model_full': None, 'serial': None, 'mac': None,
+               'firmware': None, 'hardware': None, 'brand': None}
+        try:
+            r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
+                json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
+                timeout=TIMEOUT)
+            if r.status_code == 200:
+                props = (r.json().get('data') or {}).get('propertyList') or {}
+                out['model'] = (props.get('ProdNbr') or '').strip() or None
+                out['model_full'] = (props.get('ProdFullName') or '').strip() or None
+                out['serial'] = (props.get('SerialNumber') or '').strip() or None
+                out['firmware'] = (props.get('Version') or '').strip() or None
+                out['hardware'] = (props.get('HardwareID') or '').strip() or None
+                out['brand'] = (props.get('Brand') or '').strip() or None
+                if out['serial'] and len(out['serial']) == 12 and all(c in '0123456789ABCDEFabcdef' for c in out['serial']):
+                    s = out['serial'].upper()
+                    out['mac'] = ':'.join(s[i:i+2] for i in range(0, 12, 2))
+        except Exception:
+            pass
+        return out
+
     def get_firmware(self, ip, password):
         # Three-tier fallback because firmware version is THE thing customers
         # ask about and the most-supported endpoint changed twice between
         # firmware 5.x, 6.x, and 9.x. Don't ask me why this is so hard. Below
         # in order of preference: no-auth JSON, auth JSON, auth param.cgi.
 
-        # No-auth basicdeviceinfo — works on factory + early-auth cameras.
+        # No-auth basicdeviceinfo via getAllUnrestrictedProperties — works on
+        # factory AND configured cameras (the *Unrestricted* variant doesn't
+        # require auth even when root is set; plain getAllProperties returns 401).
         try:
             r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
-                json={"apiVersion": "1.0", "method": "getAllProperties"},
+                json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
                 timeout=TIMEOUT)
             if r.status_code == 200:
                 data = r.json()
@@ -7271,10 +7311,11 @@ class CCTVToolkitApp:
                 
             cam = {'ip': ip, 'name': ip}
             
-            # Try basicdeviceinfo (works without auth on many cameras)
+            # Try basicdeviceinfo via getAllUnrestrictedProperties — works
+            # without auth on factory AND configured cameras
             try:
                 r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
-                    json={"apiVersion": "1.0", "method": "getAllProperties"},
+                    json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
                     timeout=1.5)
                 if r.status_code == 200:
                     data = r.json()
@@ -7773,15 +7814,31 @@ class CCTVToolkitApp:
         sys.exit(0)
     
     def save_log(self):
+        # The toolkit has TWO log widgets: self.log_text (legacy/general tab)
+        # and self._status_log_text (new wizard view). Older versions only
+        # saved self.log_text — which was empty when the wizard had been the
+        # only thing run, producing an empty file. Save BOTH with section
+        # headers so the user gets whichever has content (or both).
+        legacy = self.log_text.get('1.0', 'end-1c').strip() if hasattr(self, 'log_text') else ''
+        wizard = self._status_log_text.get('1.0', 'end-1c').strip() if hasattr(self, '_status_log_text') else ''
+        if not legacy and not wizard:
+            messagebox.showinfo("Save Log", "No log content to save (both general log and wizard log are empty).")
+            return
         filepath = filedialog.asksaveasfilename(
             title="Save Log",
             defaultextension=".txt",
             filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")]
         )
-        if filepath:
-            with open(filepath, 'w') as f:
-                f.write(self.log_text.get(1.0, tk.END))
-            self.log(f"Log saved to {filepath}")
+        if not filepath:
+            return
+        sections = []
+        if wizard:
+            sections.append(f"========== WIZARD LOG ({len(wizard.splitlines())} lines) ==========\n{wizard}\n")
+        if legacy:
+            sections.append(f"========== GENERAL LOG ({len(legacy.splitlines())} lines) ==========\n{legacy}\n")
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write("\n".join(sections))
+        self.log(f"Log saved to {filepath}")
     
     # ========================================================================
     # UI HELPERS
@@ -8581,19 +8638,24 @@ https://buymeacoffee.com/thelostping""")
                 else:
                     self.log("Camera detected! (could not read MAC from ARP table)")
                 
-                # Query the camera's actual model
-                actual_model = self.protocol.get_model_noauth(camera_ip)
+                # Single no-auth probe: model + serial(=MAC for Axis) + firmware + hardware
+                probe = self.protocol.probe_unrestricted(camera_ip)
+                actual_model = probe.get('model')
                 if actual_model:
                     self.log(f"Camera model: {actual_model}")
                 else:
                     self.log("Camera model: could not query (will match any entry)")
+                # If ARP didn't give us MAC, harvest from the probe (Axis serial == MAC)
+                if probe.get('mac') and not pinned_mac:
+                    pinned_mac = probe['mac']
+                    self.log(f"MAC (from probe, ARP missed): {pinned_mac}")
 
-                # Try to read firmware while still at factory IP (no auth on most brands)
-                actual_firmware = 'UNKNOWN'
-                try:
-                    actual_firmware = self.protocol.get_firmware(camera_ip, '') or 'UNKNOWN'
-                except Exception:
-                    actual_firmware = 'UNKNOWN'
+                actual_firmware = probe.get('firmware') or 'UNKNOWN'
+                if not probe.get('firmware'):
+                    try:
+                        actual_firmware = self.protocol.get_firmware(camera_ip, '') or 'UNKNOWN'
+                    except Exception:
+                        actual_firmware = 'UNKNOWN'
                 if actual_firmware and actual_firmware != 'UNKNOWN':
                     self.log(f"Camera firmware: {actual_firmware}")
 
@@ -9175,20 +9237,33 @@ https://buymeacoffee.com/thelostping""")
                     _ui(self.status_set_step, 'pin', 'fail', 'no MAC')
 
                 # ---- Verify model ----
+                # Single no-auth probe via basicdeviceinfo.cgi getAllUnrestrictedProperties
+                # — works on factory AND password-locked cameras. Returns model + serial
+                # (which IS the MAC for Axis) + firmware + hardware in one round trip.
+                # This eliminates the "expected model, got ?" path when ARP pin missed:
+                # the probe always gives us MAC if the camera is reachable on HTTP.
                 _ui(self.status_set_step, 'verify_model', 'active')
-                actual_model = self.protocol.get_model_noauth(camera_ip)
+                probe = self.protocol.probe_unrestricted(camera_ip)
+                actual_model = probe.get('model')
                 if actual_model:
                     self.status_log(f"Camera model: {actual_model}")
                 else:
                     self.status_log("Could not query model — will match any entry")
+                # If ARP didn't pin a MAC, harvest from the probe and pin retroactively
+                if probe.get('mac') and not pinned_mac:
+                    pinned_mac = probe['mac']
+                    self.status_log(f"MAC (from probe, ARP missed): {pinned_mac}")
+                    if self.arp_pin(camera_ip, pinned_mac):
+                        _ui(self.status_set_step, 'pin', 'ok', pinned_mac)
 
-                # ---- Read firmware (no-auth) ----
+                # ---- Read firmware (use probe value if we got it, else fall back) ----
                 _ui(self.status_set_step, 'firmware', 'active')
-                actual_firmware = 'UNKNOWN'
-                try:
-                    actual_firmware = self.protocol.get_firmware(camera_ip, '') or 'UNKNOWN'
-                except Exception:
-                    actual_firmware = 'UNKNOWN'
+                actual_firmware = probe.get('firmware') or 'UNKNOWN'
+                if not probe.get('firmware'):
+                    try:
+                        actual_firmware = self.protocol.get_firmware(camera_ip, '') or 'UNKNOWN'
+                    except Exception:
+                        actual_firmware = 'UNKNOWN'
                 if actual_firmware and actual_firmware != 'UNKNOWN':
                     self.status_log(f"Firmware: {actual_firmware}")
                     _ui(self.status_set_step, 'firmware', 'ok', actual_firmware)
@@ -9213,10 +9288,14 @@ https://buymeacoffee.com/thelostping""")
                             break
 
                     if not cam:
-                        self.status_log(f"⚠ MODEL MISMATCH: got {actual_model}")
-                        _ui(self.status_set_step, 'verify_model', 'fail', f'got {actual_model}')
+                        # Defensive: actual_model could theoretically be empty here even
+                        # though we entered this branch on truthy actual_model — guard so
+                        # the UI never shows "got None" or bare "got " (Brian's "got ?")
+                        shown_model = actual_model if actual_model else "(probe failed)"
+                        self.status_log(f"⚠ MODEL MISMATCH: got {shown_model}")
+                        _ui(self.status_set_step, 'verify_model', 'fail', f'got {shown_model}')
                         _ui(self.status_set_banner, 'WRONG MODEL',
-                            f'Got {actual_model} — plug in a different camera', '#F44336')
+                            f'Got {shown_model} — plug in a different camera', '#F44336')
                         self.arp_unpin(camera_ip)
                         consecutive_skips += 1
 
