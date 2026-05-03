@@ -9098,21 +9098,33 @@ https://buymeacoffee.com/thelostping""")
                     self.log(f"Camera online at {static_ip} (after {wait_count + 3}s)")
                     time.sleep(1)
 
-                # v4.3 #10: ONVIF user teardown — security cleanup. The ONVIF
-                # root user that create_initial_user added was needed for
-                # set_network's SOAP. Now that the camera is reachable at its
-                # new IP, delete it unless operator explicitly opted to keep
-                # (classic wizard's older options dialog has no checkbox so it
-                # always defaults to delete; new wizard exposes the option).
+                # v4.3 #10 — ONVIF user teardown + optional rename:
+                #   keep=False              → delete ONVIF root (default — clean)
+                #   keep=True, no creds     → don't delete, root remains
+                #   keep=True, custom creds → delete root, create custom (rename)
+                # Classic's older ProgramOptionsDialog doesn't expose custom
+                # creds yet, so the rename path never triggers from classic —
+                # but the code is wired anyway so it Just Works if/when the
+                # older dialog gets the fields.
                 if camera_reachable and hasattr(self.protocol, 'delete_onvif_user'):
-                    keep_onvif = bool(prog_opts.result.get('keep_onvif_user', False)) if prog_opts and prog_opts.result else False
+                    _r = (prog_opts.result if (prog_opts and prog_opts.result) else {})
+                    keep_onvif = bool(_r.get('keep_onvif_user', False))
+                    custom_u = (_r.get('onvif_username') or '').strip()
+                    custom_p = (_r.get('onvif_password') or '').strip()
                     if not keep_onvif:
                         if self.protocol.delete_onvif_user(static_ip, password, 'root'):
                             self.log("ONVIF user deleted — camera ends with VAPIX root only.")
                         else:
                             self.log("⚠ ONVIF user delete failed — leftover ONVIF account on camera.")
+                    elif custom_u and custom_p and hasattr(self.protocol, 'add_onvif_user'):
+                        if not self.protocol.delete_onvif_user(static_ip, password, 'root'):
+                            self.log("⚠ Could not delete ONVIF root before custom-user create — proceeding anyway.")
+                        if self.protocol.add_onvif_user(static_ip, password, custom_u, custom_p):
+                            self.log(f"ONVIF user replaced: 'root' → '{custom_u}'.")
+                        else:
+                            self.log(f"⚠ Could not create ONVIF user '{custom_u}' — camera may have NO ONVIF user.")
                     else:
-                        self.log("ONVIF user kept (operator-requested).")
+                        self.log("ONVIF user kept as 'root' (operator-requested).")
 
                 # Get serial/MAC if camera is reachable
                 serial = 'UNKNOWN'
