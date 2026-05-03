@@ -1286,6 +1286,58 @@ class AxisProtocol(CameraProtocol):
         except Exception:
             return False
 
+    def verify_camera_state(self, ip, password):
+        """v4.3 #12 — Confirm Programming. Audit one camera at one IP, return
+        a dict of read-only checks. Caller compares against the expected
+        camera entry to decide pass/fail.
+        Checks:
+          - reachable      : probe_unrestricted got something back
+          - mac/model/firmware : from no-auth probe (Axis serial == MAC)
+          - auth_ok        : root+password gets 200 from param.cgi (Network)
+          - dhcp_off       : Network.eth0.BootProto == 'static' (most installs
+                             on a camera VLAN need DHCP off; on, only safe
+                             with MAC reservations)
+          - actual_ip / actual_gateway / actual_subnet : what the camera says
+                             its config is, for diff against expected entry
+        Returns a dict with all fields; missing/unread fields are None or False."""
+        out = {
+            'reachable': False, 'mac': None, 'model': None, 'firmware': None,
+            'auth_ok': False, 'dhcp_off': None,
+            'actual_ip': None, 'actual_gateway': None, 'actual_subnet': None,
+        }
+        # Quick no-auth probe — also covers reachability + identity
+        probe = self.probe_unrestricted(ip)
+        if probe.get('mac') or probe.get('model'):
+            out['reachable'] = True
+            out['mac'] = probe.get('mac')
+            out['model'] = probe.get('model')
+            out['firmware'] = probe.get('firmware')
+        if not out['reachable']:
+            return out
+        # Auth + network config
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                params={"action": "list", "group": "Network"},
+                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+            if r.status_code == 200:
+                out['auth_ok'] = True
+                for line in r.text.split('\n'):
+                    line = line.strip()
+                    if not line or '=' not in line:
+                        continue
+                    if 'Network.eth0.IPAddress=' in line or line.startswith('Network.IPAddress='):
+                        out['actual_ip'] = line.split('=', 1)[1].strip()
+                    elif 'Network.eth0.DefaultRouter=' in line:
+                        out['actual_gateway'] = line.split('=', 1)[1].strip()
+                    elif 'Network.eth0.SubnetMask=' in line:
+                        out['actual_subnet'] = line.split('=', 1)[1].strip()
+                    elif 'Network.eth0.BootProto=' in line or line.startswith('Network.BootProto='):
+                        proto = line.split('=', 1)[1].strip().lower()
+                        out['dhcp_off'] = (proto != 'dhcp')
+        except Exception:
+            pass
+        return out
+
     def delete_onvif_user(self, ip, password, username='root'):
         """v4.3 #10 — security cleanup after programming completes. The ONVIF
         user that create_initial_user added is a transient TOOL needed for
@@ -5810,6 +5862,8 @@ class CCTVToolkitApp:
         operations = [
             ("🔧 Program New Cameras", "Step-by-step wizard with live\nchecklist (recommended)",
              self.start_program_wizard, "#4CAF50"),
+            ("✅ Confirm Programming", "Audit each camera in the list:\nIP / auth / DHCP-off match expected",
+             self.start_confirm_wizard, "#00ACC1"),
             ("🔄 Update Cameras", "Push changes (IP, hostname, DHCP)\nfrom Camera List to cameras",
              self.start_update_wizard, "#2196F3"),
             ("📷 Capture Images", "Download snapshot images from\nall cameras in the list",
@@ -10102,6 +10156,107 @@ https://buymeacoffee.com/thelostping""")
             _ui(self.refresh_camera_list)
             _ui(self.rescan_after_operation)
             self._close_wizard_run_log()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def start_confirm_wizard(self):
+        """v4.3 #12 — Confirm Programming. Audit each camera in the list against
+        what was expected: IP matches? Auth (root + master password) returns
+        200? DHCP is off? MAC matches the expected serial? Read-only — never
+        mutates the camera. Reports per-camera pass/fail to the main log
+        widget AND writes EXPORT_DIR/verification_<timestamp>.csv."""
+        cameras = self.camera_data.get_all()
+        if not cameras:
+            messagebox.showinfo("Confirm Programming",
+                                "No cameras in the list to verify.")
+            return
+        if not hasattr(self.protocol, 'verify_camera_state'):
+            messagebox.showinfo("Confirm Programming",
+                                f"{self.protocol.BRAND_NAME} protocol does not support verification yet.")
+            return
+        password = simpledialog.askstring("Confirm Programming",
+            f"Master password (root) to verify {len(cameras)} camera(s):",
+            show='*', parent=self.root)
+        if not password:
+            return
+
+        self.cancel_flag = False
+        self.enable_cancel(True)
+
+        def run():
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime('%Y%m%d_%H%M%S')
+            report_path = EXPORT_DIR / f'verification_{ts}.csv'
+            EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+            header = ['CameraName', 'ExpectedIP', 'ActualIP', 'IPMatch', 'AuthOK',
+                      'DHCPOff', 'ActualMAC', 'ExpectedMAC', 'MACMatch',
+                      'Model', 'Firmware', 'Status', 'Timestamp']
+            ok_count = warn_count = fail_count = 0
+            self.log(f"\n{'='*60}")
+            self.log(f"CONFIRM PROGRAMMING — {len(cameras)} camera(s)")
+            self.log(f"Report: {report_path}")
+            self.log(f"{'='*60}")
+            with open(report_path, 'w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow(header)
+                for cam in cameras:
+                    if self.cancel_flag:
+                        self.log("Cancelled by user.")
+                        break
+                    name = cam.get('name', '?')
+                    expected_ip = cam.get('ip', '')
+                    expected_mac = (cam.get('mac') or '').upper().replace('-', ':')
+                    self.log(f"\n--- {name} (expected {expected_ip}) ---")
+                    if not expected_ip:
+                        self.log("  ⚠ No expected IP in list — skipping.")
+                        w.writerow([name, '', '', '', '', '', '', expected_mac, '', '', '', 'NO_EXPECTED_IP', _dt.now().isoformat()])
+                        warn_count += 1
+                        continue
+                    state = self.protocol.verify_camera_state(expected_ip, password)
+                    actual_mac = (state.get('mac') or '').upper()
+                    actual_ip = state.get('actual_ip') or ''
+                    ip_match = (actual_ip == expected_ip) if actual_ip else state.get('reachable', False)
+                    mac_match = (actual_mac and expected_mac and actual_mac == expected_mac)
+                    # Status decision
+                    issues = []
+                    if not state['reachable']:
+                        issues.append('UNREACHABLE')
+                    if state['reachable'] and not state['auth_ok']:
+                        issues.append('AUTH_FAIL')
+                    if state['reachable'] and state['auth_ok'] and state['dhcp_off'] is False:
+                        issues.append('DHCP_ON')
+                    if expected_mac and actual_mac and not mac_match:
+                        issues.append('MAC_MISMATCH')
+                    if state['reachable'] and actual_ip and actual_ip != expected_ip:
+                        issues.append('IP_MISMATCH')
+                    status = 'OK' if not issues else ('FAIL' if 'UNREACHABLE' in issues or 'AUTH_FAIL' in issues or 'MAC_MISMATCH' in issues else 'WARN')
+                    # Log
+                    self.log(f"  reachable={state['reachable']}  auth_ok={state['auth_ok']}  "
+                             f"dhcp_off={state['dhcp_off']}  actual_ip={actual_ip or '?'}  "
+                             f"actual_mac={actual_mac or '?'}")
+                    if status == 'OK':
+                        self.log(f"  ✓ OK")
+                        ok_count += 1
+                    elif status == 'WARN':
+                        self.log(f"  ⚠ WARN: {', '.join(issues)}")
+                        warn_count += 1
+                    else:
+                        self.log(f"  ✗ FAIL: {', '.join(issues)}")
+                        fail_count += 1
+                    w.writerow([name, expected_ip, actual_ip,
+                                'Y' if ip_match else 'N',
+                                'Y' if state['auth_ok'] else 'N',
+                                'Y' if state['dhcp_off'] else ('N' if state['dhcp_off'] is False else '?'),
+                                actual_mac, expected_mac,
+                                'Y' if mac_match else ('N' if expected_mac and actual_mac else '?'),
+                                state.get('model') or '', state.get('firmware') or '',
+                                status, _dt.now().isoformat()])
+            self.log(f"\n{'='*60}")
+            self.log(f"VERIFICATION DONE  —  ✓{ok_count}  ⚠{warn_count}  ✗{fail_count}  of {len(cameras)}")
+            self.log(f"Report saved: {report_path}")
+            self.log(f"{'='*60}")
+            self.root.after(0, lambda: self.update_display("DONE", f"✓{ok_count} ⚠{warn_count} ✗{fail_count}"))
+            self.root.after(0, lambda: self.enable_cancel(False))
 
         threading.Thread(target=run, daemon=True).start()
 
