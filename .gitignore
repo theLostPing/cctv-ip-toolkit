@@ -24,3 +24,5 @@ Screenshot*.png
 Thumbs.db
 .DS_Store
 private/
+
+CCTVIPToolkit.spec

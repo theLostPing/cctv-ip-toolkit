@@ -936,8 +936,13 @@ class AxisDiscovery:
                 part = part.strip()
                 if not part:
                     continue
+                # Skip mDNS hostnames (axis-<mac>.local) — those are NOT models
+                if part.lower().endswith('.local') or part.lower().startswith('axis-'):
+                    continue
                 # Axis models often start with letters like P, M, Q, etc.
-                if re.match(r'^[PMQVFA]\d{4}', part) or 'AXIS' in part.upper():
+                # Match real product strings like "AXIS P3268-LV", not the
+                # bare hostname pattern "axis-b8a44f8bf3bb".
+                if re.match(r'^[PMQVFA]\d{4}', part) or part.upper().startswith('AXIS '):
                     camera['model'] = part
                 # Serial numbers are often MAC-like or all caps/numbers
                 elif re.match(r'^[A-F0-9]{12}$', part) or re.match(r'^ACCC[A-F0-9]{8}$', part):
@@ -1360,20 +1365,43 @@ class AxisProtocol(CameraProtocol):
     MAC_OUIS = [b'\x00\x40\x8c', b'\xac\xcc\x8e', b'\xb8\xa4\x4f']
 
     def create_initial_user(self, ip, password):
-        # On a factory Axis, /pwdgrp.cgi is wide open until the first root pwd
-        # gets set — that's by design, it's how their out-of-box flow works.
-        # First call locks down the camera and turns on auth for everything else.
+        # FW 11+: factory cams accept pwdgrp.cgi with NO auth — the first call
+        #         creates root and locks the camera down.
+        # FW 10.x and earlier: pwdgrp.cgi ALWAYS requires auth, even on a
+        #         factory camera. The camera creates root from the auth header
+        #         on the very first request. So we try open first, and on 401
+        #         retry with HTTP Digest using root:<the password we're setting>.
+        # b9 captured the FW-10.x 401 → b10 handles it.
+        self._last_create_user_error = None
+        params = {"action": "add", "user": "root", "pwd": password,
+                  "grp": "root", "sgrp": "admin:operator:viewer:ptz"}
+        url = f"http://{ip}/axis-cgi/pwdgrp.cgi"
         try:
-            r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
-                params={"action": "add", "user": "root", "pwd": password,
-                        "grp": "root", "sgrp": "admin:operator:viewer:ptz"},
-                timeout=TIMEOUT)
+            r = requests.get(url, params=params, timeout=TIMEOUT)
+            if r.status_code == 401:
+                # Older firmware: retry authed with the password we're setting.
+                # The auth header is what creates the user on these cams.
+                r = requests.get(url, params=params,
+                                 auth=HTTPDigestAuth("root", password),
+                                 timeout=TIMEOUT)
             if r.status_code != 200:
+                body = (r.text or '')[:300].replace('\n', ' | ').replace('\r', '')
+                self._last_create_user_error = (
+                    f"VAPIX pwdgrp.cgi → HTTP {r.status_code} "
+                    f"(content-type: {r.headers.get('Content-Type', '?')}) "
+                    f"body[:300]: {body!r}")
                 return False
-        except:
-            # Bare except because anything that explodes here (DNS, refused,
-            # cert, you name it) means the camera isn't reachable or isn't
-            # actually factory. Either way: not our problem.
+            # Some Axis firmwares return 200 with an `Error:` body instead of
+            # a non-2xx code. Detect and surface.
+            body_text = (r.text or '').strip()
+            low = body_text.lower()
+            if low.startswith('error') or 'error:' in low[:60]:
+                self._last_create_user_error = (
+                    f"VAPIX pwdgrp.cgi → HTTP 200 but body indicates failure: "
+                    f"{body_text[:300]!r}")
+                return False
+        except Exception as e:
+            self._last_create_user_error = f"VAPIX pwdgrp.cgi raised {type(e).__name__}: {e}"
             return False
 
         # The ONVIF user is a SEPARATE database from the VAPIX user. Same name,
@@ -2619,6 +2647,236 @@ PROTOCOLS = {
     'bosch': BoschProtocol,
     'hanwha': HanwhaProtocol,
 }
+
+
+# ============================================================================
+# BUNDLED DHCP SERVER — single-lease, scoped to one interface
+# ============================================================================
+# Hands one fixed IP to whatever camera plugs in, so the wizard can hit a
+# known address every time. Off by default; user must explicitly enable with
+# typed confirmation. Pre-flight probe refuses to start if another DHCP server
+# already answers on the chosen interface (rogue-DHCP risk on customer LANs).
+
+import struct as _bs_struct
+import threading as _bs_threading
+
+_DHCP_SERVER_PORT = 67
+_DHCP_CLIENT_PORT = 68
+_DHCP_MAGIC_COOKIE = b'\x63\x82\x53\x63'
+
+_DHCP_MSG_DISCOVER = 1
+_DHCP_MSG_OFFER    = 2
+_DHCP_MSG_REQUEST  = 3
+_DHCP_MSG_ACK      = 5
+_DHCP_MSG_NAK      = 6
+
+
+def _bs_pack_dhcp_packet(*, op, xid, chaddr, yiaddr, server_ip, msg_type, lease_secs,
+                          subnet_mask, router_ip, dns_ip, requested_ip=None):
+    """Build a minimal DHCP packet (BOOTP body + DHCP options)."""
+    pkt = b''
+    pkt += _bs_struct.pack('!BBBB', op, 1, 6, 0)        # op, htype, hlen, hops
+    pkt += _bs_struct.pack('!I', xid)                    # xid
+    pkt += _bs_struct.pack('!HH', 0, 0)                  # secs, flags
+    pkt += b'\x00' * 4                                    # ciaddr
+    pkt += socket.inet_aton(yiaddr)                       # yiaddr
+    pkt += socket.inet_aton(server_ip)                    # siaddr
+    pkt += b'\x00' * 4                                    # giaddr
+    pkt += chaddr + b'\x00' * (16 - len(chaddr))          # chaddr (16 bytes)
+    pkt += b'\x00' * 64                                    # sname
+    pkt += b'\x00' * 128                                   # file
+    pkt += _DHCP_MAGIC_COOKIE
+    # Options
+    pkt += bytes([53, 1, msg_type])                       # DHCP Message Type
+    pkt += bytes([54, 4]) + socket.inet_aton(server_ip)   # Server Identifier
+    pkt += bytes([51, 4]) + _bs_struct.pack('!I', lease_secs)  # Lease Time
+    pkt += bytes([1, 4]) + socket.inet_aton(subnet_mask)  # Subnet Mask
+    if router_ip:
+        pkt += bytes([3, 4]) + socket.inet_aton(router_ip)
+    if dns_ip:
+        pkt += bytes([6, 4]) + socket.inet_aton(dns_ip)
+    if requested_ip:
+        pkt += bytes([50, 4]) + socket.inet_aton(requested_ip)
+    pkt += bytes([255])                                    # End
+    return pkt
+
+
+def _bs_parse_dhcp_packet(data):
+    """Minimal parser. Returns dict with op, xid, chaddr (mac str), msg_type."""
+    if len(data) < 240:
+        return None
+    op = data[0]
+    xid = _bs_struct.unpack('!I', data[4:8])[0]
+    chaddr = data[28:34]
+    mac = ':'.join(f'{b:02X}' for b in chaddr)
+    if data[236:240] != _DHCP_MAGIC_COOKIE:
+        return None
+    msg_type = None
+    requested_ip = None
+    i = 240
+    while i < len(data):
+        opt = data[i]
+        if opt == 255:
+            break
+        if opt == 0:
+            i += 1
+            continue
+        if i + 1 >= len(data):
+            break
+        ln = data[i + 1]
+        val = data[i + 2:i + 2 + ln]
+        if opt == 53 and ln == 1:
+            msg_type = val[0]
+        elif opt == 50 and ln == 4:
+            requested_ip = socket.inet_ntoa(val)
+        i += 2 + ln
+    return {'op': op, 'xid': xid, 'chaddr': chaddr, 'mac': mac,
+            'msg_type': msg_type, 'requested_ip': requested_ip}
+
+
+def probe_existing_dhcp(iface_ip, timeout=3.0):
+    """Send a DHCP DISCOVER from iface_ip and listen for any OFFER reply.
+    Returns dict {found: bool, server_ip: str|None} — found=True means an
+    existing DHCP server is already serving this interface; refuse to enable
+    bundled DHCP."""
+    try:
+        # Send socket — bound to chosen iface IP, broadcast-enabled
+        send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            send_sock.bind((iface_ip, _DHCP_CLIENT_PORT))
+        except OSError:
+            # Port 68 may be claimed; bind to ephemeral and accept that we
+            # won't see broadcast OFFERs as cleanly. Best-effort still useful.
+            send_sock.bind((iface_ip, 0))
+        send_sock.settimeout(timeout)
+
+        xid = int(time.time()) & 0xFFFFFFFF
+        # Use a fake-but-unique MAC so any sane DHCP won't intersect a real lease
+        fake_mac = b'\x02\xCC\xCC' + os.urandom(3)
+        discover = _bs_pack_dhcp_packet(
+            op=1, xid=xid, chaddr=fake_mac,
+            yiaddr='0.0.0.0', server_ip='0.0.0.0',
+            msg_type=_DHCP_MSG_DISCOVER, lease_secs=60,
+            subnet_mask='0.0.0.0', router_ip=None, dns_ip=None,
+        )
+        send_sock.sendto(discover, ('255.255.255.255', _DHCP_SERVER_PORT))
+
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                data, addr = send_sock.recvfrom(1500)
+            except socket.timeout:
+                break
+            parsed = _bs_parse_dhcp_packet(data)
+            if parsed and parsed.get('msg_type') == _DHCP_MSG_OFFER and parsed.get('xid') == xid:
+                send_sock.close()
+                return {'found': True, 'server_ip': addr[0]}
+        send_sock.close()
+    except Exception as e:
+        return {'found': False, 'server_ip': None, 'error': str(e)}
+    return {'found': False, 'server_ip': None}
+
+
+class BundledDHCPServer:
+    """Tiny single-lease DHCP server, bound to one interface IP.
+    Hands the configured lease_ip to whatever camera DISCOVERs. Designed for
+    isolated camera-programming networks — see probe_existing_dhcp() before
+    starting on any non-isolated network."""
+
+    def __init__(self, iface_ip, lease_ip, subnet_mask='255.255.255.0',
+                 router_ip=None, dns_ip='8.8.8.8', lease_secs=300, log_fn=None):
+        self.iface_ip = iface_ip
+        self.lease_ip = lease_ip
+        self.subnet_mask = subnet_mask
+        self.router_ip = router_ip or iface_ip
+        self.dns_ip = dns_ip
+        self.lease_secs = lease_secs
+        self._log = log_fn or (lambda msg: None)
+        self._sock = None
+        self._thread = None
+        self._stop = _bs_threading.Event()
+        self._last_client_mac = None
+        self._lease_active = False
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # Bind to chosen iface IP only — Windows routes the broadcast send
+        # back out the matching NIC, scoping us to one network.
+        sock.bind((self.iface_ip, _DHCP_SERVER_PORT))
+        sock.settimeout(0.5)
+        self._sock = sock
+        self._thread = _bs_threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        self._log(f"DHCP server started on {self.iface_ip} → leasing {self.lease_ip}")
+
+    def stop(self):
+        self._stop.set()
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+        if self._thread:
+            self._thread.join(timeout=2)
+            self._thread = None
+        self._log("DHCP server stopped.")
+
+    @property
+    def last_client_mac(self):
+        return self._last_client_mac
+
+    @property
+    def lease_active(self):
+        return self._lease_active
+
+    def _send_reply(self, parsed, msg_type):
+        pkt = _bs_pack_dhcp_packet(
+            op=2, xid=parsed['xid'], chaddr=parsed['chaddr'],
+            yiaddr=self.lease_ip, server_ip=self.iface_ip,
+            msg_type=msg_type, lease_secs=self.lease_secs,
+            subnet_mask=self.subnet_mask, router_ip=self.router_ip, dns_ip=self.dns_ip,
+        )
+        try:
+            self._sock.sendto(pkt, ('255.255.255.255', _DHCP_CLIENT_PORT))
+        except Exception as e:
+            self._log(f"DHCP reply send failed: {e}")
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                data, addr = self._sock.recvfrom(1500)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            parsed = _bs_parse_dhcp_packet(data)
+            if not parsed or parsed.get('op') != 1:
+                continue
+            mt = parsed.get('msg_type')
+            mac = parsed.get('mac', '?')
+            if mt == _DHCP_MSG_DISCOVER:
+                self._log(f"DHCP DISCOVER from {mac} → offering {self.lease_ip}")
+                self._send_reply(parsed, _DHCP_MSG_OFFER)
+            elif mt == _DHCP_MSG_REQUEST:
+                req = parsed.get('requested_ip')
+                # Only ACK if the client is asking for our offered IP, OR if no
+                # specific IP was requested (some clients put it in ciaddr).
+                if not req or req == self.lease_ip:
+                    self._log(f"DHCP REQUEST from {mac} → ACK {self.lease_ip}")
+                    self._last_client_mac = mac
+                    self._lease_active = True
+                    self._send_reply(parsed, _DHCP_MSG_ACK)
+                else:
+                    self._log(f"DHCP REQUEST from {mac} for {req} (we serve {self.lease_ip}) → NAK")
+                    self._send_reply(parsed, _DHCP_MSG_NAK)
 
 
 # ============================================================================
@@ -3878,27 +4136,36 @@ def _center_on_parent(dialog, parent, width, height):
     """Center a dialog on its parent window. Works across multiple monitors.
     The width/height args act as MINIMUM sizes — if the dialog's content
     requests more space (likely under DPI scaling), the dialog grows so
-    nothing is cut off. Also clamps to screen bounds and sets minsize so
-    the user can't drag it smaller than the content."""
+    nothing is cut off. Also clamps to virtual-desktop bounds so dialogs
+    follow the parent across monitors instead of snapping home to monitor 1
+    (b13 fix — the previous clamp used winfo_screenwidth which on Windows
+    Tk returns the PRIMARY monitor's width, yanking every popup back to
+    monitor 1 even when the parent toolkit window was on monitor 2)."""
     parent.update_idletasks()
     dialog.update_idletasks()
     req_w = dialog.winfo_reqwidth()
     req_h = dialog.winfo_reqheight()
-    # Use the larger of (caller-requested, content-required) so widgets fit
     width = max(width, req_w) if width > 0 else req_w
     height = max(height, req_h) if height > 0 else req_h
-    # Clamp to screen so dialog isn't bigger than the display
-    sw = dialog.winfo_screenwidth()
-    sh = dialog.winfo_screenheight()
-    width = min(width, sw - 40)
-    height = min(height, sh - 80)
-    # Center on parent — use parent's actual position (works on any monitor)
+    # Virtual desktop bounds span all monitors on Windows Tk; primary-only
+    # screenwidth/height was the bug.
+    vx = dialog.winfo_vrootx()
+    vy = dialog.winfo_vrooty()
+    vw = dialog.winfo_vrootwidth()
+    vh = dialog.winfo_vrootheight()
+    # Cap dialog to the smallest single monitor so it can't be wider than any
+    # one display — using primary monitor as a sane proxy.
+    sw_one = dialog.winfo_screenwidth()
+    sh_one = dialog.winfo_screenheight()
+    width = min(width, sw_one - 40)
+    height = min(height, sh_one - 80)
+    # Center on parent's actual position on its actual monitor.
     px = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
     py = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
-    px = max(0, min(px, sw - width))
-    py = max(0, min(py, sh - height))
+    # Clamp to the FULL virtual desktop, not just the primary monitor.
+    px = max(vx, min(px, vx + vw - width))
+    py = max(vy, min(py, vy + vh - height))
     dialog.geometry(f"{width}x{height}+{px}+{py}")
-    # Keep dialog at-or-above the content's minimum size during user resize
     dialog.minsize(width, height)
 
 
@@ -4173,7 +4440,7 @@ class ProgramOptionsDialog(tk.Toplevel):
         # Hostname checkbox — default ON 2026-05-03 (Brian's beta found the
         # off default confusing; auto-set is the better default for almost
         # every install workflow).
-        self.hostname_var = tk.BooleanVar(value=True)
+        self.hostname_var = tk.BooleanVar(value=False)
         self.hostname_check = ttk.Checkbutton(frame,
             text="Change network hostname",
             variable=self.hostname_var)
@@ -4281,7 +4548,7 @@ class ProgramWizardDialog(tk.Toplevel):
         self.discovery_var = tk.StringVar(value='both')
         self.factory_ip_var = tk.StringVar(value=factory_ip)
         # Default hostname-set to ON 2026-05-03 (per Brian beta-run feedback)
-        self.hostname_var = tk.BooleanVar(value=True)
+        self.hostname_var = tk.BooleanVar(value=False)
         self.additional_users_var = tk.BooleanVar(value=False)
         # v4.3 #10: by default the wizard creates an ONVIF root user (required
         # by set_network's ONVIF SOAP) AND deletes it after programming so the
@@ -4328,6 +4595,15 @@ class ProgramWizardDialog(tk.Toplevel):
         self.auto_multihome_var = tk.BooleanVar(value=False)
         self.iface_var = tk.StringVar(value='Auto-detect (default)')
         self._interfaces = ProgramOptionsDialog._get_network_interfaces()
+        # v4.3 — Bundled DHCP server. When enabled, the toolkit hands a
+        # single fixed IP to whatever camera plugs in (gated behind a typed
+        # confirmation + pre-flight DHCPDISCOVER probe to refuse if existing
+        # DHCP already serves the chosen interface). Wizard discovery checks
+        # this lease IP first when the server is on. Designed for isolated
+        # camera-programming networks; mDNS + factory IP stay as fallbacks.
+        self.dhcp_server_var = tk.BooleanVar(value=False)
+        self.dhcp_lease_ip_var = tk.StringVar(value='192.168.0.50')
+        self._dhcp_confirmed = False  # set True only after pre-flight + typed confirm
 
         # Layout: header bar + step area + nav bar
         outer = ttk.Frame(self, padding=(0, 0, 0, 0))
@@ -4372,6 +4648,23 @@ class ProgramWizardDialog(tk.Toplevel):
         self.show_step(0)
 
         self.bind("<Escape>", lambda e: self.cancel())
+        # v4.3 — Enter advances to the next step. Skip if focus is on a
+        # multiline Text widget (the review pane is read-only Text). Same
+        # binding fires Start Programming on the final step.
+        def _on_enter(event=None):
+            try:
+                w = self.focus_get()
+                if isinstance(w, tk.Text):
+                    return None
+            except Exception:
+                pass
+            self.go_next()
+            return 'break'
+        self.bind("<Return>", _on_enter)
+        self.bind("<KP_Enter>", _on_enter)
+        # Alt+Left/Right = Back/Next (browser-style)
+        self.bind("<Alt-Left>", lambda e: self.go_back())
+        self.bind("<Alt-Right>", lambda e: self.go_next())
         # Min size 800x820 — Step 3 (Extras) accumulated a lot of options in
         # v4.3-pre work (hostname / extra users / Keep ONVIF + custom creds /
         # Building Reports stickers / Auto multi-home / factory-default-before-
@@ -4431,12 +4724,10 @@ class ProgramWizardDialog(tk.Toplevel):
         f = self._new_step("Step 2 of 4 — How to find cameras",
                            "Pick how the toolkit should discover the camera when you plug it in.")
 
-        if self._interfaces:
-            ttk.Label(f, text="Network interface (which port the cameras are on):",
-                      font=('Helvetica', 10, 'bold')).pack(anchor='w', pady=(15, 4))
-            iface_labels = ['Auto-detect (default)'] + [i['label'] for i in self._interfaces]
-            ttk.Combobox(f, textvariable=self.iface_var, values=iface_labels,
-                         state='readonly', width=50).pack(anchor='w')
+        # Interface is declared at the top of the main window (session-level).
+        # The wizard inherits it — no per-wizard override.
+        ttk.Label(f, text="Interface and DHCP server are set at the top of the main window.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(15, 0))
 
         ttk.Label(f, text="Discovery method:", font=('Helvetica', 10, 'bold')).pack(
             anchor='w', pady=(18, 4))
@@ -4468,6 +4759,132 @@ class ProgramWizardDialog(tk.Toplevel):
         self.ip_label.pack(side=tk.LEFT)
         self.ip_entry = ttk.Entry(ip_row, textvariable=self.factory_ip_var, width=20, font=('Helvetica', 10))
         self.ip_entry.pack(side=tk.LEFT, padx=(10, 0), ipady=3)
+
+    def _on_dhcp_toggle(self):
+        """Handle the bundled-DHCP checkbox. On enable: pre-flight probe +
+        typed-confirmation modal. On disable: clear confirmed state."""
+        if not self.dhcp_server_var.get():
+            self._dhcp_confirmed = False
+            self._dhcp_status_label.configure(text="    Status: disabled.", foreground='gray')
+            return
+
+        # Resolve the chosen interface IP — needed for the pre-flight probe
+        iface_ip = None
+        sel = self.iface_var.get()
+        if sel and sel != 'Auto-detect (default)':
+            for iface in self._interfaces:
+                if iface['label'] == sel:
+                    iface_ip = iface['ip']
+                    break
+        if not iface_ip:
+            messagebox.showwarning(
+                "Pick an interface first",
+                "Choose a specific Network interface above before enabling the\n"
+                "bundled DHCP server. Auto-detect won't work — the server has to\n"
+                "bind to one specific NIC.",
+                parent=self)
+            self.dhcp_server_var.set(False)
+            return
+
+        lease_ip = self.dhcp_lease_ip_var.get().strip()
+        if not lease_ip:
+            messagebox.showwarning("Lease IP required",
+                                   "Enter a lease IP to hand out (e.g. 192.168.0.50).",
+                                   parent=self)
+            self.dhcp_server_var.set(False)
+            return
+
+        # Pre-flight: detect existing DHCP on this interface
+        self._dhcp_status_label.configure(
+            text=f"    Pre-flight: probing {iface_ip} for existing DHCP...",
+            foreground='#1565C0')
+        self.update_idletasks()
+        probe = probe_existing_dhcp(iface_ip, timeout=3.0)
+        if probe.get('found'):
+            messagebox.showerror(
+                "Existing DHCP detected — REFUSING",
+                f"Another DHCP server replied on {iface_ip}\n"
+                f"(server: {probe.get('server_ip', 'unknown')}).\n\n"
+                "Running our DHCP server here would conflict with the existing\n"
+                "one and could break the network. Refusing to enable.\n\n"
+                "If you're SURE this is an isolated programming network and the\n"
+                "reply was a stray, unplug the upstream DHCP source and try again.",
+                parent=self)
+            self.dhcp_server_var.set(False)
+            self._dhcp_confirmed = False
+            self._dhcp_status_label.configure(
+                text="    Status: blocked — existing DHCP found.", foreground='#B71C1C')
+            return
+
+        # Typed-confirmation modal
+        confirmed = self._dhcp_typed_confirm(iface_ip, lease_ip)
+        if not confirmed:
+            self.dhcp_server_var.set(False)
+            self._dhcp_confirmed = False
+            self._dhcp_status_label.configure(text="    Status: cancelled.", foreground='gray')
+            return
+
+        self._dhcp_confirmed = True
+        self._dhcp_status_label.configure(
+            text=f"    Status: ARMED. Will serve {lease_ip} on {iface_ip} when programming starts.",
+            foreground='#2E7D32')
+
+    def _dhcp_typed_confirm(self, iface_ip, lease_ip):
+        """Modal that requires typing OFFER LEASES to confirm enabling the
+        bundled DHCP server. Returns True if confirmed, False otherwise."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Confirm: enable bundled DHCP server")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        result = {'ok': False}
+
+        warn = tk.Label(dlg,
+            text="⚠  ABOUT TO RUN A DHCP SERVER  ⚠",
+            bg='#B71C1C', fg='white', font=('Helvetica', 14, 'bold'),
+            padx=20, pady=10)
+        warn.pack(fill=tk.X)
+
+        body = ttk.Frame(dlg, padding=20)
+        body.pack(fill=tk.BOTH, expand=True)
+        msg = (
+            f"Interface : {iface_ip}\n"
+            f"Lease IP  : {lease_ip}  (handed to whatever camera plugs in)\n\n"
+            "DO NOT enable this on a corporate or residential network.\n"
+            "Cameras AND laptops AND phones AND TVs will all try to take this\n"
+            "lease and you will break things.\n\n"
+            "Pre-flight saw no existing DHCP on this interface, but pre-flight\n"
+            "is not magic. If you're not 100% sure this is an isolated\n"
+            "camera-only network, click Cancel.\n\n"
+            "Type  OFFER LEASES  below to confirm:"
+        )
+        ttk.Label(body, text=msg, justify=tk.LEFT, font=('Helvetica', 10)).pack(anchor='w')
+        entry = ttk.Entry(body, width=30, font=('Helvetica', 11))
+        entry.pack(anchor='w', pady=(10, 0), ipady=3)
+        entry.focus_set()
+
+        btns = ttk.Frame(body)
+        btns.pack(anchor='e', pady=(15, 0))
+
+        def _ok():
+            if entry.get().strip() == 'OFFER LEASES':
+                result['ok'] = True
+                dlg.destroy()
+            else:
+                messagebox.showwarning("Not confirmed",
+                                       "Type OFFER LEASES exactly (case-sensitive) to enable.",
+                                       parent=dlg)
+
+        def _cancel():
+            dlg.destroy()
+
+        ttk.Button(btns, text="Cancel", command=_cancel).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Enable DHCP", command=_ok).pack(side=tk.RIGHT, padx=4)
+        dlg.bind("<Escape>", lambda e: _cancel())
+
+        _center_on_parent(dlg, self, 0, 0)
+        self.wait_window(dlg)
+        return result['ok']
 
     def _build_step_extras(self):
         # 2026-05-03 — Step 3 grew to ~6 options × 3-4 lines of help text each
@@ -4631,9 +5048,12 @@ class ProgramWizardDialog(tk.Toplevel):
             self._populate_review()
         else:
             self.next_btn.config(text='Next →')
-        # Focus first input on the password step
+        # Focus first input on the password step; focus the (now ✓ Start
+        # Programming) button on the review step so Enter ships it.
         if idx == 1:
             self.after(50, self._pwd_entry.focus_set)
+        elif idx == len(self.steps) - 1:
+            self.after(50, self.next_btn.focus_set)
 
     def go_back(self):
         if self.current_step > 0:
@@ -4695,6 +5115,10 @@ class ProgramWizardDialog(tk.Toplevel):
             'existing_root_pwd': self.existing_root_pwd_var.get(),
             'auto_multihome': self.auto_multihome_var.get(),
             'interface': selected_iface,
+            # Bundled DHCP server (only honored if confirmed via typed gate +
+            # pre-flight). Refuse to enable without a specific interface picked.
+            'dhcp_server_enabled': bool(self.dhcp_server_var.get() and self._dhcp_confirmed and selected_iface),
+            'dhcp_lease_ip': self.dhcp_lease_ip_var.get().strip(),
         }
         self.destroy()
 
@@ -5364,7 +5788,23 @@ class CCTVToolkitApp:
         self._periodic_scan_id = None
         self._post_op_scan_id = None
         self._countdown_tick_id = None
-        
+
+        # Session-level networking (v4.3 — declared once, applies to everything)
+        # Interface picked here is used by every wizard, factory reset, and
+        # discovery in this run. DHCP server is also session-scoped.
+        self.session_iface = None  # dict {'ip', 'index', 'label'} or None
+        self.session_iface_var = tk.StringVar(value='Auto-detect')
+        self.session_dhcp_var = tk.BooleanVar(value=False)
+        self.session_dhcp_confirmed = False
+        self.session_dhcp_server = None  # BundledDHCPServer or None
+        self.session_dhcp_config = {
+            'lease_ip': '192.168.0.50',
+            'subnet_mask': '255.255.255.0',
+            'router_ip': '192.168.0.1',
+            'dns_ip': '8.8.8.8',
+            'lease_secs': 300,
+        }
+
         # Create UI
         self.create_menu()
         self.create_main_ui()
@@ -5451,7 +5891,43 @@ class CCTVToolkitApp:
         help_menu.add_command(label="Report Issues", command=lambda: __import__('webbrowser').open('mailto:axisprogrammer@thelostping.net'))
     
     def create_main_ui(self):
-        # Brand selection bar (always visible above tabs)
+        # Session networking bar — interface + DHCP server (v4.3, top of window)
+        # Declares "all things on this NIC" up-front so every wizard inherits it.
+        self.session_bar = ttk.Frame(self.root, padding=(10, 6, 10, 6))
+        self.session_bar.pack(fill=tk.X)
+        self.session_bar.configure(style='Session.TFrame')
+        try:
+            ttk.Style().configure('Session.TFrame', background='#ECEFF1')
+        except Exception:
+            pass
+
+        ttk.Label(self.session_bar, text="INTERFACE:",
+                  font=('Helvetica', 10, 'bold'), background='#ECEFF1').pack(side=tk.LEFT)
+        ifaces = ProgramOptionsDialog._get_network_interfaces()
+        self._session_interfaces = ifaces
+        iface_labels = ['Auto-detect'] + [i['label'] for i in ifaces]
+        self.session_iface_combo = ttk.Combobox(self.session_bar,
+            textvariable=self.session_iface_var, values=iface_labels,
+            state='readonly', width=42)
+        self.session_iface_combo.pack(side=tk.LEFT, padx=(8, 0))
+        self.session_iface_combo.bind('<<ComboboxSelected>>', self._on_session_iface_change)
+
+        ttk.Separator(self.session_bar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=15)
+
+        ttk.Label(self.session_bar, text="DHCP SERVER:",
+                  font=('Helvetica', 10, 'bold'), background='#ECEFF1').pack(side=tk.LEFT)
+        self.session_dhcp_check = ttk.Checkbutton(self.session_bar,
+            text="On", variable=self.session_dhcp_var,
+            command=self._on_session_dhcp_toggle)
+        self.session_dhcp_check.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(self.session_bar, text="Configure DHCP...",
+                   command=self.show_dhcp_config_dialog).pack(side=tk.LEFT, padx=(8, 0))
+        self.session_dhcp_status = ttk.Label(self.session_bar,
+            text="(disabled)", foreground='gray',
+            font=('Helvetica', 9), background='#ECEFF1')
+        self.session_dhcp_status.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Brand selection bar
         self.brand_bar = ttk.Frame(self.root)
         self.brand_bar.pack(fill=tk.X, padx=10, pady=(5, 0))
 
@@ -5520,6 +5996,257 @@ class CCTVToolkitApp:
         # Restart background scan for new brand
         self.root.after(1000, lambda: self.background_scan(force=True, quiet=False))
 
+    # ------------------------------------------------------------------
+    # Session-level interface + DHCP server (v4.3 — declared once, top-bar)
+    # ------------------------------------------------------------------
+    def _resolve_session_iface(self):
+        """Returns the dict for the currently selected session interface, or None
+        for Auto-detect. Updates self.session_iface as a side effect."""
+        sel = self.session_iface_var.get()
+        if not sel or sel == 'Auto-detect':
+            self.session_iface = None
+            return None
+        for iface in self._session_interfaces:
+            if iface['label'] == sel:
+                self.session_iface = iface
+                return iface
+        self.session_iface = None
+        return None
+
+    def _on_session_iface_change(self, event=None):
+        """Interface picker changed — if DHCP server is running, stop it
+        (it was bound to the previous NIC)."""
+        self._resolve_session_iface()
+        if self.session_dhcp_server:
+            self.log("Interface changed — stopping bundled DHCP server "
+                     "(must re-arm on new interface)")
+            try:
+                self.session_dhcp_server.stop()
+            except Exception:
+                pass
+            self.session_dhcp_server = None
+            self.session_dhcp_var.set(False)
+            self.session_dhcp_confirmed = False
+            self.session_dhcp_status.configure(text="(disabled)", foreground='gray')
+
+    def _on_session_dhcp_toggle(self):
+        """DHCP toggle clicked. Enable: pre-flight + typed confirm + start
+        server. Disable: stop server."""
+        if not self.session_dhcp_var.get():
+            # Disable
+            if self.session_dhcp_server:
+                try:
+                    self.session_dhcp_server.stop()
+                except Exception:
+                    pass
+                self.session_dhcp_server = None
+            self.session_dhcp_confirmed = False
+            self.session_dhcp_status.configure(text="(disabled)", foreground='gray')
+            self.log("Bundled DHCP server: disabled")
+            return
+
+        # Enable path
+        iface = self._resolve_session_iface()
+        if not iface:
+            messagebox.showwarning(
+                "Pick an interface first",
+                "Choose a specific Network Interface above before enabling the\n"
+                "bundled DHCP server. Auto-detect won't work — the server has to\n"
+                "bind to one specific NIC.",
+                parent=self.root)
+            self.session_dhcp_var.set(False)
+            return
+
+        cfg = self.session_dhcp_config
+        lease_ip = cfg.get('lease_ip', '').strip()
+        if not lease_ip:
+            messagebox.showwarning("Lease IP required",
+                                   "Open Configure DHCP... and set a lease IP first.",
+                                   parent=self.root)
+            self.session_dhcp_var.set(False)
+            return
+
+        # Pre-flight: detect existing DHCP on this interface
+        self.session_dhcp_status.configure(
+            text=f"pre-flight probing {iface['ip']}...",
+            foreground='#1565C0')
+        self.root.update_idletasks()
+        probe = probe_existing_dhcp(iface['ip'], timeout=3.0)
+        if probe.get('found'):
+            messagebox.showerror(
+                "Existing DHCP detected — REFUSING",
+                f"Another DHCP server replied on {iface['ip']}\n"
+                f"(server: {probe.get('server_ip', 'unknown')}).\n\n"
+                "Running our DHCP server here would conflict and could break\n"
+                "the network. Refusing to enable.\n\n"
+                "If this is supposed to be an isolated programming network,\n"
+                "unplug the upstream DHCP source and try again.",
+                parent=self.root)
+            self.session_dhcp_var.set(False)
+            self.session_dhcp_confirmed = False
+            self.session_dhcp_status.configure(
+                text="blocked — existing DHCP found", foreground='#B71C1C')
+            return
+
+        # Typed-confirmation modal
+        if not self._dhcp_typed_confirm_session(iface['ip'], lease_ip):
+            self.session_dhcp_var.set(False)
+            self.session_dhcp_confirmed = False
+            self.session_dhcp_status.configure(text="cancelled", foreground='gray')
+            return
+
+        # Start the server
+        try:
+            self.session_dhcp_server = BundledDHCPServer(
+                iface_ip=iface['ip'],
+                lease_ip=lease_ip,
+                subnet_mask=cfg.get('subnet_mask', '255.255.255.0'),
+                router_ip=cfg.get('router_ip') or iface['ip'],
+                dns_ip=cfg.get('dns_ip', '8.8.8.8'),
+                lease_secs=int(cfg.get('lease_secs', 300)),
+                log_fn=lambda m: self.log(f"[dhcp] {m}"),
+            )
+            self.session_dhcp_server.start()
+            self.session_dhcp_confirmed = True
+            self.session_dhcp_status.configure(
+                text=f"serving {lease_ip} on {iface['ip']}", foreground='#2E7D32')
+            self.log(f"Bundled DHCP server started — leasing {lease_ip} on {iface['ip']}")
+        except Exception as e:
+            messagebox.showerror("DHCP server failed to start",
+                                 f"Could not start bundled DHCP server:\n\n{e}",
+                                 parent=self.root)
+            self.session_dhcp_server = None
+            self.session_dhcp_var.set(False)
+            self.session_dhcp_confirmed = False
+            self.session_dhcp_status.configure(text=f"failed: {e}", foreground='#B71C1C')
+
+    def _dhcp_typed_confirm_session(self, iface_ip, lease_ip):
+        """Modal — type OFFER LEASES to confirm enabling the bundled DHCP."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Confirm: enable bundled DHCP server")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        result = {'ok': False}
+
+        warn = tk.Label(dlg, text="⚠  ABOUT TO RUN A DHCP SERVER  ⚠",
+                        bg='#B71C1C', fg='white',
+                        font=('Helvetica', 14, 'bold'), padx=20, pady=10)
+        warn.pack(fill=tk.X)
+
+        body = ttk.Frame(dlg, padding=20)
+        body.pack(fill=tk.BOTH, expand=True)
+        msg = (
+            f"Interface : {iface_ip}\n"
+            f"Lease IP  : {lease_ip}\n\n"
+            "DO NOT enable this on a corporate or residential network.\n"
+            "Cameras AND laptops AND phones AND TVs will all try to take this\n"
+            "lease and you will break things.\n\n"
+            "Pre-flight saw no existing DHCP on this interface, but pre-flight\n"
+            "is not magic. Use only on isolated camera-programming networks.\n\n"
+            "Type  OFFER LEASES  below to confirm:"
+        )
+        ttk.Label(body, text=msg, justify=tk.LEFT,
+                  font=('Helvetica', 10)).pack(anchor='w')
+        entry = ttk.Entry(body, width=30, font=('Helvetica', 11))
+        entry.pack(anchor='w', pady=(10, 0), ipady=3)
+        entry.focus_set()
+
+        btns = ttk.Frame(body)
+        btns.pack(anchor='e', pady=(15, 0))
+
+        def _ok():
+            if entry.get().strip() == 'OFFER LEASES':
+                result['ok'] = True
+                dlg.destroy()
+            else:
+                messagebox.showwarning("Not confirmed",
+                                       "Type OFFER LEASES exactly (case-sensitive).",
+                                       parent=dlg)
+
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Enable DHCP", command=_ok).pack(side=tk.RIGHT, padx=4)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        _center_on_parent(dlg, self.root, 0, 0)
+        self.root.wait_window(dlg)
+        return result['ok']
+
+    def show_dhcp_config_dialog(self):
+        """Configure the bundled DHCP server's parameters (lease IP, mask,
+        router, DNS, lease seconds). Changes apply on next enable; if the
+        server is currently running, prompt to restart."""
+        cfg = self.session_dhcp_config
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Configure bundled DHCP server")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        body = ttk.Frame(dlg, padding=20)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="Bundled DHCP parameters",
+                  font=('Helvetica', 12, 'bold')).grid(
+            row=0, column=0, columnspan=2, sticky='w', pady=(0, 12))
+        ttk.Label(body,
+            text="Hands ONE fixed IP to whatever camera plugs in. Used as the\n"
+                 "rendezvous IP after factory reset and as the primary discovery\n"
+                 "address when the server is on. Changes apply when DHCP is\n"
+                 "next enabled.",
+            foreground='gray', font=('Helvetica', 9)).grid(
+            row=1, column=0, columnspan=2, sticky='w', pady=(0, 14))
+
+        fields = [
+            ('Lease IP',           'lease_ip'),
+            ('Subnet mask',        'subnet_mask'),
+            ('Default gateway',    'router_ip'),
+            ('DNS server',         'dns_ip'),
+            ('Lease seconds',      'lease_secs'),
+        ]
+        entries = {}
+        for i, (label, key) in enumerate(fields, start=2):
+            ttk.Label(body, text=label + ':', font=('Helvetica', 10)).grid(
+                row=i, column=0, sticky='w', pady=3, padx=(0, 8))
+            v = tk.StringVar(value=str(cfg.get(key, '')))
+            ent = ttk.Entry(body, textvariable=v, width=22, font=('Helvetica', 10))
+            ent.grid(row=i, column=1, sticky='w', pady=3, ipady=2)
+            entries[key] = v
+
+        btns = ttk.Frame(body)
+        btns.grid(row=20, column=0, columnspan=2, sticky='e', pady=(15, 0))
+
+        def _save():
+            new_cfg = dict(cfg)
+            for key, var in entries.items():
+                val = var.get().strip()
+                if key == 'lease_secs':
+                    try:
+                        new_cfg[key] = max(60, int(val))
+                    except ValueError:
+                        messagebox.showwarning("Invalid", "Lease seconds must be an integer.",
+                                               parent=dlg)
+                        return
+                else:
+                    new_cfg[key] = val
+            self.session_dhcp_config = new_cfg
+            self.log("Bundled DHCP config updated.")
+            if self.session_dhcp_server:
+                if messagebox.askyesno(
+                    "Restart DHCP server?",
+                    "DHCP server is running with the OLD config. Restart with\n"
+                    "the new settings now?",
+                    parent=dlg):
+                    self.session_dhcp_var.set(False)
+                    self._on_session_dhcp_toggle()
+                    dlg.destroy()
+                    self.session_dhcp_var.set(True)
+                    self._on_session_dhcp_toggle()
+                    return
+            dlg.destroy()
+
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="Save", command=_save).pack(side=tk.RIGHT, padx=4)
+        _center_on_parent(dlg, self.root, 0, 0)
+
     def create_cameras_tab(self):
         """Camera list editor tab"""
         self.cameras_frame = ttk.Frame(self.cameras_tab, padding="10")
@@ -5583,6 +6310,8 @@ class CCTVToolkitApp:
         
         # Double-click to edit
         self.camera_tree.bind('<Double-1>', lambda e: self.edit_camera())
+        # Right-click context menu (v4.3)
+        self.camera_tree.bind('<Button-3>', self._on_camera_right_click)
         # Keyboard shortcuts
         self.camera_tree.bind('<Delete>', lambda e: self.delete_camera())
         self.camera_tree.bind('<Return>', lambda e: self.edit_camera())
@@ -6656,7 +7385,7 @@ class CCTVToolkitApp:
         cameras = self.camera_data.get_all()
         count = sum(1 for cam in cameras if cam.get('processed') or cam.get('status') == 'failed')
         if count == 0:
-            messagebox.showinfo("Nothing to Reset", 
+            messagebox.showinfo("Nothing to Reset",
                 "No cameras are marked as done or failed.\n\n"
                 "All cameras already show 'Ready' status.")
             return
@@ -6667,6 +7396,62 @@ class CCTVToolkitApp:
         self.camera_data.save()
         self.refresh_camera_list()
         self.log(f"Reset status on {count} camera(s) back to Ready")
+
+    def reset_status_selected(self):
+        """Reset processed/failed flags back to Ready for SELECTED rows only."""
+        sel = self.camera_tree.selection()
+        if not sel:
+            return
+        cameras = self.camera_data.get_all()
+        names = {self.camera_tree.item(iid)['values'][0] for iid in sel}
+        count = 0
+        for cam in cameras:
+            if cam.get('name') in names and (cam.get('processed') or cam.get('status') == 'failed'):
+                cam['processed'] = False
+                cam.pop('status', None)
+                cam.pop('fail_reason', None)
+                count += 1
+        if count == 0:
+            messagebox.showinfo("Nothing to Reset",
+                "Selected rows are already in 'Ready' state.")
+            return
+        self.camera_data.save()
+        self.refresh_camera_list()
+        self.log(f"Reset status on {count} selected camera(s) back to Ready")
+
+    def _on_camera_right_click(self, event):
+        """Context menu on Camera List rows: Edit, Reset Status, Factory Default, Delete."""
+        iid = self.camera_tree.identify_row(event.y)
+        if iid and iid not in self.camera_tree.selection():
+            # Right-clicked an unselected row → make it the selection
+            self.camera_tree.selection_set(iid)
+        sel = self.camera_tree.selection()
+
+        menu = tk.Menu(self.root, tearoff=0)
+        if sel:
+            single = len(sel) == 1
+            menu.add_command(label="Edit..." if single else f"Edit selected ({len(sel)})...",
+                             command=self.edit_camera,
+                             state='normal' if single else 'disabled')
+            menu.add_command(label="Reset status (selected)",
+                             command=self.reset_status_selected)
+            menu.add_separator()
+            menu.add_command(label="Factory default this camera...",
+                             command=self.factory_default_camera,
+                             state='normal' if single else 'disabled')
+            menu.add_separator()
+            menu.add_command(label=f"Delete ({len(sel)})",
+                             command=self.delete_camera)
+        else:
+            menu.add_command(label="Add Camera...", command=self.add_camera)
+            menu.add_separator()
+            menu.add_command(label="Reset all statuses", command=self.reset_status)
+            menu.add_command(label="Clear Done", command=self.clear_processed)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
     
     def clear_processed(self):
         """Delete cameras marked as Done from the list"""
@@ -7679,7 +8464,6 @@ class CCTVToolkitApp:
         # Show scan configuration dialog
         scan_dialog = tk.Toplevel(self.root)
         scan_dialog.title("Network Scan Configuration")
-        scan_dialog.geometry("600x560")
         scan_dialog.transient(self.root)
         scan_dialog.grab_set()
         
@@ -7789,7 +8573,8 @@ class CCTVToolkitApp:
         # Enter key starts scan
         scan_dialog.bind('<Return>', lambda e: start_scan())
         range_entry.focus_set()
-        
+        _center_on_parent(scan_dialog, self.root, 600, 560)
+
         scan_dialog.wait_window()
         
         if not result.get('start'):
@@ -7844,9 +8629,8 @@ class CCTVToolkitApp:
         # Show progress
         progress = tk.Toplevel(self.root)
         progress.title("Scanning Network...")
-        progress.geometry("500x220")
         progress.transient(self.root)
-        
+
         frame = ttk.Frame(progress, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
         
@@ -7870,7 +8654,8 @@ class CCTVToolkitApp:
             progress.destroy()
         
         ttk.Button(frame, text="Cancel", command=cancel_scan).pack(pady=(10, 0))
-        
+        _center_on_parent(progress, self.root, 500, 220)
+
         found = []
         scanned_count = [0]
         
@@ -8385,6 +9170,13 @@ class CCTVToolkitApp:
     def on_close(self):
         """Close all child windows and exit the application"""
         self.cancel_flag = True
+        # Stop the bundled DHCP server if it's running (v4.3 — session-level)
+        try:
+            if getattr(self, 'session_dhcp_server', None):
+                self.session_dhcp_server.stop()
+                self.session_dhcp_server = None
+        except Exception:
+            pass
         # Destroy all toplevel windows
         for widget in self.root.winfo_children():
             if isinstance(widget, tk.Toplevel):
@@ -8477,7 +9269,7 @@ Need help? Click Help → Quick Start Guide"""
     def show_quick_start(self):
         w = tk.Toplevel(self.root)
         w.title("Quick Start Guide")
-        w.geometry("700x650")
+        w.transient(self.root)
         t = scrolledtext.ScrolledText(w, font=('Helvetica', 11), wrap=tk.WORD)
         t.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         t.insert(tk.END, """
@@ -8575,6 +9367,7 @@ NEED MORE HELP?
 Email: axisprogrammer@thelostping.net
 """)
         t.config(state=tk.DISABLED)
+        _center_on_parent(w, self.root, 700, 650)
     
     # ------------------------------------------------------------------
     # Update checking
@@ -8642,13 +9435,8 @@ Email: axisprogrammer@thelostping.net
         """Toplevel showing version diff + release notes + action buttons."""
         w = tk.Toplevel(self.root)
         w.title("Update Available")
-        w.geometry("640x520")
         w.transient(self.root)
         w.grab_set()
-        w.update_idletasks()
-        px = self.root.winfo_x() + (self.root.winfo_width() - 640) // 2
-        py = self.root.winfo_y() + (self.root.winfo_height() - 520) // 2
-        w.geometry(f"640x520+{max(px, 0)}+{max(py, 0)}")
 
         ttk.Label(w, text=f"New version: v{latest_tag}",
                   font=('Helvetica', 16, 'bold')).pack(pady=(18, 4))
@@ -8685,11 +9473,33 @@ Email: axisprogrammer@thelostping.net
         ttk.Button(btns, text="Release Notes on GitHub", command=open_release_notes).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(btns, text="Remind Me Later", command=remind_later).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(btns, text="Close", command=w.destroy).pack(side=tk.RIGHT)
+        _center_on_parent(w, self.root, 640, 520)
 
     # ------------------------------------------------------------------
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.3.0": (
+            "What's new in v4.3.0",
+            [
+                "• Session-level Interface + DHCP Server controls at the top of the main window — declared once, applies to every wizard. No more per-wizard interface picker.",
+                "• Bundled DHCP server (advanced, opt-in): hands a single fixed lease IP to whatever camera plugs in, so the wizard hits a deterministic address every time. Pre-flight DHCPDISCOVER probe refuses to start if existing DHCP is already serving the chosen interface; typed-confirmation gate prevents accidental rogue DHCP on customer/home LANs. Auto-stops on app close.",
+                "• Configure DHCP… dialog: lease IP, subnet mask, gateway, DNS, lease seconds. Hot-restart prompt when changed mid-session.",
+                "• Factory-reset rendezvous via DHCP: when the bundled server is on, the post-reset wait polls the lease IP first. Camera lands deterministically — no mDNS guessing.",
+                "• Two-phase factory_reset wait: Phase A confirms the camera actually went offline before declaring reset complete (fixes the 'every event in the same second' false-positive where ICMP responded for several seconds before reboot kicked in). Phase B re-discovers via DHCP lease → old IP → factory IP → mDNS, in that order.",
+                "• Skip factory_reset when the camera is already factory-clean. No more bailing on a freshly-reset camera because the 'existing password' is now invalid.",
+                "• HTTP-confirmed factory IP discovery: ICMP alone no longer counts. The toolkit requires basicdeviceinfo.cgi to actually respond with model/firmware before declaring 'Camera found at factory IP X'. Fixes the boot-blip ghost where a camera ICMP-responds at 192.168.0.90 for a few seconds during reboot before settling on its real address.",
+                "• create_initial_user FW 10.x compatibility: older Axis firmware requires HTTP Digest auth even on factory cams (the auth header itself triggers user creation). On a 401 from open pwdgrp.cgi, retries with HTTPDigestAuth(root, password). FW 11+ open-auth path still tried first.",
+                "• MAC freshness gate falls back to ARP when probe_unrestricted returns no MAC (older firmware doesn't expose SerialNumber via basicdeviceinfo). First-iteration short-circuit when seen_macs is empty — nothing to be stale against.",
+                "• Right-click context menu on the Camera List: Edit, Reset status (selected), Factory default this camera, Delete. Selection-aware menu items.",
+                "• Wizard keyboard polish: Enter advances to next step (skips inside multi-line Text widgets), Alt+Left/Right for back/forward, focus moves to Start Programming button on the review step so Enter ships it.",
+                "• Multi-monitor dialog placement fixed: every popup (wizard, ContinueDialog, LLDP, scan progress, settings, update notice, etc.) now centers on the parent window's actual monitor instead of snapping back to monitor 1. Helper now clamps to virtual desktop bounds (winfo_vroot*) instead of primary-monitor-only winfo_screen*.",
+                "• Taskbar icon fix: AppUserModelID set before Tk init so Windows shows app.ico in the taskbar instead of the generic Tk feather.",
+                "• Wizard 'Set network hostname automatically' default flipped to OFF (you can still tick it per-run). The auto-default created confusing hostnames for techs not expecting it.",
+                "• mDNS hostname no longer matched as model: 'axis-<mac>.local' was lighting up an over-broad AXIS-anywhere regex and getting written into the model field. Now requires real product strings (e.g. 'AXIS P3268-LV').",
+                "• create_initial_user diagnostic: on failure, the wizard log now includes [debug] HTTP status + content-type + first 300 chars of body, so unknown-firmware failures surface what the camera is actually returning.",
+            ],
+        ),
         "4.2.8": (
             "What's new in v4.2.8",
             [
@@ -8803,15 +9613,8 @@ https://buymeacoffee.com/thelostping""")
     def show_settings(self):
         w = tk.Toplevel(self.root)
         w.title("Settings")
-        w.geometry("650x550")
         w.transient(self.root)
         w.grab_set()
-        
-        # Center on parent
-        w.update_idletasks()
-        px = self.root.winfo_x() + (self.root.winfo_width() - 650) // 2
-        py = self.root.winfo_y() + (self.root.winfo_height() - 550) // 2
-        w.geometry(f"650x550+{max(px,0)}+{max(py,0)}")
         
         # Scrollable interior
         canvas = tk.Canvas(w, highlightthickness=0)
@@ -8907,7 +9710,8 @@ https://buymeacoffee.com/thelostping""")
         btn_frame.pack(pady=15)
         ttk.Button(btn_frame, text="💾 Save Settings", command=save_settings).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=w.destroy).pack(side=tk.LEFT, padx=5)
-    
+        _center_on_parent(w, self.root, 650, 550)
+
     def open_export_folder(self):
         """Open the folder where CSVs, screenshots, and FTP pulls land."""
         EXPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -9776,7 +10580,22 @@ https://buymeacoffee.com/thelostping""")
         discovery_mode = opts['discovery_mode']
         set_hostname = opts['set_hostname']
         add_additional_users = opts['add_additional_users']
-        selected_iface = opts['interface']
+        # v4.3 — session top-bar overrides the wizard. Interface and DHCP
+        # are declared once for the whole app, not per-wizard.
+        session_iface = self._resolve_session_iface()
+        if session_iface:
+            selected_iface = session_iface
+            opts['interface'] = session_iface
+        else:
+            selected_iface = opts.get('interface')
+        if self.session_dhcp_server and self.session_dhcp_confirmed:
+            opts['dhcp_server_enabled'] = True
+            opts['dhcp_lease_ip'] = self.session_dhcp_config.get('lease_ip')
+            opts['_session_dhcp'] = True   # marker: server already running, don't start/stop here
+        else:
+            opts['dhcp_server_enabled'] = False
+            opts['dhcp_lease_ip'] = None
+            opts['_session_dhcp'] = False
 
         # Persist factory IP if user changed it
         if factory_ip and factory_ip != self.protocol.FACTORY_IP:
@@ -9847,6 +10666,14 @@ https://buymeacoffee.com/thelostping""")
                 self.status_log("Adding link-local route for camera discovery...")
                 self.add_linklocal_route()
 
+            # Bundled DHCP — session-level (v4.3). The server (if any) is
+            # already running from the top-bar toggle; we just read its state.
+            dhcp_enabled = bool(opts.get('dhcp_server_enabled'))
+            dhcp_lease_ip = (opts.get('dhcp_lease_ip') or '').strip() or None
+            self._bundled_dhcp = self.session_dhcp_server if dhcp_enabled else None
+            if dhcp_enabled and dhcp_lease_ip:
+                self.status_log(f"Bundled DHCP active — leasing {dhcp_lease_ip} (session)")
+
             remaining = list(cameras)
             programmed_count = 0
             seen_macs = set()
@@ -9889,11 +10716,30 @@ https://buymeacoffee.com/thelostping""")
 
                 # ---- Discovery phase ----
                 while not self.cancel_flag:
-                    if discovery_mode in ('factory', 'both'):
-                        if factory_ip and self.ping_camera(factory_ip, timeout_ms=1000):
-                            camera_ip = factory_ip
-                            self.status_log(f"Camera found at factory IP {factory_ip}")
+                    # Bundled DHCP path: when the server is on, the camera
+                    # picks up our lease almost immediately on power-up.
+                    # Check this IP first — it's the "always know" address.
+                    if self._bundled_dhcp and dhcp_lease_ip:
+                        if self.ping_camera(dhcp_lease_ip, timeout_ms=1000):
+                            camera_ip = dhcp_lease_ip
+                            self.status_log(f"Camera found at bundled DHCP lease {dhcp_lease_ip}")
                             break
+
+                    if discovery_mode in ('factory', 'both'):
+                        # b12 — require HTTP confirmation, not just ICMP. Older
+                        # Axis cams ICMP-respond on 192.168.0.90 briefly during
+                        # boot, then move to DHCP/link-local. A naive ping-only
+                        # check latches onto that ghost and the wizard chases
+                        # an empty IP for the rest of the run (Brian, 2026-05-03).
+                        if factory_ip and self.ping_camera(factory_ip, timeout_ms=1000):
+                            probe = self.protocol.probe_unrestricted(factory_ip)
+                            if probe.get('model') or probe.get('firmware'):
+                                camera_ip = factory_ip
+                                self.status_log(f"Camera found at factory IP {factory_ip}")
+                                break
+                            else:
+                                self.status_log(
+                                    f"  (ICMP at {factory_ip} but no HTTP — boot blip, ignoring)")
 
                     if discovery_mode in ('mdns', 'both'):
                         dhcp_found_mac = None
@@ -9982,6 +10828,13 @@ https://buymeacoffee.com/thelostping""")
                 while not self.cancel_flag and not mac_settled:
                     pre_probe = self.protocol.probe_unrestricted(camera_ip)
                     mac = pre_probe.get('mac')
+                    # b11 — fall back to ARP when probe doesn't return a MAC.
+                    # Older Axis firmware (FW 10.x) responds to basicdeviceinfo
+                    # but doesn't expose SerialNumber → probe returns mac=None
+                    # and the freshness gate hangs forever. ARP is the truth
+                    # source; the camera just answered ICMP from us.
+                    if not mac:
+                        mac = self.get_mac_from_arp(camera_ip)
                     if mac:
                         mac_norm = mac.upper().replace(':', '').replace('-', '')
                         if mac_norm not in seen_macs:
@@ -9989,6 +10842,14 @@ https://buymeacoffee.com/thelostping""")
                             pinned_mac = mac
                             mac_settled = True
                             break
+                    # b11 — when seen_macs is empty (first iteration of the
+                    # run), there's nothing this MAC could be stale against.
+                    # Don't wait for a MAC we may never get — proceed and let
+                    # downstream ARP-pin handle MAC resolution.
+                    elif not seen_macs:
+                        pinned_mac = None  # ARP pin step below will populate
+                        mac_settled = True
+                        break
                     # MAC unreachable OR stale → keep waiting silently
                     if not self.ping_camera(camera_ip, timeout_ms=1000):
                         # Camera left this IP — re-discover (might be a new IP now)
@@ -10023,35 +10884,112 @@ https://buymeacoffee.com/thelostping""")
                 factory_first = bool(opts.get('factory_first', False))
                 existing_pwd = opts.get('existing_root_pwd') or ''
                 if factory_first and existing_pwd and hasattr(self.protocol, 'factory_reset'):
-                    self.status_log(f"Factory-resetting {pinned_mac} via existing password...")
-                    if self.protocol.factory_reset(camera_ip, existing_pwd):
-                        self.status_log("  ✓ Reset issued. Waiting for camera to come back...")
-                        # Camera reboots, loses everything. Try original IP first
-                        # (might come back same via DHCP), then 192.168.0.90 fallback.
+                    # Skip the reset if the camera is ALREADY factory-clean.
+                    # Detection: no-auth probe succeeds AND old root password
+                    # gets a 401 on an authed endpoint. (Brian's 2026-05-03
+                    # test: a freshly-reset cam triggered factory_first and
+                    # bailed because the existing password was now invalid.)
+                    already_factory = False
+                    try:
+                        if hasattr(self.protocol, 'is_factory_state'):
+                            already_factory = bool(self.protocol.is_factory_state(camera_ip, existing_pwd))
+                        elif hasattr(self.protocol, 'BRAND_KEY') and self.protocol.BRAND_KEY == 'axis':
+                            # Inline Axis check: getAllUnrestrictedProperties is
+                            # no-auth on factory cams. Then prove the old root
+                            # password is INVALID by hitting an authed endpoint.
+                            r1 = requests.post(
+                                f"http://{camera_ip}/axis-cgi/basicdeviceinfo.cgi",
+                                json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
+                                timeout=4)
+                            if r1.status_code == 200:
+                                r2 = requests.get(
+                                    f"http://{camera_ip}/axis-cgi/admin/restart.cgi",
+                                    auth=requests.auth.HTTPBasicAuth('root', existing_pwd),
+                                    timeout=4)
+                                if r2.status_code == 401:
+                                    already_factory = True
+                    except Exception:
+                        pass
+                    if already_factory:
+                        # Already factory — keep camera_ip as-is, skip the
+                        # whole reset+wait dance. Programming proceeds normally.
+                        self.status_log("  ✓ Camera is already factory-clean — skipping reset")
+                    else:
+                        self.status_log(f"Factory-resetting {pinned_mac} via existing password...")
+                        if not self.protocol.factory_reset(camera_ip, existing_pwd):
+                            self.status_log("  ✗ Factory reset failed — wrong existing password? bailing this slot")
+                            errors.append('factory_reset_failed')
+                            continue
+
+                        self.status_log("  ✓ Reset issued.")
                         old_ip = camera_ip
                         target_mac_norm = pinned_mac.upper().replace(':', '').replace('-', '')
                         camera_ip = None
-                        for attempt in range(60):  # up to 120s
+
+                        # Phase A — confirm the reset actually took.
+                        # The camera answers ICMP for several seconds before
+                        # reboot kicks in. Without this gate we accept the
+                        # still-pre-reset camera as "back" instantly (Brian
+                        # 2026-05-03: every event in the same second).
+                        self.status_log("  Waiting for camera to go offline (confirming reset)...")
+                        went_down = False
+                        for _ in range(30):  # up to ~60s
                             if self.cancel_flag: break
-                            for try_ip in (old_ip, '192.168.0.90'):
-                                if self.ping_camera(try_ip, timeout_ms=1000):
+                            if not self.ping_camera(old_ip, timeout_ms=800):
+                                went_down = True
+                                break
+                            time.sleep(2)
+                        if self.cancel_flag:
+                            continue
+                        if went_down:
+                            self.status_log("  ✓ Camera offline. Waiting for it to come back...")
+                        else:
+                            self.status_log(f"  ⚠ Camera at {old_ip} never went offline — reset may not have applied; will still try to find it by MAC")
+
+                        # Phase B — re-discover. When the bundled DHCP server
+                        # is on, the camera lands deterministically at the
+                        # lease IP. Otherwise fall back to old_ip + factory
+                        # fallback + mDNS.
+                        deadline = time.time() + 120
+                        rendezvous_ips = []
+                        if self._bundled_dhcp and dhcp_lease_ip:
+                            rendezvous_ips.append(dhcp_lease_ip)
+                        rendezvous_ips.extend([old_ip, '192.168.0.90'])
+                        while time.time() < deadline and not self.cancel_flag:
+                            for try_ip in rendezvous_ips:
+                                if not try_ip:
+                                    continue
+                                if self.ping_camera(try_ip, timeout_ms=800):
                                     p = self.protocol.probe_unrestricted(try_ip)
                                     p_mac = (p.get('mac') or '').upper().replace(':', '').replace('-', '')
                                     if p_mac == target_mac_norm:
                                         camera_ip = try_ip
+                                        if try_ip == dhcp_lease_ip:
+                                            self.status_log(f"  ✓ Camera grabbed our DHCP lease at {camera_ip}")
                                         break
                             if camera_ip:
                                 break
+                            # mDNS only when DHCP isn't doing the rendezvous
+                            if not self._bundled_dhcp:
+                                try:
+                                    mdns_cams = AxisMDNSDiscovery.discover(timeout=4)
+                                    for cam in mdns_cams:
+                                        cam_mac_norm = (cam.get('mac') or '').upper().replace(':', '').replace('-', '')
+                                        if cam_mac_norm == target_mac_norm and cam.get('ip'):
+                                            camera_ip = cam['ip']
+                                            self.status_log(f"  ✓ Found via mDNS at {camera_ip}")
+                                            break
+                                except Exception:
+                                    pass
+                            if camera_ip:
+                                break
                             time.sleep(2)
+
                         if not camera_ip:
                             self.status_log("  ✗ Camera didn't reappear within 120s — bailing this slot")
                             errors.append('factory_reset_no_return')
                             continue
                         self.status_log(f"  ✓ Camera back at {camera_ip} (factory state)")
-                    else:
-                        self.status_log("  ✗ Factory reset failed — wrong existing password? bailing this slot")
-                        errors.append('factory_reset_failed')
-                        continue
 
                 # ---- ARP pin ----
                 _ui(self.status_set_step, 'pin', 'active')
@@ -10271,6 +11209,13 @@ https://buymeacoffee.com/thelostping""")
                         self.status_log("    ✓ Done.")
                     else:
                         self.status_log(f"    ✗ {desc} failed")
+                        # b9 — surface protocol-level last-error if the step set one.
+                        # Currently Axis create_initial_user populates this on
+                        # failure so we can see what FW 10.x is actually returning.
+                        last_err = getattr(self.protocol, '_last_create_user_error', None)
+                        if last_err:
+                            self.status_log(f"      [debug] {last_err}")
+                            self.protocol._last_create_user_error = None
                         errors.append(desc.lower().split()[0])
                         auth_ok = False
                 _ui(self.status_set_step, 'auth', 'ok' if auth_ok else 'fail')
@@ -10588,6 +11533,10 @@ https://buymeacoffee.com/thelostping""")
             _ui(self.refresh_camera_list)
             _ui(self.rescan_after_operation)
             self._cleanup_multihome()  # v4.3 #11 — tear down any auto-added IPs
+            # NOTE: bundled DHCP server is session-level (v4.3) — do NOT stop
+            # it here. It's owned by the top-bar toggle and persists across
+            # wizard runs until the user disables it.
+            self._bundled_dhcp = None
             self._close_wizard_run_log()
 
         threading.Thread(target=run, daemon=True).start()
@@ -11636,6 +12585,15 @@ def _ensure_admin():
 
 if __name__ == "__main__":
     _ensure_admin()
+    # Without an explicit AppUserModelID, Windows groups this PyInstaller-frozen
+    # Python app under the generic Python AUMI and the taskbar shows Tk's feather
+    # icon regardless of iconbitmap(). Setting our own AUMI before Tk init makes
+    # Windows pick up app.ico for the taskbar.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('thelostping.cctv.toolkit')
+    except Exception:
+        pass
     root = tk.Tk()
     app = CCTVToolkitApp(root)
     root.mainloop()
