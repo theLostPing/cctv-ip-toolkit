@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.4.1"
+APP_VERSION = "4.4.2"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -9555,6 +9555,15 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.4.2": (
+            "What's new in v4.4.2",
+            [
+                "• First release built and published by GitHub Actions CI. Same app code as v4.4.1 — the change is in how releases are produced.",
+                "• Tag push v* on the repo now triggers a windows-latest runner that installs Python + Inno Setup, runs PyInstaller + ISCC, and attaches all artifacts to the GitHub release. No more laptop-only builds.",
+                "• Beta builds: push to a beta/** branch and CI publishes a prerelease.",
+                "• SignPath Foundation integration block is ready to enable in the workflow once the application is approved.",
+            ],
+        ),
         "4.4.1": (
             "What's new in v4.4.1",
             [
