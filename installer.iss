@@ -107,7 +107,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 ;   nowait        Setup doesn't block on cmd
 ;   postinstall   shows as the "Launch CCTVIPToolkit" checkbox on the final page
 ;   shellexec     route through ShellExecute → respects --uac-admin manifest
-Filename: "{cmd}"; Parameters: "/c timeout /t 3 /nobreak >nul && start """" """{app}\{#MyAppExeName}"""""; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall shellexec
+Filename: "{cmd}"; Parameters: "/c timeout /t 3 /nobreak >nul && ""{app}\{#MyAppExeName}"""; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall shellexec
 
 [UninstallDelete]
 ; Clean up app data on uninstall (optional — comment out to keep user settings)
