@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.4.0"
+APP_VERSION = "4.4.1"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -9555,6 +9555,13 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.4.1": (
+            "What's new in v4.4.1",
+            [
+                "• FIX: Installer's post-install \"Launch CCTVIPToolkit\" option failed with CreateProcess code 740 (\"The requested operation requires elevation\") because the app's manifest requires admin (for bundled DHCP + static IP) but Inno's [Run] entry was launching in user context. Added shellexec flag so ShellExecute is used — Windows shows a UAC prompt and the app actually launches.",
+                "• No code changes to the toolkit itself; v4.4.1 is purely an installer fix.",
+            ],
+        ),
         "4.4.0": (
             "What's new in v4.4.0",
             [

@@ -90,9 +90,17 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; Drop "skipifsilent" so the app relaunches even when the in-app updater
-; runs the installer with /SP- (which suppresses the welcome page but is NOT silent).
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall
+; "shellexec" is REQUIRED here because the toolkit's PyInstaller build sets
+; --uac-admin (manifest requires admin for the bundled DHCP server + static-IP
+; setting features). Without shellexec, [Run] uses CreateProcess in the
+; user's context → CreateProcess returns code 740 because it can't elevate
+; from user context. shellexec routes through ShellExecute which respects
+; the manifest and triggers Windows' UAC prompt. User sees one extra UAC
+; click here (separate from the install elevation), but the app actually launches.
+;
+; "skipifsilent" dropped so the app relaunches when the in-app updater runs
+; the installer with /SP- (suppresses welcome page but is NOT silent).
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall shellexec
 
 [UninstallDelete]
 ; Clean up app data on uninstall (optional — comment out to keep user settings)
