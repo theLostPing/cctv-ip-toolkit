@@ -1,17 +1,20 @@
 name: Build CCTV IP Toolkit
 
-# Fires on:
-#   - Tagged release (v*) -> builds + uploads EXE + source zip to the GitHub release
-#   - Manual trigger (workflow_dispatch) -> builds and drops artifacts for download
-#   - Any push to master -> builds and drops artifacts (sanity check, no release)
+# Triggers:
+#   - Tagged release v*  -> stable release: builds bare exe + Inno installer + source zip,
+#                           attaches all to the GitHub release
+#   - Branch beta/**     -> prerelease: same artifacts, version suffixed -beta.<short_sha>,
+#                           release marked prerelease=true
+#   - Push to master     -> sanity-check build, artifacts only (no release)
+#   - workflow_dispatch  -> manual ad-hoc build, artifacts only (no release)
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, 'beta/**']
     tags: ['v*']
   workflow_dispatch:
 
 permissions:
-  contents: write  # needed by softprops/action-gh-release to attach assets to the v* release
+  contents: write  # needed by softprops/action-gh-release to attach assets
 
 jobs:
   build:
@@ -24,82 +27,155 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
-      - name: Install build dependencies
+      - name: Install Python build dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller requests pillow openpyxl
+          python -m pip install pyinstaller==6.18.0 requests pillow openpyxl
 
-      - name: Build with PyInstaller
+      - name: Install Inno Setup (for installer build)
+        # windows-latest ships chocolatey pre-installed
+        run: choco install innosetup --no-progress -y
+
+      - name: Read APP_VERSION + resolve build version
+        id: vers
+        shell: pwsh
+        run: |
+          $line = Select-String -Path cctv_toolkit.py -Pattern '^APP_VERSION\s*=' | Select-Object -First 1
+          $base = ($line.Line -replace '.*=\s*[''"]([^''"]+).*', '$1')
+          Write-Host "Base version: $base"
+
+          if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $tag = $env:GITHUB_REF -replace '^refs/tags/v?', ''
+            $version = $tag
+            $is_prerelease = 'false'
+            $release_kind = 'stable'
+          } elseif ($env:GITHUB_REF -like 'refs/heads/beta/*') {
+            $sha = $env:GITHUB_SHA.Substring(0, 7)
+            $version = "$base-beta.$sha"
+            $is_prerelease = 'true'
+            $release_kind = 'beta'
+          } else {
+            $sha = $env:GITHUB_SHA.Substring(0, 7)
+            $version = "$base-dev.$sha"
+            $is_prerelease = 'true'
+            $release_kind = 'none'
+          }
+
+          Write-Host "Resolved version: $version (kind=$release_kind)"
+          "version=$version"             | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "base=$base"                   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_prerelease=$is_prerelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "release_kind=$release_kind"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build PyInstaller exe
         shell: pwsh
         run: |
           pyinstaller --clean cctv_toolkit.spec
+          if (-not (Test-Path "dist\CCTVIPToolkit.exe")) { throw "PyInstaller didn't produce dist\CCTVIPToolkit.exe" }
 
-      - name: Compute SHA-256
+      - name: Compute SHA-256 of bare exe
         shell: pwsh
         run: |
           $hash = (Get-FileHash -Algorithm SHA256 dist\CCTVIPToolkit.exe).Hash.ToLower()
           Write-Host "SHA-256: $hash"
           Set-Content -Path dist\CCTVIPToolkit.exe.sha256 -Value "$hash  CCTVIPToolkit.exe"
 
-      - name: Build source zip (public release pattern)
+      - name: Build Inno Setup installer
         shell: pwsh
         run: |
-          # Excludes per memory project_cctv_toolkit.md:
-          # .git, __pycache__, dist, build, private, .github
-          # file globs: *.bak, *.mp4, *.pcapng, Screenshot*.png
-          $excludeDirs = @('.git','__pycache__','dist','build','private','.github')
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found after choco install" }
+
+          & $iscc "/Q" "/DMyAppVersion=${{ steps.vers.outputs.version }}" installer.iss
+          $installer = "Output\CCTVIPToolkit-Setup-v${{ steps.vers.outputs.version }}.exe"
+          if (-not (Test-Path $installer)) { throw "ISCC didn't produce $installer" }
+          Move-Item -Force $installer "dist\"
+
+      - name: Build versioned source zip
+        shell: pwsh
+        run: |
+          $excludeDirs = @('.git','__pycache__','dist','build','private','Output')
           $excludeFiles = @('*.bak','*.mp4','*.pcapng','Screenshot*.png')
-          $items = Get-ChildItem -Path . -Force | Where-Object {
-            $_.Name -notin $excludeDirs -and
-            -not ($excludeFiles | Where-Object { $_n = $_; $item = $args[0]; $item.Name -like $_n })
-          }
-          # Stage to a temp dir so Compress-Archive preserves structure cleanly.
           $stage = Join-Path $env:RUNNER_TEMP 'src-stage'
           Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          $items = Get-ChildItem -Path . -Force | Where-Object { $_.Name -notin $excludeDirs }
           foreach ($item in $items) {
-            Copy-Item $item.FullName -Destination $stage -Recurse -Force `
-              -Exclude ($excludeFiles + $excludeDirs)
+            Copy-Item $item.FullName -Destination $stage -Recurse -Force -Exclude ($excludeFiles + $excludeDirs)
           }
-          Compress-Archive -Path "$stage\*" -DestinationPath "dist\cctv-ip-toolkit-source.zip" -Force
-          Write-Host "source zip built: $(Get-Item dist\cctv-ip-toolkit-source.zip | Select-Object -Expand Length) bytes"
+          $zip = "dist\cctv-ip-toolkit-source-v${{ steps.vers.outputs.version }}.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          Copy-Item $zip "dist\cctv-ip-toolkit-source.zip"
+          Write-Host "source zip: $(Get-Item $zip | Select-Object -Expand Length) bytes"
 
-      # Placeholder for Azure Trusted Signing. Uncomment + fill in once the
-      # Azure account + code-signing account is provisioned. The action docs
-      # are at https://github.com/Azure/trusted-signing-action
-      # - name: Sign CCTVIPToolkit.exe with Azure Trusted Signing
-      #   uses: azure/trusted-signing-action@v0.4.0
+      # ============================================================
+      # Code signing — currently disabled, replaced 2026-05-03 with SignPath Foundation.
+      # SignPath application submitted 2026-05-03; CI wiring lands here when approved.
+      # When the cert is provisioned, sign IN THIS ORDER:
+      #   1. Sign dist\CCTVIPToolkit.exe FIRST (the bare PyInstaller output)
+      #   2. THEN re-run ISCC so the installer bundles the already-signed exe
+      #   3. THEN sign dist\CCTVIPToolkit-Setup-v*.exe (the installer)
+      # That order matters — signing only the installer leaves SmartScreen
+      # warning on first launch of the installed app.
+      #
+      # - name: Sign with SignPath Foundation
+      #   uses: signpath/github-action-submit-signing-request@v1
       #   with:
-      #     azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-      #     azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-      #     azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-      #     endpoint: https://eus.codesigning.azure.net/
-      #     trusted-signing-account-name: ${{ secrets.TS_ACCOUNT }}
-      #     certificate-profile-name: ${{ secrets.TS_PROFILE }}
-      #     files-folder: dist
-      #     files-folder-filter: exe
-      #     file-digest: SHA256
-      #     timestamp-rfc3161: http://timestamp.acs.microsoft.com
-      #     timestamp-digest: SHA256
+      #     api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+      #     organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+      #     project-slug: cctv-ip-toolkit
+      #     signing-policy-slug: release-signing
+      #     artifact-configuration-slug: cctv-toolkit
+      #     wait-for-completion: true
+      #     output-artifact-directory: dist
+      # ============================================================
 
-      - name: Upload build artifacts (every run)
+      - name: List dist before upload
+        shell: pwsh
+        run: Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Upload build artifacts (always)
         uses: actions/upload-artifact@v4
         with:
-          name: CCTVIPToolkit-${{ github.sha }}
+          name: CCTVIPToolkit-v${{ steps.vers.outputs.version }}
           path: |
             dist/CCTVIPToolkit.exe
             dist/CCTVIPToolkit.exe.sha256
+            dist/CCTVIPToolkit-Setup-v${{ steps.vers.outputs.version }}.exe
+            dist/cctv-ip-toolkit-source-v${{ steps.vers.outputs.version }}.zip
             dist/cctv-ip-toolkit-source.zip
           retention-days: 30
 
-      - name: Attach to GitHub Release (tag builds only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Attach to GitHub Release (stable tag)
+        if: steps.vers.outputs.release_kind == 'stable'
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/CCTVIPToolkit.exe
             dist/CCTVIPToolkit.exe.sha256
-            dist/cctv-ip-toolkit-source.zip
+            dist/CCTVIPToolkit-Setup-v${{ steps.vers.outputs.version }}.exe
+            dist/cctv-ip-toolkit-source-v${{ steps.vers.outputs.version }}.zip
           generate_release_notes: true
+          prerelease: false
+
+      - name: Create Beta Prerelease (beta/** branch)
+        if: steps.vers.outputs.release_kind == 'beta'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta-v${{ steps.vers.outputs.version }}
+          name: Beta v${{ steps.vers.outputs.version }}
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Automated beta build from branch `${{ github.ref_name }}` at commit `${{ github.sha }}`.
+
+            **Not a stable release.** Use only for testing.
+          files: |
+            dist/CCTVIPToolkit.exe
+            dist/CCTVIPToolkit.exe.sha256
+            dist/CCTVIPToolkit-Setup-v${{ steps.vers.outputs.version }}.exe
+            dist/cctv-ip-toolkit-source-v${{ steps.vers.outputs.version }}.zip
