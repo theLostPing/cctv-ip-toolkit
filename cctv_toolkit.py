@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.4.2"
+APP_VERSION = "4.4.3"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -6740,7 +6740,15 @@ class CCTVToolkitApp:
         self.mass_password_text.bind("<Button-3>", lambda e: mass_menu.tk_popup(e.x_root, e.y_root))
         
         ttk.Button(right_frame, text="➕ Add All", command=self.mass_add_passwords).pack(pady=(0, 10))
-        
+
+        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+
+        # Import from file
+        ttk.Label(right_frame, text="Import from file:", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W)
+        ttk.Label(right_frame, text=".txt / .csv (one per line) or\n.md (extracts ``` code blocks)",
+                  font=('Helvetica', 9), foreground='#7d8aa3', justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
+        ttk.Button(right_frame, text="📂 Import from file…", command=self.import_passwords_from_file).pack(pady=(0, 10))
+
         ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=10)
         
         # Common defaults
@@ -9064,6 +9072,83 @@ class CCTVToolkitApp:
         self.mass_password_text.delete('1.0', tk.END)
         self.refresh_password_list()
         self.log(f"Bulk added {added} password(s)")
+
+    def import_passwords_from_file(self):
+        """Import passwords from a .txt / .csv / .md file.
+
+        - .md: extracts content between ``` fenced code blocks (concatenated).
+          Anything outside the fences (markdown headers, prose, instructions)
+          is ignored. Multiple code blocks are supported.
+        - .txt / .csv / .tsv / anything else: one password per line. Blank
+          lines and lines starting with # are skipped. CSV: takes the first
+          non-empty column per row.
+
+        Reports: total imported, new added, duplicates skipped.
+        """
+        filepath = filedialog.askopenfilename(
+            title="Import Password List",
+            filetypes=[
+                ("All supported", "*.txt *.csv *.tsv *.md *.list"),
+                ("Text", "*.txt"),
+                ("CSV / TSV", "*.csv *.tsv"),
+                ("Markdown", "*.md"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if not filepath:
+            return
+
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+        except Exception as e:
+            messagebox.showerror("Import failed", f"Could not read file:\n{e}")
+            return
+
+        # Markdown: extract everything between fenced code blocks
+        is_markdown = filepath.lower().endswith('.md') or '```' in content[:2000]
+        if is_markdown and '```' in content:
+            blocks = re.findall(r'```[^\n]*\n(.*?)```', content, flags=re.DOTALL)
+            if blocks:
+                content = '\n'.join(blocks)
+
+        candidates = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # CSV/TSV: take first non-empty column
+            if ',' in line or '\t' in line:
+                parts = re.split(r'[,\t]', line)
+                line = next((p.strip() for p in parts if p.strip()), '')
+                if not line:
+                    continue
+            candidates.append(line)
+
+        if not candidates:
+            messagebox.showinfo("Import",
+                "No passwords found in that file.\n\n"
+                "For .md files, passwords must be inside ``` code fences.\n"
+                "For .txt/.csv, one password per line, # for comments.")
+            return
+
+        existing = set(self.password_data.get_all())
+        added = 0
+        dupes = 0
+        for pwd in candidates:
+            if pwd in existing:
+                dupes += 1
+                continue
+            self.password_data.add(pwd)
+            existing.add(pwd)
+            added += 1
+
+        self.refresh_password_list()
+        msg = f"Imported {added} new password(s) from {os.path.basename(filepath)}."
+        if dupes:
+            msg += f"\n{dupes} were already in your list (skipped)."
+        self.log(msg)
+        messagebox.showinfo("Import complete", msg)
     
     def add_password_quick(self, pwd):
         self.password_data.add(pwd)
@@ -9555,6 +9640,16 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.4.3": (
+            "What's new in v4.4.3",
+            [
+                "• NEW: Passwords tab → 'Import from file…' button. Accepts .txt, .csv, .tsv, .md, .list (and 'all files').",
+                "• Markdown handling: extracts passwords from inside ``` fenced code blocks. Headers, prose, and instructions outside the fences are ignored. Multiple code blocks combine.",
+                "• Plain text / CSV: one password per line, blank lines and # comments skipped, CSV first non-empty column wins.",
+                "• Reports counts on import: \"Imported N new (X already in your list).\"",
+                "• The Convergint password list .md (handed out to techs separately) now imports cleanly with one click instead of copy-paste-trim.",
+            ],
+        ),
         "4.4.2": (
             "What's new in v4.4.2",
             [
