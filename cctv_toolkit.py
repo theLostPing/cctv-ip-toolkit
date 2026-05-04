@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.4.0"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -9555,6 +9555,17 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.4.0": (
+            "What's new in v4.4.0",
+            [
+                "• NEW: Inno Setup installer ships alongside the bare .exe. CCTVIPToolkit-Setup-vX.Y.Z.exe puts the toolkit in Program Files (or %LocalAppData%\\Programs without admin), creates a Start Menu shortcut, optional Desktop shortcut, and registers an uninstaller in Add/Remove Programs.",
+                "• NEW: One-click in-app update. When a newer release is published, the Update Available dialog now offers 'Install vX.Y.Z now' as the primary action — downloads the installer to %TEMP% with inline progress, launches it detached, exits cleanly. Inno's Restart Manager handles the close-and-replace if the timing is tight.",
+                "• Update flow auto-relaunches the app post-install (Inno RestartApplications=yes + [Run] entry).",
+                "• Bare .exe download path still available via the existing 'Download' button when a release was published without the installer asset (older releases).",
+                "• Stable AppId GUID across all installer versions: every future installer detects prior installs and upgrades in place, preserving install location + user choices (desktop shortcut, etc.).",
+                "• build.bat now produces both artifacts in dist/. Auto-installs Inno Setup via winget if missing.",
+            ],
+        ),
         "4.3.0": (
             "What's new in v4.3.0",
             [
