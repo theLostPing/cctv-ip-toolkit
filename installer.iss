@@ -90,17 +90,25 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; "shellexec" is REQUIRED here because the toolkit's PyInstaller build sets
-; --uac-admin (manifest requires admin for the bundled DHCP server + static-IP
-; setting features). Without shellexec, [Run] uses CreateProcess in the
-; user's context → CreateProcess returns code 740 because it can't elevate
-; from user context. shellexec routes through ShellExecute which respects
-; the manifest and triggers Windows' UAC prompt. User sees one extra UAC
-; click here (separate from the install elevation), but the app actually launches.
+; Auto-launch INTENTIONALLY DROPPED in v4.4.4 after Brian saw a "Failed to load
+; Python DLL ... python312.dll" error from PyInstaller's onefile bootloader on
+; the in-app updater path. The race: Inno's RestartManager closes the running
+; v4.4.x process, replaces files in {app}, then [Run] fires and starts the new
+; .exe before the OS / antivirus / Defender finish releasing locks on the freshly
+; extracted _MEI<random> temp dir. PyInstaller's bootloader then can't load
+; python312.dll from that temp dir.
 ;
-; "skipifsilent" dropped so the app relaunches when the in-app updater runs
-; the installer with /SP- (suppresses welcome page but is NOT silent).
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall shellexec
+; The user sees one extra click — Start Menu / Desktop shortcut — but the new
+; version launches reliably from a fresh process context. The in-app updater
+; UI text was updated in v4.4.4 to set this expectation explicitly.
+;
+; If you ever want to re-enable, the standard mitigation is to launch via a
+; small launcher (cmd /c "timeout 3 && start <exe>") so the new process starts
+; ~3s after Inno's file replacement settles. Don't use shellexec without that
+; delay — it reproduces the DLL race.
+;
+; (Old line for reference, do not uncomment without delay launcher:)
+; Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,...}"; Flags: nowait postinstall shellexec
 
 [UninstallDelete]
 ; Clean up app data on uninstall (optional — comment out to keep user settings)

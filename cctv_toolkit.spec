@@ -5,7 +5,11 @@ a = Analysis(
     ['cctv_toolkit.py'],
     pathex=[],
     binaries=[],
-    datas=[('logo.ico', '.')],
+    # app.ico = runtime taskbar icon (loaded via iconbitmap from sys._MEIPASS)
+    # logo.ico = file/EXE icon (set via icon=[...] below)
+    # Both must be in datas so PyInstaller bundles them; runtime code at line ~5764
+    # explicitly looks for app.ico — without it, Tk falls back to its feather icon.
+    datas=[('app.ico', '.'), ('logo.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

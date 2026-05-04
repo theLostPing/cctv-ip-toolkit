@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.4.3"
+APP_VERSION = "4.4.4"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -6741,15 +6741,12 @@ class CCTVToolkitApp:
         
         ttk.Button(right_frame, text="➕ Add All", command=self.mass_add_passwords).pack(pady=(0, 10))
 
-        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+        # Import from file (compact — single button, no extra labels, keeps the
+        # Additional Users section visible without scrolling)
+        ttk.Button(right_frame, text="📂 Import from file…  (.txt / .csv / .md)",
+                   command=self.import_passwords_from_file).pack(pady=(2, 10), fill=tk.X)
 
-        # Import from file
-        ttk.Label(right_frame, text="Import from file:", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W)
-        ttk.Label(right_frame, text=".txt / .csv (one per line) or\n.md (extracts ``` code blocks)",
-                  font=('Helvetica', 9), foreground='#7d8aa3', justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
-        ttk.Button(right_frame, text="📂 Import from file…", command=self.import_passwords_from_file).pack(pady=(0, 10))
-
-        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=8)
         
         # Common defaults
         ttk.Label(right_frame, text="Common defaults:", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W)
@@ -9595,7 +9592,10 @@ Email: axisprogrammer@thelostping.net
                                 pct = int(downloaded * 100 / total)
                                 progress_label.config(text=f"Downloading... {pct}% ({downloaded//1048576} / {total//1048576} MB)")
                                 w.update_idletasks()
-                progress_label.config(text="Launching installer...")
+                progress_label.config(
+                    text="Launching installer...\nWhen install finishes, relaunch from your Start Menu shortcut.",
+                    justify=tk.LEFT,
+                )
                 w.update_idletasks()
 
                 # Detached launch so the installer survives our exit.
@@ -9640,6 +9640,14 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.4.4": (
+            "What's new in v4.4.4",
+            [
+                "• FIX: Taskbar icon was reverting to the generic Tk feather on CI builds. The PyInstaller .spec was bundling logo.ico (the file/EXE icon) but not app.ico (the runtime taskbar icon the code actually loads at startup). Both are now bundled.",
+                "• FIX: Add User row at the bottom of the Passwords tab was clipped on default window heights — the new Import-from-file section in v4.4.3 was eating too much vertical space. Compacted to a single button so the Additional Users controls are fully visible again.",
+                "• FIX: In-app update flow occasionally died with 'Failed to load Python DLL' (PyInstaller bootloader race when Inno's auto-relaunch fired before the OS released file locks on the freshly-extracted temp dir). Auto-relaunch dropped — installer now ends with the standard 'Setup complete' page; you launch the new version once from your Start Menu / Desktop shortcut.",
+            ],
+        ),
         "4.4.3": (
             "What's new in v4.4.3",
             [
