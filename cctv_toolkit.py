@@ -9373,7 +9373,10 @@ Email: axisprogrammer@thelostping.net
     # Update checking
     # ------------------------------------------------------------------
     def _fetch_latest_release(self, timeout=6):
-        """Return (tag, body, html_url) of the latest published release, or None."""
+        """Return (tag, body, html_url, installer_url) of the latest published release, or None.
+        installer_url is the direct download URL of the Inno Setup installer asset
+        (CCTVIPToolkit-Setup-vX.Y.Z.exe), or None if no installer is published for this release
+        (older releases shipped only the bare .exe — those fall back to browser-download)."""
         try:
             req = urllib.request.Request(
                 GITHUB_LATEST_API,
@@ -9385,7 +9388,13 @@ Email: axisprogrammer@thelostping.net
             tag = (data.get("tag_name") or "").lstrip("vV").strip()
             body = (data.get("body") or "").strip()
             url = data.get("html_url") or GITHUB_RELEASES_PAGE
-            return tag, body, url
+            installer_url = None
+            for asset in (data.get("assets") or []):
+                name = (asset.get("name") or "").lower()
+                if "setup" in name and name.endswith(".exe"):
+                    installer_url = asset.get("browser_download_url")
+                    break
+            return tag, body, url, installer_url
         except Exception:
             return None
 
@@ -9413,7 +9422,7 @@ Email: axisprogrammer@thelostping.net
                     f"You can check manually at:\n{GITHUB_RELEASES_PAGE}",
                 )
             return
-        latest_tag, body, url = result
+        latest_tag, body, url, installer_url = result
         latest_tup = self._version_tuple(latest_tag)
         current_tup = self._version_tuple(APP_VERSION)
 
@@ -9429,9 +9438,9 @@ Email: axisprogrammer@thelostping.net
         if silent and self.settings.get('general', 'last_dismissed_version') == latest_tag:
             return
 
-        self._show_update_dialog(latest_tag, body, url)
+        self._show_update_dialog(latest_tag, body, url, installer_url)
 
-    def _show_update_dialog(self, latest_tag, body, url):
+    def _show_update_dialog(self, latest_tag, body, url, installer_url=None):
         """Toplevel showing version diff + release notes + action buttons."""
         w = tk.Toplevel(self.root)
         w.title("Update Available")
@@ -9454,12 +9463,75 @@ Email: axisprogrammer@thelostping.net
         btns = ttk.Frame(w)
         btns.pack(fill=tk.X, padx=18, pady=(6, 14))
 
-        def open_download():
-            # Route through fieldtoolkit.com tracker so upgrades count in analytics
-            # the same as fresh downloads. The tracker 302s to the GitHub asset.
+        def open_browser_download():
+            # Fallback path used when the release didn't publish an installer asset
+            # (older releases only had the bare .exe). Routes through fieldtoolkit.com
+            # tracker so upgrades count in analytics the same as fresh downloads.
             import webbrowser
             tracked_url = f"{FIELDTOOLKIT_DOWNLOAD_URL}&v=v{latest_tag}"
             webbrowser.open(tracked_url)
+
+        def install_now():
+            """Download the installer to a temp file, launch it detached, exit the app.
+            The Inno installer handles the rest: if our exe is still in use it shows
+            "Close apps to continue" via Restart Manager, then installs in place,
+            then auto-relaunches us via the [Run] section in installer.iss."""
+            if not installer_url:
+                # Older release — fall back to browser download
+                open_browser_download()
+                w.destroy()
+                return
+
+            # Disable buttons and show progress
+            for child in btns.winfo_children():
+                try: child.config(state='disabled')
+                except Exception: pass
+            progress_label = ttk.Label(btns, text="Preparing download...", foreground='#7da7d9')
+            progress_label.pack(side=tk.LEFT, padx=(12, 0))
+            w.update_idletasks()
+
+            import tempfile, subprocess
+            try:
+                # Download to %TEMP%\CCTVIPToolkit-Setup-vX.Y.Z.exe
+                fname = f"CCTVIPToolkit-Setup-v{latest_tag}.exe"
+                dest = os.path.join(tempfile.gettempdir(), fname)
+                req = urllib.request.Request(installer_url,
+                    headers={"User-Agent": f"CCTVIPToolkit/{APP_VERSION}"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    total = int(resp.headers.get('Content-Length') or 0)
+                    downloaded = 0
+                    with open(dest, 'wb') as fh:
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk: break
+                            fh.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                pct = int(downloaded * 100 / total)
+                                progress_label.config(text=f"Downloading... {pct}% ({downloaded//1048576} / {total//1048576} MB)")
+                                w.update_idletasks()
+                progress_label.config(text="Launching installer...")
+                w.update_idletasks()
+
+                # Detached launch so the installer survives our exit.
+                # CREATE_NEW_PROCESS_GROUP + DETACHED_PROCESS = installer fully owns its lifecycle.
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+                DETACHED_PROCESS = 0x00000008
+                subprocess.Popen(
+                    [dest, "/SP-"],   # /SP- = skip the "this will install..." preamble
+                    creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+                    close_fds=True,
+                )
+                # Give the installer ~half a second to spawn before we exit so its
+                # "scan for in-use files" begins after the OS has registered the new process.
+                self.root.after(600, lambda: (self.root.destroy(), os._exit(0)))
+            except Exception as e:
+                progress_label.config(text=f"Failed: {e}", foreground='#ff6b6b')
+                # Re-enable buttons so user can try again or fall back to browser
+                for child in btns.winfo_children():
+                    if isinstance(child, ttk.Button):
+                        try: child.config(state='normal')
+                        except Exception: pass
 
         def open_release_notes():
             import webbrowser
@@ -9469,7 +9541,11 @@ Email: axisprogrammer@thelostping.net
             self.settings.set('general', 'last_dismissed_version', latest_tag)
             w.destroy()
 
-        ttk.Button(btns, text=f"Download v{latest_tag}", command=open_download).pack(side=tk.LEFT)
+        # Primary action: in-app download + install (only if release has an installer asset)
+        if installer_url:
+            ttk.Button(btns, text=f"Install v{latest_tag} now", command=install_now).pack(side=tk.LEFT)
+        else:
+            ttk.Button(btns, text=f"Download v{latest_tag}", command=open_browser_download).pack(side=tk.LEFT)
         ttk.Button(btns, text="Release Notes on GitHub", command=open_release_notes).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(btns, text="Remind Me Later", command=remind_later).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(btns, text="Close", command=w.destroy).pack(side=tk.RIGHT)

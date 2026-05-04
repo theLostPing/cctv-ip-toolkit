@@ -59,6 +59,16 @@ ShowLanguageDialog=no
 Compression=lzma2/ultra64
 SolidCompression=yes
 
+; In-app upgrade flow:
+;   - The running CCTVIPToolkit.exe launches this installer detached, then exits.
+;   - If the app is still alive when Inno scans (race window), CloseApplications=yes
+;     triggers the "Setup has detected that this application is currently running"
+;     page with a "Close all and continue" button (uses Restart Manager API).
+;   - RestartApplications=yes asks the OS to relaunch the app post-install.
+;   - The [Run] section's launch (without skipifsilent) is the belt to that suspenders.
+CloseApplications=yes
+RestartApplications=yes
+
 ; Output
 OutputDir=Output
 OutputBaseFilename=CCTVIPToolkit-Setup-v{#MyAppVersion}
@@ -80,7 +90,9 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+; Drop "skipifsilent" so the app relaunches even when the in-app updater
+; runs the installer with /SP- (which suppresses the welcome page but is NOT silent).
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall
 
 [UninstallDelete]
 ; Clean up app data on uninstall (optional — comment out to keep user settings)
