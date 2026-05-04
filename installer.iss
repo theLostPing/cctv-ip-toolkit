@@ -67,7 +67,11 @@ SolidCompression=yes
 ;   - RestartApplications=yes asks the OS to relaunch the app post-install.
 ;   - The [Run] section's launch (without skipifsilent) is the belt to that suspenders.
 CloseApplications=yes
-RestartApplications=yes
+; v4.4.6: was =yes — Restart Manager would auto-relaunch the closed app after
+; install. Setting to =no for the same reason [Run] auto-launch was dropped:
+; the relaunched exe could fire before file locks released on the freshly-
+; extracted PyInstaller temp dir. User opens from Start Menu after install.
+RestartApplications=no
 
 ; Output
 OutputDir=Output
@@ -90,24 +94,19 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; Auto-launch RE-ENABLED in v4.4.5 with a 3s delay launcher.
-; Background: v4.4.0 had a direct shellexec auto-launch that hit a PyInstaller
-; onefile DLL-load race (RestartManager replaces files → [Run] fires → new exe
-; tries to extract+load python312.dll from _MEI<random> before the OS releases
-; locks on the freshly-extracted temp dir). v4.4.4 dropped auto-launch entirely.
-; v4.4.5 fix: launch via cmd's `timeout` so the new process starts 3s after
-; Inno's file replacement settles, well past any AV/lock-release race.
+; Auto-launch DROPPED AGAIN in v4.4.6.
+; v4.4.5 added a 3s delay launcher (`cmd /c "timeout 3 && start <exe>"`) to dodge
+; the PyInstaller DLL-load race that bit v4.4.0. Real-world testing showed 3s
+; isn't always enough on slower disks / AV-active systems — the in-app update
+; download → install → relaunch still occasionally fired the new exe before
+; Windows fully released file locks on the freshly-extracted _MEI temp dir.
+; Reverted to v4.4.4 behavior: installer ends with the standard Setup Complete
+; page, user opens the toolkit from Start Menu / Desktop shortcut.
 ;
-; cmd parameters explained:
-;   /c                              run the command and exit
-;   timeout /t 3 /nobreak >nul      wait 3s, ignore keypress, swallow output
-;   && start "" "<exe>"             then ShellExecute the toolkit (empty title
-;                                   "" required because target path has spaces)
-; Inno flags:
-;   nowait        Setup doesn't block on cmd
-;   postinstall   shows as the "Launch CCTVIPToolkit" checkbox on the final page
-;   shellexec     route through ShellExecute → respects --uac-admin manifest
-Filename: "{cmd}"; Parameters: "/c timeout /t 3 /nobreak >nul && ""{app}\{#MyAppExeName}"""; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall shellexec
+; (No [Run] entries — intentional. Don't re-add without solving the race
+; deterministically — e.g. waiting on a process-handle from the running app
+; rather than a fixed sleep, or shipping a tiny stub launcher that polls the
+; install dir for stability before exec'ing the toolkit.)
 
 [UninstallDelete]
 ; Clean up app data on uninstall (optional — comment out to keep user settings)
