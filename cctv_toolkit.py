@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.4.4"
+APP_VERSION = "4.4.5"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -9593,7 +9593,7 @@ Email: axisprogrammer@thelostping.net
                                 progress_label.config(text=f"Downloading... {pct}% ({downloaded//1048576} / {total//1048576} MB)")
                                 w.update_idletasks()
                 progress_label.config(
-                    text="Launching installer...\nWhen install finishes, relaunch from your Start Menu shortcut.",
+                    text="Launching installer...\nThe new version will auto-launch ~3 seconds after install finishes.",
                     justify=tk.LEFT,
                 )
                 w.update_idletasks()
@@ -9640,6 +9640,14 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.4.5": (
+            "What's new in v4.4.5",
+            [
+                "• Installer now auto-launches the toolkit after install via a 3-second delay launcher (`cmd /c \"timeout 3 && start <exe>\"`). The delay lets Windows release file locks on the freshly-extracted PyInstaller temp dir, fixing the v4.4.0 'Failed to load Python DLL' race that forced auto-relaunch to be dropped in v4.4.4.",
+                "• In-app update flow now ends with the new version launching automatically — no manual click on the Start Menu shortcut after install.",
+                "• Standard Inno 'Launch CCTVIPToolkit' checkbox on the Setup Complete page is back, ticked by default.",
+            ],
+        ),
         "4.4.4": (
             "What's new in v4.4.4",
             [
