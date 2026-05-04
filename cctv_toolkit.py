@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.4.6"
+APP_VERSION = "4.4.7"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -340,6 +340,68 @@ def _unique_camera_subnets(cameras):
         seen.add(key)
         out.append({'gateway': gw, 'mask': mask, 'subnet_base': subnet_base})
     return out
+
+
+def _get_local_ipv4_prefixes():
+    """v4.4.7 — list of {ip, prefix_len, iface_index} for every UP IPv4 address
+    on the host. Used to decide whether the toolkit already has a route to a
+    candidate camera IP (and therefore doesn't need to alias)."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             "Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+             "Where-Object { $_.IPAddress -notlike '127.*' -and $_.AddressState -eq 'Preferred' } | "
+             "Select-Object IPAddress,PrefixLength,InterfaceIndex | ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+        if isinstance(data, dict):
+            data = [data]
+        out = []
+        for d in data:
+            ip = d.get('IPAddress')
+            if not ip:
+                continue
+            out.append({'ip': ip,
+                        'prefix_len': int(d.get('PrefixLength') or 0),
+                        'iface_index': int(d.get('InterfaceIndex') or 0)})
+        return out
+    except Exception:
+        return []
+
+
+def _ipv4_to_int(s):
+    try:
+        a, b, c, d = (int(x) for x in s.split('.'))
+        return (a << 24) | (b << 16) | (c << 8) | d
+    except Exception:
+        return None
+
+
+def _ip_in_same_subnet(target_ip, my_ip, prefix_len):
+    """True if target_ip is in the same /prefix_len subnet as my_ip."""
+    if not (1 <= prefix_len <= 32):
+        return False
+    ti = _ipv4_to_int(target_ip)
+    mi = _ipv4_to_int(my_ip)
+    if ti is None or mi is None:
+        return False
+    mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
+    return (ti & mask) == (mi & mask)
+
+
+def _have_route_to(target_ip):
+    """If any current local IPv4 covers target_ip's subnet, return that entry
+    dict ({ip, prefix_len, iface_index}). Else None."""
+    if not target_ip or '.' not in target_ip:
+        return None
+    for entry in _get_local_ipv4_prefixes():
+        if _ip_in_same_subnet(target_ip, entry['ip'], entry['prefix_len']):
+            return entry
+    return None
 
 
 def _save_multihome_state(entries):
@@ -7191,6 +7253,85 @@ class CCTVToolkitApp:
             self.log(f"Auto multi-home: {len(added)} address(es) added. Cleanup at wizard end.")
         return len(added)
 
+    def _ensure_route_to_camera(self, target_ip, ask_consent=True):
+        """v4.4.7 — When discovery surfaces a camera at an IP we have no path
+        to (typical case: the camera was previously programmed with a static
+        like 10.0.0.26 and is now plugged into our isolated programming NIC
+        on a different subnet), offer to add a same-subnet alias to the
+        chosen interface so the toolkit can reach the camera long enough to
+        factory-default and reprogram it.
+
+        Skips for link-local (169.254/16) — that path is handled by
+        add_linklocal_route(). Skips silently if the route already exists.
+        Adds added IPs to the same multihome_state.json that
+        _offer_multihome / _cleanup_multihome use, so teardown is automatic
+        at wizard end and crash-resilient.
+
+        Returns True if a route now exists, False if we have no route and
+        couldn't / weren't allowed to add one (caller should skip the
+        candidate camera)."""
+        if not target_ip or '.' not in target_ip:
+            return False
+        if target_ip.startswith('169.254.'):
+            return True  # add_linklocal_route handles this lane.
+        if _have_route_to(target_ip):
+            return True
+
+        iface_idx = self._get_interface_index() if hasattr(self, '_get_interface_index') else None
+        if not iface_idx:
+            self.log(f"  ⚠ Camera advertised at {target_ip} but no interface selected — can't add a route.")
+            return False
+        if not _is_admin_windows():
+            self.log(f"  ⚠ Camera advertised at {target_ip} on a subnet we have no route to. "
+                     f"Relaunch the toolkit as admin to auto-alias and reach it.")
+            return False
+
+        parts = target_ip.split('.')
+        if len(parts) != 4:
+            return False
+        subnet_base = '.'.join(parts[:3])
+        try:
+            target_last = int(parts[3])
+        except ValueError:
+            return False
+        candidates = tuple(n for n in (99, 98, 97, 250, 249, 200, 150, 100, 50)
+                           if n != target_last and n != 1)
+        chosen = _pick_free_host_ip(subnet_base, '255.255.255.0', candidates=candidates)
+        if not chosen:
+            self.log(f"  ⚠ No free host IP in {subnet_base}.x to alias for {target_ip}.")
+            return False
+
+        if ask_consent:
+            consent = [None]
+            def _ask():
+                consent[0] = messagebox.askyesno(
+                    "Add route to discovered camera?",
+                    f"Camera discovered at {target_ip}, but the selected adapter\n"
+                    f"has no IP on that subnet — there is no route to reach it.\n\n"
+                    f"Add a temporary alias  {chosen}/24  to interface {iface_idx}?\n\n"
+                    f"Cleanup runs automatically at wizard end.\n"
+                    f"(Requires admin — which the toolkit has.)",
+                    parent=self.root)
+            self.root.after(0, _ask)
+            while consent[0] is None and not getattr(self, 'cancel_flag', False):
+                time.sleep(0.05)
+            if not consent[0]:
+                self.log(f"  Operator declined alias for {target_ip} — skipping this candidate.")
+                return False
+
+        if _netsh_add_ip(iface_idx, chosen, '255.255.255.0'):
+            existing = _load_multihome_state() or []
+            existing.append({'iface_index': iface_idx, 'ip': chosen,
+                             'mask': '255.255.255.0', 'subnet_base': subnet_base,
+                             '_added_by': 'ensure_route_to_camera',
+                             '_for_target': target_ip})
+            _save_multihome_state(existing)
+            self.log(f"  ✓ Added {chosen}/24 to interface {iface_idx} so we can reach {target_ip}")
+            time.sleep(1.0)  # Let the OS wire up the address.
+            return True
+        self.log(f"  ✗ netsh add {chosen}/24 to interface {iface_idx} failed.")
+        return False
+
     def _cleanup_multihome(self):
         """Tear down whatever _offer_multihome added. Idempotent — safe to
         call even if no multi-home was set up. Removes the state file when
@@ -9640,6 +9781,14 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.4.7": (
+            "What's new in v4.4.7",
+            [
+                "• NEW: Auto-route to discovered cameras on unknown subnets. When mDNS surfaces a camera at a previously-configured static IP that's not on any of your NICs (e.g. camera advertises 10.0.0.26 but your programming NIC is on 192.168.0.0/24), the toolkit now offers — per-camera, with explicit consent — to add a temporary same-subnet alias so the wizard can actually talk to it. Closes the 'discovered but unreachable' gap that previously made the toolkit silently skip such cameras during the 'Waiting for camera...' loop.",
+                "• Aliases added this way are tracked in the same multihome_state.json as the existing Auto Multi-Home flow, so cleanup runs automatically at wizard end and crash-resilient cleanup happens on next launch.",
+                "• Requires admin (same as Auto Multi-Home). When not elevated, the toolkit logs a clear message instead of silently failing.",
+            ],
+        ),
         "4.4.6": (
             "What's new in v4.4.6",
             [
@@ -10210,8 +10359,11 @@ https://buymeacoffee.com/thelostping""")
                                     mc_mac = mc.get('mac', '').upper().replace(':', '').replace('-', '')
                                     if mc_mac and mc_mac in seen_macs:
                                         continue
-                                    if mc_ip.startswith('169.254.'):
-                                        self.add_linklocal_route()
+                                    if mc_ip:
+                                        if mc_ip.startswith('169.254.'):
+                                            self.add_linklocal_route()
+                                        elif not self._ensure_route_to_camera(mc_ip):
+                                            continue  # v4.4.7 — no route, operator declined or admin missing
                                     if mc_ip and self.ping_camera(mc_ip, timeout_ms=1000):
                                         camera_ip = mc_ip
                                         pinned_mac = mc.get('mac', '')
@@ -11015,8 +11167,11 @@ https://buymeacoffee.com/thelostping""")
                                     mc_mac = mc.get('mac', '').upper().replace(':', '').replace('-', '')
                                     if mc_mac and mc_mac in seen_macs:
                                         continue
-                                    if mc_ip.startswith('169.254.'):
-                                        self.add_linklocal_route()
+                                    if mc_ip:
+                                        if mc_ip.startswith('169.254.'):
+                                            self.add_linklocal_route()
+                                        elif not self._ensure_route_to_camera(mc_ip):
+                                            continue  # v4.4.7 — no route, operator declined or admin missing
                                     if mc_ip and self.ping_camera(mc_ip, timeout_ms=1000):
                                         camera_ip = mc_ip
                                         pinned_mac = mc.get('mac', '')
