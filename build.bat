@@ -132,7 +132,7 @@ python -m PyInstaller --onefile --windowed ^
 echo.
 echo ========================================
 if exist "dist\CCTVIPToolkit.exe" (
-    echo BUILD SUCCESSFUL!
+    echo PYINSTALLER BUILD SUCCESSFUL!
     echo.
     REM Clean up build artifacts
     if exist "build" rmdir /s /q build 2>nul
@@ -147,11 +147,58 @@ if exist "dist\CCTVIPToolkit.exe" (
         set /a "SIZE_MB=!SIZE! / 1048576"
         echo   File: dist\CCTVIPToolkit.exe [!SIZE_MB! MB]
     )
+
+    REM ============================================================
+    REM Step 5: Build Inno Setup installer
+    REM ============================================================
     echo.
-    echo To distribute, just share:
-    echo   dist\CCTVIPToolkit.exe
+    echo [5/5] Building installer...
+
+    REM Pull APP_VERSION from cctv_toolkit.py so installer + .exe stay in sync
+    call :read_version
+    if "!APP_VER!"=="" (
+        echo   WARN: could not read APP_VERSION from cctv_toolkit.py — defaulting to 0.0.0
+        set "APP_VER=0.0.0"
+    )
+    echo   Version: !APP_VER!
+
+    REM Pre-compute Inno Setup candidate paths OUTSIDE this block —
+    REM literal "(x86)" in %ProgramFiles(x86)% breaks the cmd parser's paren matching
+    REM when expanded inside an if-block.
+    call :find_iscc
+    if "!ISCC!"=="" (
+        echo   Inno Setup 6 not installed — installing via winget...
+        winget install --id JRSoftware.InnoSetup --accept-package-agreements --accept-source-agreements --silent
+        call :find_iscc
+    )
+
+    if "!ISCC!"=="" (
+        echo   ERROR: ISCC.exe not found after install attempt — installer skipped.
+        echo   Install Inno Setup 6 manually from https://jrsoftware.org/isinfo.php
+    ) else (
+        echo   Compiler: !ISCC!
+        if exist "Output" rmdir /s /q "Output" 2>nul
+        "!ISCC!" /Q /DMyAppVersion=!APP_VER! installer.iss
+        if exist "Output\CCTVIPToolkit-Setup-v!APP_VER!.exe" (
+            move /Y "Output\CCTVIPToolkit-Setup-v!APP_VER!.exe" "dist\" >nul
+            rmdir /s /q "Output" 2>nul
+            for %%A in ("dist\CCTVIPToolkit-Setup-v!APP_VER!.exe") do (
+                set "ISIZE=%%~zA"
+                set /a "ISIZE_MB=!ISIZE! / 1048576"
+                echo   File: dist\CCTVIPToolkit-Setup-v!APP_VER!.exe [!ISIZE_MB! MB]
+            )
+        ) else (
+            echo   ERROR: Inno Setup compile failed — see output above.
+        )
+    )
+
     echo.
-    echo No Python or dependencies needed to RUN the exe.
+    echo ========================================
+    echo BUILD COMPLETE
+    echo.
+    echo Distribute either or both:
+    echo   dist\CCTVIPToolkit.exe                       ^(bare exe, runs from anywhere^)
+    echo   dist\CCTVIPToolkit-Setup-v!APP_VER!.exe   ^(installer w/ Start Menu + uninstall^)
     echo ========================================
 ) else (
     echo BUILD FAILED
@@ -164,3 +211,37 @@ if exist "dist\CCTVIPToolkit.exe" (
 )
 echo.
 pause
+goto :eof
+
+REM ============================================================
+REM :find_iscc — sets ISCC to the first existing Inno Setup compiler path.
+REM Defined as a callable label so the literal "(x86)" in the path
+REM doesn't poison the cmd parenthesis parser inside if-blocks.
+REM ============================================================
+:find_iscc
+set "ISCC="
+set "_P1=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
+set "_P2=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+set "_P3=%ProgramFiles%\Inno Setup 6\ISCC.exe"
+if exist "%_P1%" set "ISCC=%_P1%"
+if "%ISCC%"=="" if exist "%_P2%" set "ISCC=%_P2%"
+if "%ISCC%"=="" if exist "%_P3%" set "ISCC=%_P3%"
+goto :eof
+
+REM ============================================================
+REM :read_version — sets APP_VER from APP_VERSION = "X.Y.Z" line in cctv_toolkit.py
+REM Same isolation reason: complex quoting outside if-block.
+REM ============================================================
+:read_version
+set "APP_VER="
+for /f "tokens=2 delims==" %%V in ('findstr /B /C:"APP_VERSION" cctv_toolkit.py') do (
+    set "RAW=%%V"
+    REM Strip leading space and surrounding quotes
+    set "RAW=!RAW: =!"
+    set "RAW=!RAW:"=!"
+    set "RAW=!RAW:'=!"
+    set "APP_VER=!RAW!"
+    goto :read_version_done
+)
+:read_version_done
+goto :eof
