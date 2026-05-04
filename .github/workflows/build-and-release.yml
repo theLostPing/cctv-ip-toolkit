@@ -1,0 +1,126 @@
+name: Build & Release
+
+# Three trigger modes:
+#   1. Tag push v*.*.*       -> full stable release, all 3 assets, NOT prerelease
+#   2. Branch push beta/*    -> prerelease, same artifacts, version suffixed with -beta.<short_sha>
+#   3. workflow_dispatch     -> manual ad-hoc build, artifacts uploaded but NO release created
+#
+# Build runs on windows-latest because PyInstaller produces a Windows EXE
+# and Inno Setup is Windows-only. Build time ~5-8 min cold, ~3-4 min cached.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+    branches:
+      - 'beta/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create releases + upload assets
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Inno Setup
+        # windows-latest ships with chocolatey pre-installed
+        run: choco install innosetup --no-progress -y
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pillow openpyxl pyinstaller==6.18.0
+
+      - name: Read APP_VERSION from cctv_toolkit.py
+        id: vers
+        shell: pwsh
+        run: |
+          $line = Select-String -Path cctv_toolkit.py -Pattern '^APP_VERSION\s*=' | Select-Object -First 1
+          $base = ($line.Line -replace '.*=\s*[''"]([^''"]+).*', '$1')
+          Write-Host "Base version: $base"
+
+          # Beta suffix when triggered by a beta/* branch push
+          if ($env:GITHUB_REF -like 'refs/heads/beta/*') {
+            $sha = $env:GITHUB_SHA.Substring(0, 7)
+            $version = "$base-beta.$sha"
+            $isPrerelease = 'true'
+          } elseif ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $version = $base
+            $isPrerelease = 'false'
+          } else {
+            # workflow_dispatch — use base + run id, won't release
+            $version = "$base-dev.$($env:GITHUB_RUN_NUMBER)"
+            $isPrerelease = 'true'
+          }
+
+          Write-Host "Resolved version: $version (prerelease=$isPrerelease)"
+          "version=$version"          | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "base=$base"                 | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_prerelease=$isPrerelease"| Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build PyInstaller exe
+        run: |
+          python -m PyInstaller --onefile --windowed --name "CCTVIPToolkit" --uac-admin --icon=app.ico --add-data "app.ico;." --clean cctv_toolkit.py
+          if (-not (Test-Path "dist\CCTVIPToolkit.exe")) { throw "PyInstaller didn't produce dist\CCTVIPToolkit.exe" }
+        shell: pwsh
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe not found after choco install — check the choco step"
+          }
+          # Use the resolved version (may include -beta.SHA suffix)
+          & $iscc "/Q" "/DMyAppVersion=${{ steps.vers.outputs.version }}" installer.iss
+          $installer = "Output\CCTVIPToolkit-Setup-v${{ steps.vers.outputs.version }}.exe"
+          if (-not (Test-Path $installer)) { throw "ISCC didn't produce $installer" }
+          Move-Item -Force $installer "dist\"
+
+      - name: Build source zip
+        shell: pwsh
+        run: |
+          $zip = "dist\cctv-ip-toolkit-source-v${{ steps.vers.outputs.version }}.zip"
+          Compress-Archive -Force -Path cctv_toolkit.py,build.bat,installer.iss,app.ico,README.md,.github -DestinationPath $zip
+
+      - name: List dist
+        shell: pwsh
+        run: Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Upload artifacts (always — useful for workflow_dispatch + debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CCTVIPToolkit-v${{ steps.vers.outputs.version }}
+          path: |
+            dist/CCTVIPToolkit.exe
+            dist/CCTVIPToolkit-Setup-v${{ steps.vers.outputs.version }}.exe
+            dist/cctv-ip-toolkit-source-v${{ steps.vers.outputs.version }}.zip
+          retention-days: 30
+
+      # Create release on tag push OR beta branch push (NOT on workflow_dispatch)
+      - name: Create GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('beta-{0}', steps.vers.outputs.version) }}
+          name: ${{ github.ref_type == 'tag' && format('v{0}', steps.vers.outputs.base) || format('Beta v{0}', steps.vers.outputs.version) }}
+          prerelease: ${{ steps.vers.outputs.is_prerelease == 'true' }}
+          generate_release_notes: ${{ github.ref_type == 'tag' }}
+          files: |
+            dist/CCTVIPToolkit.exe
+            dist/CCTVIPToolkit-Setup-v${{ steps.vers.outputs.version }}.exe
+            dist/cctv-ip-toolkit-source-v${{ steps.vers.outputs.version }}.zip
