@@ -10948,6 +10948,10 @@ https://buymeacoffee.com/thelostping""")
                     last_announced_remaining_count = len(remaining)
 
                 # Wait for a camera based on discovery mode
+                # v4.4.8-beta9 — heartbeat so the operator sees the loop is alive,
+                # not silent-frozen, while Phase 1a/1b/2 cycle through with no hits.
+                _wait_start = time.time()
+                _last_heartbeat = _wait_start
                 while not self.cancel_flag:
                     # Try factory default IP if enabled (fast 1s ping — local LAN)
                     if discovery_mode in ('factory', 'both'):
@@ -11038,7 +11042,20 @@ https://buymeacoffee.com/thelostping""")
                                 pass
 
                     time.sleep(1)
-                    
+                    # v4.4.8-beta9 — emit heartbeat every 15s so silent-loop
+                    # doesn't look frozen. Lists what's been tried and how long
+                    # we've been waiting.
+                    _now = time.time()
+                    if _now - _last_heartbeat >= 15:
+                        _elapsed = int(_now - _wait_start)
+                        _modes = []
+                        if discovery_mode in ('factory', 'both'):
+                            _modes.append(f"factory IP {factory_ip}")
+                        if discovery_mode in ('mdns', 'both'):
+                            _modes.append("DHCP snoop + mDNS (link-local)")
+                        self.log(f"  ...still searching for {next_name if 'next_name' in dir() else 'camera'} ({_elapsed}s) — checking: {', '.join(_modes)}. Plug in / reboot to trigger fresh DHCP DISCOVER.")
+                        _last_heartbeat = _now
+
                 if self.cancel_flag:
                     break
 
@@ -11762,6 +11779,9 @@ https://buymeacoffee.com/thelostping""")
                     _ui(self.status_set_step, 'discover', 'active')
 
                 # ---- Discovery phase ----
+                # v4.4.8-beta9 — heartbeat so the operator sees the loop is alive.
+                _wait_start = time.time()
+                _last_heartbeat = _wait_start
                 while not self.cancel_flag:
                     # Bundled DHCP path: when the server is on, the camera
                     # picks up our lease almost immediately on power-up.
@@ -11857,6 +11877,20 @@ https://buymeacoffee.com/thelostping""")
                                 pass
 
                     time.sleep(1)
+                    # v4.4.8-beta9 — heartbeat (status_log so it shows in the
+                    # step-by-step UI's log pane).
+                    _now = time.time()
+                    if _now - _last_heartbeat >= 15:
+                        _elapsed = int(_now - _wait_start)
+                        _modes = []
+                        if self._bundled_dhcp and dhcp_lease_ip:
+                            _modes.append(f"bundled DHCP lease {dhcp_lease_ip}")
+                        if discovery_mode in ('factory', 'both'):
+                            _modes.append(f"factory IP {factory_ip}")
+                        if discovery_mode in ('mdns', 'both'):
+                            _modes.append("DHCP snoop + mDNS (link-local)")
+                        self.status_log(f"  ...still searching for {next_name} ({_elapsed}s) — checking: {', '.join(_modes)}. Plug in / reboot to trigger fresh DHCP DISCOVER.")
+                        _last_heartbeat = _now
 
                 if self.cancel_flag:
                     break
