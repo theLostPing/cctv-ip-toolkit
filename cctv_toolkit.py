@@ -1770,6 +1770,46 @@ class AxisProtocol(CameraProtocol):
 
         _diag(f"target ip={new_ip}/{cidr} gw={gateway} via current_ip={ip} as user=root")
 
+        # v4.5.1-beta2 — settling delay. P3267-LV / FW 10.12.240 returns 503
+        # with empty body and ONVIF ReadTimeout for ~5s after fresh user
+        # creation. Brian 2026-05-05 KBO-012: 1s between admin user created
+        # and set_network → 503 storm. Give the camera time to flush its
+        # config service before hammering it with network changes.
+        time.sleep(5)
+
+        # v4.5.1-beta2 — retry helper. Transient 503 / ReadTimeout /
+        # ConnectionError on the network-config endpoints means the camera
+        # is busy, not broken. Three attempts with 4s back-off. Returns the
+        # last response object (or None on total exception). Distinct from
+        # the raw try-blocks below because each leg needs its own diag log.
+        def _retry(method, url, *, attempts=3, delay=4, **kwargs):
+            last_exc = None
+            last_resp = None
+            for i in range(attempts):
+                try:
+                    r = method(url, **kwargs)
+                    last_resp = r
+                    # 503 + empty body = camera busy. Retry.
+                    if r.status_code == 503 and not (r.text or '').strip():
+                        if i + 1 < attempts:
+                            _diag(f"  503-busy on attempt {i+1}/{attempts}; retrying in {delay}s")
+                            time.sleep(delay)
+                            continue
+                    return r
+                except (requests.exceptions.ReadTimeout,
+                        requests.exceptions.ConnectionError) as e:
+                    last_exc = e
+                    if i + 1 < attempts:
+                        _diag(f"  {type(e).__name__} on attempt {i+1}/{attempts}; retrying in {delay}s")
+                        time.sleep(delay)
+                        continue
+                    raise
+            if last_resp is not None:
+                return last_resp
+            if last_exc:
+                raise last_exc
+            return None
+
         # --- ONVIF path ---
         onvif_ok = False
         # Gateway has to go in its own SOAP call. Tried merging it into the
@@ -1781,9 +1821,10 @@ class AxisProtocol(CameraProtocol):
                    f'<IPv4Address>{gateway}</IPv4Address>'
                    f'</SetNetworkDefaultGateway></Body></Envelope>')
         try:
-            r_gw = requests.post(f"http://{ip}/vapix/services", data=gw_soap,
+            r_gw = _retry(requests.post,
+                f"http://{ip}/vapix/services", data=gw_soap,
                 headers={"Content-Type": "application/soap+xml"},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=15)  # bumped from TIMEOUT (5s) — SetNetworkDefaultGateway can sit on the camera 5-10s before responding
             snippet = (r_gw.text or '')[:240].replace('\n', ' ').replace('\r', '')
             _diag(f"ONVIF SetNetworkDefaultGateway → status={r_gw.status_code} body[:240]={snippet}")
         except Exception as e:
@@ -1805,9 +1846,10 @@ class AxisProtocol(CameraProtocol):
                    f'<tt:DHCP>false</tt:DHCP></tt:IPv4></tds:NetworkInterface>'
                    f'</tds:SetNetworkInterfaces></Body></Envelope>')
         try:
-            r = requests.post(f"http://{ip}/vapix/services", data=ip_soap,
+            r = _retry(requests.post,
+                f"http://{ip}/vapix/services", data=ip_soap,
                 headers={"Content-Type": "application/soap+xml"},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=15)  # SetNetworkInterfaces is the slow one
             snippet = (r.text or '')[:240].replace('\n', ' ').replace('\r', '')
             has_fault = 'Fault' in (r.text or '')
             _diag(f"ONVIF SetNetworkInterfaces → status={r.status_code} fault_in_body={has_fault} body[:240]={snippet}")
@@ -1831,25 +1873,26 @@ class AxisProtocol(CameraProtocol):
         # subnet, IP last — that order has been bulletproof since at least
         # the M-series firmware in 2012.
         try:
-            r1 = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+            r1 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.IPv4.DHCP": "no"},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=10)
             _diag(f"VAPIX DHCP=no → status={r1.status_code} body[:160]={(r1.text or '')[:160]!r}")
-            r2 = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+            r2 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.DefaultRouter": gateway},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=10)
             _diag(f"VAPIX DefaultRouter={gateway} → status={r2.status_code} body[:160]={(r2.text or '')[:160]!r}")
-            r3 = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+            r3 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.SubnetMask": subnet},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=10)
             _diag(f"VAPIX SubnetMask={subnet} → status={r3.status_code} body[:160]={(r3.text or '')[:160]!r}")
             # Setting IPAddress is the call that yanks the rug — the response
             # may never come back because the kernel has switched interfaces
             # by the time it tries to ack. Hence the ConnectionError below
-            # being treated as success.
+            # being treated as success. Don't retry this one — connection drop
+            # IS the success signal.
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.IPAddress": new_ip},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=10)
             _diag(f"VAPIX IPAddress={new_ip} → status={r.status_code} body[:160]={(r.text or '')[:160]!r}")
             ok = r.status_code == 200
             _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200)'}")
@@ -7219,25 +7262,27 @@ class CCTVToolkitApp:
         frame.pack(fill=tk.BOTH, expand=True)
 
         # ---- Big banner ----
-        self._status_banner_frame = tk.Frame(frame, bg='#9E9E9E', padx=20, pady=18)
+        # v4.5.1-beta2: bumped fonts so the wizard banner is legible
+        # from across the room. Brian's training-room ask 2026-05-05.
+        self._status_banner_frame = tk.Frame(frame, bg='#9E9E9E', padx=20, pady=22)
         self._status_banner_frame.pack(fill=tk.X)
         self._status_banner_label = tk.Label(self._status_banner_frame,
             text="READY", bg='#9E9E9E', fg='white',
-            font=('Helvetica', 28, 'bold'))
+            font=('Helvetica', 42, 'bold'))
         self._status_banner_label.pack()
         self._status_banner_sub = tk.Label(self._status_banner_frame,
             text="Start a programming run from the Operations tab.",
-            bg='#9E9E9E', fg='white', font=('Helvetica', 11))
-        self._status_banner_sub.pack(pady=(4, 0))
+            bg='#9E9E9E', fg='white', font=('Helvetica', 18, 'bold'))
+        self._status_banner_sub.pack(pady=(6, 0))
 
         # ---- Camera + progress row ----
         info_row = ttk.Frame(frame)
-        info_row.pack(fill=tk.X, pady=(15, 5))
+        info_row.pack(fill=tk.X, pady=(18, 5))
         self._status_camera_label = ttk.Label(info_row,
-            text="—", font=('Helvetica', 14, 'bold'))
+            text="—", font=('Helvetica', 24, 'bold'))
         self._status_camera_label.pack(side=tk.LEFT)
         self._status_progress_label = ttk.Label(info_row,
-            text="", font=('Helvetica', 11), foreground='#555')
+            text="", font=('Helvetica', 14), foreground='#555')
         self._status_progress_label.pack(side=tk.RIGHT)
 
         # ---- Two columns: checklist on left, preview on right ----
@@ -7307,8 +7352,19 @@ class CCTVToolkitApp:
     # ---------- Status view API (called from worker thread via root.after) ----
     def status_set_banner(self, text, subtitle='', color='#9E9E9E'):
         self._status_banner_frame.config(bg=color)
-        self._status_banner_label.config(text=text, bg=color)
-        self._status_banner_sub.config(text=subtitle, bg=color)
+        self._status_banner_label.config(text=text, bg=color,
+            font=('Helvetica', 42, 'bold'))
+        self._status_banner_sub.config(text=subtitle, bg=color,
+            font=('Helvetica', 18, 'bold'))
+
+    def status_set_banner_big(self, text, subtitle='', color='#4CAF50'):
+        """v4.5.1-beta2: extra-large, room-visible success callout. Used
+        for per-camera DONE so it survives a tech glancing away."""
+        self._status_banner_frame.config(bg=color)
+        self._status_banner_label.config(text=text, bg=color,
+            font=('Helvetica', 60, 'bold'))
+        self._status_banner_sub.config(text=subtitle, bg=color,
+            font=('Helvetica', 22, 'bold'))
 
     def status_set_camera(self, name='—', detail=''):
         self._status_camera_label.config(text=name)
@@ -10583,6 +10639,9 @@ Email: axisprogrammer@thelostping.net
         "4.5.1": (
             "What's new in v4.5.1",
             [
+                "• HOTFIX (beta2): set_network 503 storm on FW 10.12.240. KBO-012 / KBW-014 hit 'Setting gateway + IP' immediately after fresh user creation — camera answered ONVIF with ReadTimeout for 5s then VAPIX with HTTP 503 (empty body). Camera was busy flushing config service and we hammered it 1s after the last user write. Fix: 5s settling sleep before set_network + retry helper (3 attempts, 4s back-off) on transient 503 / ReadTimeout / ConnectionError + bumped per-call timeouts (5s → 15s for ONVIF, 10s for VAPIX param.cgi).",
+                "• Programming screen — bigger fonts: banner text 28→42pt, subtitle 11→18pt bold, camera name 14→24pt bold, progress 11→14pt. Legible from across a training-room.",
+                "• Per-camera SUCCESS callout: 60pt green '✓ <name> DONE' banner with 22pt subtitle, held 5s before transitioning to 'PLUG IN CAMERA' for the next slot. A tech glancing away no longer returns to a screen that only says 'waiting for camera' with no signal that the previous one finished.",
                 "• HOTFIX: Field bug from a live job 2026-05-05 — wizard declared a P3267-LV (FW 10.12.240) 'already factory-clean' and skipped reset, then the next step (Creating system user) 401-ed because the camera DID have root with an unknown password. Old detection trusted a 401 from restart.cgi+existing_pwd as proof of factory state; that's ambiguous (also fires when root exists but our existing_pwd is wrong).",
                 "• FIX 1 — Tightened factory-state detection. The factory_first probe now requires a POSITIVE factory signal (no-auth pwdgrp.cgi action=list returning 200) before declaring 'skip reset.' Wrong-pwd-on-configured-camera no longer false-positives. Truly factory cams on FW 11+ pass; FW 10.x factory cams fall through to the reset path, which still works.",
                 "• FIX 2 — 3rd-tier change-password fallback in Axis create_initial_user. After the open-call → Digest-with-new-pwd cascade, if both 401 AND the operator gave us existing_pwd, the toolkit now tries pwdgrp.cgi action=update with old creds (changes root's pwd to the new one without a factory reset). 'Camera already programmed with the password I told you' is now a no-touch swap.",
@@ -12841,8 +12900,15 @@ https://buymeacoffee.com/thelostping""")
                     self.camera_data.mark_processed(idx)
                     total_ok += 1
                     self.status_log(f"\n*** {cam_name} COMPLETE ***")
-                    _ui(self.status_set_banner, f'DONE  ({total_ok} OK / {total_fail} fail)',
-                        f"{cam_name} complete — plug in next camera", '#4CAF50')
+                    # v4.5.1-beta2: extra-large + long-hold success callout —
+                    # Brian asked for bigger/longer 'success' so a tech who
+                    # looks away during programming doesn't return to find
+                    # only "PLUG IN CAMERA" with no signal that the previous
+                    # one finished. 60pt + 5s hold per ask.
+                    _ui(self.status_set_banner_big,
+                        f'✓  {cam_name}  DONE',
+                        f'  ({total_ok} OK / {total_fail} fail) — plug in next camera  ',
+                        '#4CAF50')
 
                 remaining.pop(cam_idx)
 
@@ -12850,7 +12916,7 @@ https://buymeacoffee.com/thelostping""")
                     # No continue dialog — banner tells the user what to do
                     _ui(self.status_set_camera, '—',
                         f'{programmed_count} of {len(cameras)} done · {len(remaining)} remaining')
-                    time.sleep(2)  # brief pause so user can see "DONE" before "PLUG IN"
+                    time.sleep(5)  # v4.5.1-beta2: 2s → 5s so the success callout actually lingers
 
                     # 2026-04-30 hot fix: wait for the just-programmed camera to leave
                     # factory IP before entering next discovery. Without this guard, if
