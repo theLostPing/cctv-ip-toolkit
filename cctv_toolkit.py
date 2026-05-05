@@ -7399,8 +7399,8 @@ class CCTVToolkitApp:
 
         win = tk.Toplevel(self.root)
         win.title("Find Camera Anywhere")
-        win.geometry("760x540")
         win.transient(self.root)
+        _center_on_parent(win, self.root, 760, 540)
 
         intro = ("Sweep common deployment subnets for Axis cameras. Each /24 is "
                  "temporarily aliased on the selected NIC, ARP-probed via TCP, "
