@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.5.0"
+APP_VERSION = "4.5.1"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -1450,8 +1450,10 @@ class CameraProtocol(ABC):
     MAC_OUIS = []
 
     @abstractmethod
-    def create_initial_user(self, ip, password):
-        """Set password on a factory-default camera. Returns True/False."""
+    def create_initial_user(self, ip, password, existing_pwd=None):
+        """Set password on a factory-default camera. Returns True/False.
+        existing_pwd is an optional fallback for protocols that can change
+        an existing root user's password when bootstrap fails (Axis v4.5.1)."""
 
     @abstractmethod
     def set_network(self, ip, password, new_ip, subnet, gateway):
@@ -1546,14 +1548,16 @@ class AxisProtocol(CameraProtocol):
     # newer ARTPEC chips (M30/M32 series and up); 00:40:8c is older P-series.
     MAC_OUIS = [b'\x00\x40\x8c', b'\xac\xcc\x8e', b'\xb8\xa4\x4f']
 
-    def create_initial_user(self, ip, password):
+    def create_initial_user(self, ip, password, existing_pwd=None):
         # FW 11+: factory cams accept pwdgrp.cgi with NO auth — the first call
         #         creates root and locks the camera down.
         # FW 10.x and earlier: pwdgrp.cgi ALWAYS requires auth, even on a
         #         factory camera. The camera creates root from the auth header
         #         on the very first request. So we try open first, and on 401
         #         retry with HTTP Digest using root:<the password we're setting>.
-        # b9 captured the FW-10.x 401 → b10 handles it.
+        # v4.5.1: 3rd tier — if we still 401 and the operator gave us
+        #         existing_pwd, the camera has root with that pwd; use action=
+        #         update to change it to the new pwd.
         self._last_create_user_error = None
         params = {"action": "add", "user": "root", "pwd": password,
                   "grp": "root", "sgrp": "admin:operator:viewer:ptz"}
@@ -1566,6 +1570,20 @@ class AxisProtocol(CameraProtocol):
                 r = requests.get(url, params=params,
                                  auth=HTTPDigestAuth("root", password),
                                  timeout=TIMEOUT)
+            if r.status_code == 401 and existing_pwd:
+                # 3rd tier — root already exists with existing_pwd; switch the
+                # call to action=update and re-aim with old creds. Net effect:
+                # change root's password to the new one, no factory reset.
+                upd = {"action": "update", "user": "root", "pwd": password}
+                r = requests.get(url, params=upd,
+                                 auth=HTTPDigestAuth("root", existing_pwd),
+                                 timeout=TIMEOUT)
+                if r.status_code == 200:
+                    body_text = (r.text or '').strip().lower()
+                    if not (body_text.startswith('error') or 'error:' in body_text[:60]):
+                        # password updated. Skip ONVIF-CreateUsers below — root
+                        # already exists in ONVIF too, just trust new pwd.
+                        return True
             if r.status_code != 200:
                 body = (r.text or '')[:300].replace('\n', ' | ').replace('\r', '')
                 self._last_create_user_error = (
@@ -2203,10 +2221,13 @@ class AxisProtocol(CameraProtocol):
         gateway = cam['gateway']
         subnet = cam['subnet']
         set_hostname = options.get('set_hostname', False) if options else False
+        # v4.5.1: forward existing_root_pwd into create_initial_user so the
+        # 3rd-tier change-password fallback can fire if open + new-pwd both 401.
+        existing_root_pwd = options.get('existing_root_pwd') if options else None
 
         steps = [
             ("Creating system user + ONVIF user",
-             lambda: self.create_initial_user(ip, password)),
+             lambda: self.create_initial_user(ip, password, existing_pwd=existing_root_pwd)),
             ("Setting gateway + IP + disabling DHCP",
              lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
         ]
@@ -2281,7 +2302,8 @@ class BoschProtocol(CameraProtocol):
                                     # networks — fun for tech support calls
     MAC_OUIS = [b'\x00\x07\x5f']    # Robert Bosch GmbH OUI; basically all their cams
 
-    def create_initial_user(self, ip, password):
+    def create_initial_user(self, ip, password, existing_pwd=None):
+        # Bosch ignores existing_pwd — RCP+ writes blast through regardless.
         # Change all three password tiers in one shot. Walking high->low so if
         # the service write fails (the only one that's REALLY bad), we bail
         # before partially-resetting the lower-priv ones. Return False only on
@@ -2548,7 +2570,7 @@ class HanwhaProtocol(CameraProtocol):
             kwargs['data'] = data
         return requests.post(f"http://{ip}{path}", **kwargs)
 
-    def create_initial_user(self, ip, password):
+    def create_initial_user(self, ip, password, existing_pwd=None):
         # Hanwha factory cameras don't have a default password — they REQUIRE
         # you to set one before anything else works (similar to Axis 7.10+).
         # Password rules are 8-15 chars and 3+ character types (upper/lower/
@@ -10558,6 +10580,16 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.5.1": (
+            "What's new in v4.5.1",
+            [
+                "• HOTFIX: Field bug from a live job 2026-05-05 — wizard declared a P3267-LV (FW 10.12.240) 'already factory-clean' and skipped reset, then the next step (Creating system user) 401-ed because the camera DID have root with an unknown password. Old detection trusted a 401 from restart.cgi+existing_pwd as proof of factory state; that's ambiguous (also fires when root exists but our existing_pwd is wrong).",
+                "• FIX 1 — Tightened factory-state detection. The factory_first probe now requires a POSITIVE factory signal (no-auth pwdgrp.cgi action=list returning 200) before declaring 'skip reset.' Wrong-pwd-on-configured-camera no longer false-positives. Truly factory cams on FW 11+ pass; FW 10.x factory cams fall through to the reset path, which still works.",
+                "• FIX 2 — 3rd-tier change-password fallback in Axis create_initial_user. After the open-call → Digest-with-new-pwd cascade, if both 401 AND the operator gave us existing_pwd, the toolkit now tries pwdgrp.cgi action=update with old creds (changes root's pwd to the new one without a factory reset). 'Camera already programmed with the password I told you' is now a no-touch swap.",
+                "• FIX 3 — Bootstrap-401 auto-rescue. When the user-creation step still fails 401 inside the auth phase (false-positive detection that escaped fix 1, OR detection found factory but bootstrap can't proceed), the wizard automatically attempts factory_reset(existing_pwd), waits up to 120s for the camera to return on its old IP or 192.168.0.90, and retries the user step against the freshly-clean camera. One shot, no operator intervention.",
+                "• Net effect: 'find any camera, anywhere, I give you the password, you make it bow to your will.' The intended v4.5 behavior — the false-positive trap was the last gap.",
+            ],
+        ),
         "4.5.0": (
             "What's new in v4.5.0",
             [
@@ -12117,29 +12149,52 @@ https://buymeacoffee.com/thelostping""")
                 existing_pwd = opts.get('existing_root_pwd') or ''
                 if factory_first and existing_pwd and hasattr(self.protocol, 'factory_reset'):
                     # Skip the reset if the camera is ALREADY factory-clean.
-                    # Detection: no-auth probe succeeds AND old root password
-                    # gets a 401 on an authed endpoint. (Brian's 2026-05-03
-                    # test: a freshly-reset cam triggered factory_first and
-                    # bailed because the existing password was now invalid.)
+                    # v4.5.1 fix: the old detection trusted a 401 from
+                    # restart.cgi+existing_pwd as proof of "no users yet."
+                    # That's ambiguous — a 401 also fires when root EXISTS
+                    # but our existing_pwd is wrong, leading to a false
+                    # positive that broke create_initial_user (also 401)
+                    # and bailed the slot mid-job (P3267-LV / FW 10.12.240,
+                    # 2026-05-05).
+                    # New detection requires a POSITIVE factory signal:
+                    # either (a) the existing_pwd actually authenticates
+                    # successfully (camera is not factory but creds work,
+                    # we'll change_password later) — bail this branch and
+                    # let the reset path or the auth-fallback handle it; OR
+                    # (b) the camera responds 200 to an unauthenticated
+                    # bootstrap probe that ONLY a true factory cam answers.
                     already_factory = False
                     try:
                         if hasattr(self.protocol, 'is_factory_state'):
                             already_factory = bool(self.protocol.is_factory_state(camera_ip, existing_pwd))
                         elif hasattr(self.protocol, 'BRAND_KEY') and self.protocol.BRAND_KEY == 'axis':
-                            # Inline Axis check: getAllUnrestrictedProperties is
-                            # no-auth on factory cams. Then prove the old root
-                            # password is INVALID by hitting an authed endpoint.
+                            # Probe 1: no-auth basicdeviceinfo (proves L7 alive).
                             r1 = requests.post(
                                 f"http://{camera_ip}/axis-cgi/basicdeviceinfo.cgi",
                                 json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
                                 timeout=4)
                             if r1.status_code == 200:
-                                r2 = requests.get(
-                                    f"http://{camera_ip}/axis-cgi/admin/restart.cgi",
-                                    auth=requests.auth.HTTPBasicAuth('root', existing_pwd),
-                                    timeout=4)
-                                if r2.status_code == 401:
-                                    already_factory = True
+                                # Probe 2: positive factory signal — pwdgrp.cgi
+                                # action=list with NO auth. On FW 11+ factory
+                                # cams this responds 200 (no users to list yet).
+                                # On any configured cam: 401. Distinguishes
+                                # truly clean from "wrong-pwd-on-configured."
+                                # FW 10.x factory cams 401 here too — they
+                                # require auth even on the bootstrap call —
+                                # but that's fine: we'll fall through to the
+                                # reset path, which will succeed if existing_pwd
+                                # works, and otherwise the new bootstrap
+                                # auth-fallback in create_initial_user picks it
+                                # up downstream.
+                                try:
+                                    r2 = requests.get(
+                                        f"http://{camera_ip}/axis-cgi/pwdgrp.cgi",
+                                        params={"action": "list"},
+                                        timeout=4)
+                                    if r2.status_code == 200:
+                                        already_factory = True
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     if already_factory:
@@ -12415,7 +12470,9 @@ https://buymeacoffee.com/thelostping""")
 
                 # ---- Build steps and split ----
                 cam['_program_ip'] = camera_ip
-                steps = self.protocol.get_programming_steps(cam, password)
+                # v4.5.1: forward opts so create_initial_user gets existing_root_pwd
+                # for the change-password fallback tier.
+                steps = self.protocol.get_programming_steps(cam, password, options=opts)
                 network_keywords = ('gateway', 'network', 'ip', 'dhcp')
                 auth_steps = []
                 network_steps = []
@@ -12440,6 +12497,91 @@ https://buymeacoffee.com/thelostping""")
                     if step_fn():
                         self.status_log("    ✓ Done.")
                     else:
+                        # v4.5.1 rescue: if the failing step is create_initial_user
+                        # AND factory_first gave us existing_pwd, the detection
+                        # was a false positive — camera has root with some pwd
+                        # we don't know, but maybe existing_pwd works against
+                        # factory_reset itself. Try the reset, wait for the
+                        # camera back, retry the step. ONE SHOT only — if reset
+                        # fails too, fall through to the normal failure path.
+                        is_user_step = ('user' in desc.lower())
+                        rescue_pwd = (opts.get('existing_root_pwd') or '') if is_user_step else ''
+                        rescued = False
+                        if (is_user_step and rescue_pwd
+                                and hasattr(self.protocol, 'factory_reset')):
+                            self.status_log(
+                                "    ↺ Bootstrap 401 — attempting auto-rescue via factory_reset(existing_pwd)…")
+                            try:
+                                rr = self.protocol.factory_reset(camera_ip, rescue_pwd)
+                            except Exception:
+                                rr = False
+                            if rr:
+                                self.status_log(
+                                    "      ✓ Reset issued. Waiting up to 120s for camera to return…")
+                                old_ip = camera_ip
+                                target_mac_norm = (pinned_mac or '').upper().replace(':', '').replace('-', '')
+                                rescue_ip = None
+                                rescue_deadline = time.time() + 120
+                                rendezvous = [old_ip, '192.168.0.90']
+                                while time.time() < rescue_deadline and not self.cancel_flag:
+                                    for try_ip in rendezvous:
+                                        if not try_ip:
+                                            continue
+                                        if self.ping_camera(try_ip, timeout_ms=800):
+                                            p = self.protocol.probe_unrestricted(try_ip)
+                                            p_mac = (p.get('mac') or '').upper().replace(':', '').replace('-', '')
+                                            if not target_mac_norm or p_mac == target_mac_norm:
+                                                rescue_ip = try_ip
+                                                break
+                                    if rescue_ip:
+                                        break
+                                    time.sleep(2)
+                                if rescue_ip:
+                                    camera_ip = rescue_ip
+                                    cam['_program_ip'] = camera_ip
+                                    self.status_log(f"      ✓ Camera back at {camera_ip} (factory state) — retrying bootstrap")
+                                    # Rebuild steps so the new ip is captured
+                                    new_steps = self.protocol.get_programming_steps(cam, password, options=opts)
+                                    new_user_fn = None
+                                    for d2, f2 in new_steps:
+                                        if 'user' in d2.lower():
+                                            new_user_fn = f2
+                                            break
+                                    if new_user_fn and new_user_fn():
+                                        self.status_log("    ✓ Done. (rescued)")
+                                        rescued = True
+                                        # Replace the remaining work with the
+                                        # freshly-built steps so they bind the new
+                                        # camera IP. Drop the user step (already
+                                        # done) and run any other auth steps now,
+                                        # then swap network_steps for later phase 3.
+                                        new_auth_remaining = [
+                                            (d2, f2) for (d2, f2) in new_steps
+                                            if 'user' not in d2.lower()
+                                            and not any(kw in d2.lower() for kw in network_keywords)
+                                        ]
+                                        for d3, f3 in new_auth_remaining:
+                                            if self.cancel_flag: break
+                                            self.status_log(f"  {d3}")
+                                            if f3():
+                                                self.status_log("    ✓ Done.")
+                                            else:
+                                                self.status_log(f"    ✗ {d3} failed")
+                                                errors.append(d3.lower().split()[0])
+                                                auth_ok = False
+                                        network_steps[:] = [
+                                            (d2, f2) for (d2, f2) in new_steps
+                                            if any(kw in d2.lower() for kw in network_keywords)
+                                        ]
+                                else:
+                                    self.status_log("      ✗ Camera didn't return within 120s")
+                            else:
+                                self.status_log("      ✗ factory_reset(existing_pwd) failed too — giving up the rescue")
+                        if rescued:
+                            # Remaining auth work was handled in the rescue
+                            # block against the new camera_ip. Bail the original
+                            # iteration (its closures still bind the old ip).
+                            break
                         self.status_log(f"    ✗ {desc} failed")
                         # b9 — surface protocol-level last-error if the step set one.
                         # Currently Axis create_initial_user populates this on
