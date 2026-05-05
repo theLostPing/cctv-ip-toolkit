@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.4.7"
+APP_VERSION = "4.4.8"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -402,6 +402,122 @@ def _have_route_to(target_ip):
         if _ip_in_same_subnet(target_ip, entry['ip'], entry['prefix_len']):
             return entry
     return None
+
+
+# v4.4.8 — Find Camera Anywhere defaults.
+# Common /24 ranges where reused cameras tend to live. Covers ~90% of
+# real-world "tech plugs in a camera from a prior customer site" scenarios.
+DEFAULT_FIND_ANYWHERE_SUBNETS = (
+    '10.0.0', '10.0.1', '192.168.0', '192.168.1', '192.168.50', '172.16.0',
+)
+# Axis OUI prefixes — dash-formatted to match Get-NetNeighbor output.
+AXIS_OUI_PREFIXES = ('B8-A4-4F', '00-40-8C', 'AC-CC-8E')
+
+
+def _arp_table():
+    """v4.4.8 — Snapshot of the OS ARP table across all NICs. Used by
+    Find Anywhere to harvest MAC matches after a TCP probe sweep."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             "Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+             "Where-Object { $_.LinkLayerAddress -and $_.LinkLayerAddress -ne '00-00-00-00-00-00' "
+             "-and $_.LinkLayerAddress -ne 'FF-FF-FF-FF-FF-FF' "
+             "-and $_.IPAddress -notlike '224.*' "
+             "-and $_.IPAddress -notlike '239.*' "
+             "-and $_.IPAddress -notlike '255.*' } | "
+             "Select-Object IPAddress,LinkLayerAddress,InterfaceIndex,InterfaceAlias,State | "
+             "ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        data = json.loads(result.stdout)
+        if isinstance(data, dict):
+            data = [data]
+        out = []
+        for d in data:
+            ip = d.get('IPAddress')
+            mac = d.get('LinkLayerAddress')
+            if not ip or not mac:
+                continue
+            out.append({'ip': ip, 'mac': mac.upper(),
+                        'iface_index': d.get('InterfaceIndex'),
+                        'iface_alias': d.get('InterfaceAlias'),
+                        'state': d.get('State')})
+        return out
+    except Exception:
+        return []
+
+
+def _tcp_probe_sweep(subnet_base, ports=(80, 443), timeout_s=0.4,
+                    max_concurrent=64, on_progress=None, cancel_flag=None):
+    """v4.4.8 — Probe TCP/80 (then /443) on every host in a /24. The
+    intent is not to find HTTP listeners directly — it's to populate the
+    OS ARP cache. Even a connection that ultimately times out will trigger
+    an ARP request, and the camera (alive at L2) will reply, so we can
+    read the cache afterwards.
+
+    Returns count of probes that actually got a TCP connection (informational).
+    Caller reads the ARP table separately."""
+    import socket
+    import concurrent.futures
+
+    targets = [f"{subnet_base}.{n}" for n in range(1, 255)]
+    hits = 0
+
+    def probe(ip):
+        if cancel_flag is not None and cancel_flag.get('cancel'):
+            return False
+        for port in ports:
+            try:
+                with socket.create_connection((ip, port), timeout=timeout_s):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    completed = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent) as ex:
+        futures = {ex.submit(probe, ip): ip for ip in targets}
+        for fut in concurrent.futures.as_completed(futures):
+            completed += 1
+            try:
+                if fut.result():
+                    hits += 1
+            except Exception:
+                pass
+            if on_progress:
+                try:
+                    on_progress(completed, len(targets))
+                except Exception:
+                    pass
+            if cancel_flag is not None and cancel_flag.get('cancel'):
+                break
+    return hits
+
+
+def _arp_matches_in_subnet(subnet_base, mac_oui_prefixes=AXIS_OUI_PREFIXES):
+    """Read the ARP table, return entries whose IP is in subnet_base.x AND
+    whose MAC starts with any of the OUI prefixes."""
+    out = []
+    seen_macs = set()
+    oui_set = tuple(p.upper() for p in mac_oui_prefixes)
+    for entry in _arp_table():
+        ip = entry.get('ip', '')
+        mac = entry.get('mac', '')
+        if not ip or not mac:
+            continue
+        if not ip.startswith(subnet_base + '.'):
+            continue
+        if not any(mac.startswith(prefix) for prefix in oui_set):
+            continue
+        if mac in seen_macs:
+            continue
+        seen_macs.add(mac)
+        out.append(entry)
+    return out
 
 
 def _save_multihome_state(entries):
@@ -5941,6 +6057,8 @@ class CCTVToolkitApp:
         menubar.add_cascade(label="Tools", menu=tools_menu)
         tools_menu.add_command(label="Identify Switch Port (LLDP)...",
                                command=self.show_lldp_discovery)
+        tools_menu.add_command(label="Find Camera Anywhere…",
+                               command=self.show_find_camera_anywhere)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -7252,6 +7370,209 @@ class CCTVToolkitApp:
             _save_multihome_state(added)
             self.log(f"Auto multi-home: {len(added)} address(es) added. Cleanup at wizard end.")
         return len(added)
+
+    def show_find_camera_anywhere(self):
+        """v4.4.8 — Tools menu entry. Opens a non-modal dialog that lets
+        the operator sweep multiple /24 subnets for Axis cameras using
+        temporary aliases on the selected NIC. Built for the common reuse
+        case: a tech plugs in a camera that was previously deployed at a
+        customer site with a hardcoded IP and no longer responds to mDNS
+        because its services are bound to its (now-unreachable) configured
+        static. Aliases are reused from the existing multihome machinery —
+        cleanup at dialog close is automatic and crash-resilient."""
+        if not _is_admin_windows():
+            messagebox.showwarning(
+                "Find Camera Anywhere — admin required",
+                "Find Anywhere needs administrator privileges to add temporary "
+                "IP addresses to your selected network adapter.\n\n"
+                "Close the toolkit, right-click → 'Run as administrator', and try again.",
+                parent=self.root)
+            return
+        iface_idx = self._get_interface_index() if hasattr(self, '_get_interface_index') else None
+        if not iface_idx:
+            messagebox.showwarning(
+                "Find Camera Anywhere",
+                "No network interface is selected. Choose an interface in the "
+                "main window's Interface picker, then re-open this tool.",
+                parent=self.root)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Find Camera Anywhere")
+        win.geometry("760x540")
+        win.transient(self.root)
+
+        intro = ("Sweep common deployment subnets for Axis cameras. Each /24 is "
+                 "temporarily aliased on the selected NIC, ARP-probed via TCP, "
+                 "then matched against Axis OUIs. Aliases for empty subnets are "
+                 "removed; aliases for hits stay so the wizard can reach them.")
+        ttk.Label(win, text=intro, wraplength=720, justify='left').pack(
+            anchor='w', padx=12, pady=(10, 6))
+
+        cfg = ttk.Frame(win); cfg.pack(fill='x', padx=12, pady=4)
+        ttk.Label(cfg, text="Candidate /24 subnets (one per line):").pack(anchor='w')
+        subnets_text = tk.Text(cfg, height=5, width=30)
+        subnets_text.insert('1.0', '\n'.join(DEFAULT_FIND_ANYWHERE_SUBNETS))
+        subnets_text.pack(fill='x', pady=2)
+
+        ctl = ttk.Frame(win); ctl.pack(fill='x', padx=12, pady=4)
+        sweep_btn = ttk.Button(ctl, text="Sweep")
+        sweep_btn.pack(side='left')
+        cancel_btn = ttk.Button(ctl, text="Cancel sweep", state='disabled')
+        cancel_btn.pack(side='left', padx=(8, 0))
+        progress_var = tk.StringVar(value="Idle.")
+        ttk.Label(ctl, textvariable=progress_var).pack(side='left', padx=12)
+
+        ttk.Label(win, text="Found cameras:").pack(anchor='w', padx=12, pady=(8, 2))
+        results_frame = ttk.Frame(win); results_frame.pack(fill='both', expand=True, padx=12)
+        cols = ('ip', 'mac', 'subnet', 'state')
+        tree = ttk.Treeview(results_frame, columns=cols, show='headings', height=10)
+        for c, w in (('ip', 140), ('mac', 160), ('subnet', 100), ('state', 220)):
+            tree.heading(c, text=c.upper())
+            tree.column(c, width=w, anchor='w')
+        tree.pack(side='left', fill='both', expand=True)
+        ysb = ttk.Scrollbar(results_frame, orient='vertical', command=tree.yview)
+        ysb.pack(side='right', fill='y')
+        tree.configure(yscrollcommand=ysb.set)
+
+        actions = ttk.Frame(win); actions.pack(fill='x', padx=12, pady=(6, 10))
+
+        def _open_web():
+            sel = tree.selection()
+            if not sel: return
+            ip = tree.item(sel[0])['values'][0]
+            import webbrowser
+            webbrowser.open(f"http://{ip}/")
+
+        def _factory_default():
+            sel = tree.selection()
+            if not sel: return
+            ip = tree.item(sel[0])['values'][0]
+            self.start_factory_default_wizard(prefill_ip=ip)
+
+        def _copy_ip():
+            sel = tree.selection()
+            if not sel: return
+            ip = tree.item(sel[0])['values'][0]
+            self.root.clipboard_clear(); self.root.clipboard_append(ip)
+            messagebox.showinfo("Copied", f"{ip} copied to clipboard.", parent=win)
+
+        ttk.Button(actions, text="Open Web UI", command=_open_web).pack(side='left')
+        ttk.Button(actions, text="Factory Default…", command=_factory_default).pack(side='left', padx=(8, 0))
+        ttk.Button(actions, text="Copy IP", command=_copy_ip).pack(side='left', padx=(8, 0))
+        ttk.Button(actions, text="Close", command=win.destroy).pack(side='right')
+
+        cancel_token = {'cancel': False}
+
+        def do_sweep():
+            subnets = [s.strip() for s in subnets_text.get('1.0', 'end').splitlines() if s.strip()]
+            # Light validation: each line must look like X.Y.Z (3 octets, all 0-255).
+            valid = []
+            for s in subnets:
+                parts = s.split('.')
+                if len(parts) != 3:
+                    continue
+                try:
+                    if all(0 <= int(p) <= 255 for p in parts):
+                        valid.append(s)
+                except ValueError:
+                    pass
+            if not valid:
+                messagebox.showwarning("Find Anywhere",
+                    "No valid /24 subnets in the list. Each line must be 'X.Y.Z' "
+                    "(three octets).", parent=win)
+                return
+
+            for item in tree.get_children():
+                tree.delete(item)
+            sweep_btn.config(state='disabled')
+            cancel_btn.config(state='normal')
+            cancel_token['cancel'] = False
+
+            def work():
+                self.log(f"\n{'='*50}\nFind Anywhere: sweeping {len(valid)} subnet(s)\n{'='*50}")
+                added_aliases = []  # (iface_idx, ip, subnet_base) to remove if no hit
+                kept_aliases = []   # alias entries we keep (registered in multihome state)
+                try:
+                    for sn in valid:
+                        if cancel_token['cancel']:
+                            break
+                        # Skip if PC already has an IP in this /24 — no alias needed.
+                        already = _have_route_to(f"{sn}.1")
+                        alias_ip = None
+                        if already:
+                            self.log(f"  [{sn}.x] already routable from {already['ip']}/{already['prefix_len']}")
+                        else:
+                            # Pick a free host (skip .1 gateway slot).
+                            chosen = _pick_free_host_ip(sn, '255.255.255.0',
+                                candidates=(99, 98, 97, 250, 249, 200, 150, 100, 50))
+                            if not chosen:
+                                self.log(f"  [{sn}.x] no free host IP — skipped")
+                                continue
+                            if not _netsh_add_ip(iface_idx, chosen, '255.255.255.0'):
+                                self.log(f"  [{sn}.x] netsh add {chosen}/24 failed — skipped")
+                                continue
+                            alias_ip = chosen
+                            added_aliases.append((iface_idx, chosen, sn))
+                            self.log(f"  [{sn}.x] aliased {chosen}/24 on iface {iface_idx}")
+                            time.sleep(0.5)
+
+                        # Sweep.
+                        progress_var.set(f"Sweeping {sn}.0/24…")
+                        win.update_idletasks()
+                        def _prog(done, total):
+                            progress_var.set(f"{sn}.0/24 — {done}/{total}")
+                            try: win.update_idletasks()
+                            except Exception: pass
+                        _tcp_probe_sweep(sn, on_progress=_prog, cancel_flag=cancel_token)
+
+                        # Harvest.
+                        time.sleep(0.5)  # let ARP cache settle
+                        matches = _arp_matches_in_subnet(sn)
+                        if matches:
+                            for m in matches:
+                                # Fingerprint quickly (no-auth basicdeviceinfo).
+                                ident = '?'
+                                try:
+                                    info = self.protocol.probe_unrestricted(m['ip']) if hasattr(self, 'protocol') else {}
+                                    if info.get('model'):
+                                        ident = info['model']
+                                except Exception:
+                                    pass
+                                state = f"HTTP-up · {ident}" if ident != '?' else "ARP-only · HTTP not responding"
+                                tree.insert('', 'end', values=(m['ip'], m['mac'], f"{sn}.0/24", state))
+                                self.log(f"  [{sn}.x] FOUND: {m['ip']}  MAC={m['mac']}  {state}")
+                            # Keep this alias — register in multihome state for auto-cleanup.
+                            if alias_ip:
+                                existing = _load_multihome_state() or []
+                                existing.append({'iface_index': iface_idx, 'ip': alias_ip,
+                                                 'mask': '255.255.255.0', 'subnet_base': sn,
+                                                 '_added_by': 'find_anywhere', '_kept': True})
+                                _save_multihome_state(existing)
+                                kept_aliases.append(alias_ip)
+                        else:
+                            # No hit — clean up the alias we added.
+                            if alias_ip:
+                                _netsh_remove_ip(iface_idx, alias_ip)
+                                added_aliases = [a for a in added_aliases if a[1] != alias_ip]
+                                self.log(f"  [{sn}.x] no Axis MACs — alias {alias_ip} removed")
+
+                    # Final summary.
+                    n_found = len(tree.get_children())
+                    if cancel_token['cancel']:
+                        progress_var.set(f"Cancelled. {n_found} found before stop.")
+                    else:
+                        progress_var.set(f"Done. {n_found} camera(s) found across {len(valid)} subnet(s).")
+                    if kept_aliases:
+                        self.log(f"Find Anywhere: kept {len(kept_aliases)} alias(es) for routing to hits.")
+                finally:
+                    sweep_btn.config(state='normal')
+                    cancel_btn.config(state='disabled')
+
+            threading.Thread(target=work, daemon=True).start()
+
+        sweep_btn.config(command=do_sweep)
+        cancel_btn.config(command=lambda: cancel_token.update({'cancel': True}))
 
     def _ensure_route_to_camera(self, target_ip, ask_consent=True):
         """v4.4.7 — When discovery surfaces a camera at an IP we have no path
@@ -9781,6 +10102,15 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.4.8": (
+            "What's new in v4.4.8 (beta)",
+            [
+                "• NEW: Tools → Find Camera Anywhere… A wide-net discovery for the case where mDNS/DHCP only surface a camera at link-local (or not at all) but the camera is actually bound to a previously-configured static IP on a subnet your NIC has no path to. Sweeps a configurable list of common deployment /24s (default: 10.0.0, 10.0.1, 192.168.0, 192.168.1, 192.168.50, 172.16.0), temporarily aliases each subnet on the selected NIC, ARPs via TCP probes, and keeps the alias only for /24s where an Axis MAC actually replied. Aliases register in the same multihome_state.json so cleanup at wizard end / next launch is automatic and crash-resilient.",
+                "• Per-result actions on the Find Anywhere result list: Open Web UI, Factory Default… (hands off to the existing standalone factory-default flow with the IP pre-filled), Copy IP.",
+                "• start_factory_default_wizard now accepts an optional prefill_ip — for the Find Anywhere → Factory Default handoff, but also usable from any other flow that already knows the camera's address.",
+                "• Beta build — install side-by-side via the prerelease installer, exercise on real reuse cameras, file feedback before the stable 4.4.8 ships.",
+            ],
+        ),
         "4.4.7": (
             "What's new in v4.4.7",
             [
@@ -11917,17 +12247,20 @@ https://buymeacoffee.com/thelostping""")
 
         threading.Thread(target=run, daemon=True).start()
 
-    def start_factory_default_wizard(self):
+    def start_factory_default_wizard(self, prefill_ip=None):
         """v4.3 — Standalone factory default. Asks for IP + existing root
         password, fires factory_reset, polls for camera to come back. Useful
         for one-off cleanups outside the programming flow (camera came in
         from a prior site and needs to be wiped before it goes on the shelf
-        as inventory)."""
+        as inventory).
+
+        v4.4.8 — `prefill_ip` lets Find Anywhere hand off the IP it located
+        without forcing the operator to retype it."""
         if not hasattr(self.protocol, 'factory_reset'):
             messagebox.showinfo("Factory Default",
                                 f"{self.protocol.BRAND_NAME} protocol does not support factory_reset yet.")
             return
-        ip = simpledialog.askstring("Factory Default",
+        ip = prefill_ip if prefill_ip else simpledialog.askstring("Factory Default",
             "Camera IP to wipe:", parent=self.root)
         if not ip:
             return
