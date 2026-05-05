@@ -7402,12 +7402,22 @@ class CCTVToolkitApp:
         win.transient(self.root)
         _center_on_parent(win, self.root, 760, 540)
 
-        intro = ("Sweep common deployment subnets for Axis cameras. Each /24 is "
-                 "temporarily aliased on the selected NIC, ARP-probed via TCP, "
-                 "then matched against Axis OUIs. Aliases for empty subnets are "
+        intro = ("Sweep common deployment /24s for Axis cameras. Each subnet is "
+                 "temporarily aliased on the selected NIC, TCP-probed to populate "
+                 "ARP, and matched against Axis OUIs. Empty-subnet aliases are "
                  "removed; aliases for hits stay so the wizard can reach them.")
-        ttk.Label(win, text=intro, wraplength=720, justify='left').pack(
-            anchor='w', padx=12, pady=(10, 6))
+        intro_lbl = ttk.Label(win, text=intro, justify='left')
+        intro_lbl.pack(anchor='w', padx=12, pady=(10, 6), fill='x')
+        # Bind wraplength to actual width so resizing the dialog re-wraps
+        # cleanly instead of clipping (v4.4.8-beta3 layout bug).
+        def _rewrap(event=None):
+            try:
+                w = max(360, win.winfo_width() - 36)
+                intro_lbl.configure(wraplength=w)
+            except Exception:
+                pass
+        win.bind('<Configure>', _rewrap)
+        win.after(50, _rewrap)
 
         cfg = ttk.Frame(win); cfg.pack(fill='x', padx=12, pady=4)
         ttk.Label(cfg, text="Candidate /24 subnets (one per line):").pack(anchor='w')
