@@ -10741,6 +10741,7 @@ Email: axisprogrammer@thelostping.net
                 "• Reusing a camera that already has a password? If the password you typed in matches what's on the camera, the toolkit just changes it to the new one — no factory reset needed.",
                 "• If the toolkit gets stuck logging in during programming, it now tries one auto-rescue: factory-reset with the password you provided, wait for the camera to come back, and pick up where it left off. You don't have to do anything.",
                 "• If you've already factory-reset a camera by hand and put it back on the bench, the toolkit recognizes that and stops nagging you for the old password. New 'Already factory-reset' button on the password prompt for the older cameras that don't auto-detect.",
+                "• Stuck-camera retry spam — fixed. If the same camera fails factory-reset twice in a row, the toolkit now stops hammering it, prints clear instructions to paperclip-reset it, and waits quietly for 30 seconds. No more 30-times-in-a-row 'wrong existing password' messages while you're already trying to physically reset the camera.",
                 "• Net effect: plug in, click Program, and the toolkit handles the awkward middle states (reused cameras, stale passwords, slow cameras) without bouncing back to you.",
             ],
         ),
@@ -12076,6 +12077,13 @@ https://buymeacoffee.com/thelostping""")
             programmed_count = 0
             seen_macs = set()
             consecutive_skips = 0
+            # v4.5.1-beta4: per-MAC factory_reset failure counter. After
+            # the same MAC fails reset 2 times in a row we stop hammering
+            # the camera and tell the operator in plain English to paperclip
+            # it. Field session 2026-05-05: KBO-033 / KBO-034 burned ~5min
+            # each looping factory-reset → 401 → bail-this-slot → re-discover
+            # → repeat 30+ times before the camera came back factory-clean.
+            factory_reset_fail_count = {}
 
             # Banner suppression: only print "Waiting for camera N" once per real new
             # camera. When we re-enter the outer loop after waiting for the previous
@@ -12356,10 +12364,44 @@ https://buymeacoffee.com/thelostping""")
                         # whole reset+wait dance. Programming proceeds normally.
                         self.status_log("  ✓ Camera is already factory-clean — skipping reset")
                     else:
+                        # v4.5.1-beta4: cap the bail-and-retry loop. After 2
+                        # consecutive factory_reset failures for the same MAC,
+                        # stop hammering and pause for 30s with clear plain-
+                        # English instructions, then keep waiting (don't bail
+                        # the whole wizard, just stop the spam). Lets the
+                        # operator paperclip-reset the camera in peace.
+                        mac_key = (pinned_mac or '').upper().replace(':', '').replace('-', '')
+                        prior_fails = factory_reset_fail_count.get(mac_key, 0)
+
                         self.status_log(f"Factory-resetting {pinned_mac} via existing password...")
                         if not self.protocol.factory_reset(camera_ip, existing_pwd):
                             self.status_log("  ✗ Factory reset failed — wrong existing password? bailing this slot")
                             errors.append('factory_reset_failed')
+                            new_fails = prior_fails + 1
+                            factory_reset_fail_count[mac_key] = new_fails
+                            if new_fails >= 2:
+                                self.status_log(
+                                    f"  ⚠ {pinned_mac} has failed factory-reset {new_fails}× in a row.")
+                                self.status_log(
+                                    f"  ⚠ The 'existing password' you provided isn't accepted by this camera.")
+                                self.status_log(
+                                    f"  ⚠ ACTION: paperclip-reset the camera (hold the button for ~10s")
+                                self.status_log(
+                                    f"  ⚠         until the LED blinks amber, then release). The wizard")
+                                self.status_log(
+                                    f"  ⚠         will pick it up at 192.168.0.90 once it's back.")
+                                self.status_log(
+                                    f"  ⚠ Pausing 30s before re-checking — paperclip now.")
+                                # Quiet wait. Don't bounce back to outer loop;
+                                # let the camera come back to factory state
+                                # without retry-spam. Reset the per-MAC counter
+                                # so we don't immediately re-trip after the
+                                # paperclip when it shows up factory-clean.
+                                factory_reset_fail_count[mac_key] = 0
+                                for _ in range(30):
+                                    if self.cancel_flag:
+                                        break
+                                    time.sleep(1)
                             continue
 
                         self.status_log("  ✓ Reset issued.")
