@@ -7898,16 +7898,60 @@ class CCTVToolkitApp:
             self.log(f"  {f['ip']}: walking saved passwords for auth…")
             working_pwd = self._find_working_password(f['ip'], known_mac=f.get('mac'))
             if working_pwd is None:
-                self.log(f"  {f['ip']}: no saved password authenticated — skipped")
-                self.root.after(0, lambda f=f: messagebox.showwarning(
-                    "Password not found",
-                    f"None of the saved passwords authenticated against "
-                    f"{f['ip']}.\n\nAdd the camera's current root password to "
-                    f"the Passwords tab, then re-run the wizard. Or factory-"
-                    f"reset this camera manually with the existing Factory "
-                    f"Default tool.",
-                    parent=self.root))
-                continue
+                # v4.4.8-beta8 — saved walk failed. Don't silently skip; prompt
+                # the operator inline so they can type the password they know
+                # without going hunting in the Passwords tab. If it works, save
+                # it (list + per-MAC cache) so this never happens again for
+                # this camera or any other camera using the same root pwd.
+                self.log(f"  {f['ip']}: no saved password authenticated — prompting operator")
+                pwd_holder = [None]
+                def _ask_pwd(f=f):
+                    pwd_holder[0] = simpledialog.askstring(
+                        "Provide camera password",
+                        f"None of {len(self.password_data.get_all() or [])} saved "
+                        f"passwords authenticated against {f['ip']} "
+                        f"({f.get('model', '?')}).\n\n"
+                        f"Enter the camera's existing root password to factory-"
+                        f"reset it (or Cancel to skip this camera):",
+                        show='*', parent=self.root)
+                self.root.after(0, _ask_pwd)
+                while pwd_holder[0] is None and not getattr(self, 'cancel_flag', False):
+                    time.sleep(0.05)
+                typed_pwd = pwd_holder[0]
+                if not typed_pwd:
+                    self.log(f"  {f['ip']}: operator cancelled — skipped")
+                    continue
+                # Try the typed password.
+                from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+                authed = False
+                for auth_cls in (HTTPDigestAuth, HTTPBasicAuth):
+                    try:
+                        r = requests.post(
+                            f"http://{f['ip']}/axis-cgi/basicdeviceinfo.cgi",
+                            json={"apiVersion": "1.0", "method": "getAllProperties"},
+                            auth=auth_cls('root', typed_pwd), timeout=3)
+                        if r.status_code == 200:
+                            authed = True
+                            break
+                    except Exception:
+                        continue
+                if not authed:
+                    self.log(f"  {f['ip']}: typed password also rejected — skipped")
+                    self.root.after(0, lambda f=f: messagebox.showwarning(
+                        "Password rejected",
+                        f"The password you typed didn't authenticate against "
+                        f"{f['ip']} either. Camera might be in a non-standard "
+                        f"state — try the existing Tools → Factory Default "
+                        f"flow, or hard-reset via the camera's physical button.",
+                        parent=self.root))
+                    continue
+                # Persist for next time.
+                self.password_data.add(typed_pwd)
+                mac_clean = (f.get('mac', '') or '').upper().replace(':', '').replace('-', '') or None
+                if mac_clean:
+                    self._save_password_cache_entry(mac_clean, typed_pwd)
+                self.log(f"  {f['ip']}: typed password authenticated — saved to list + cache")
+                working_pwd = typed_pwd
             self.log(f"  {f['ip']}: auth OK — sending factory_reset")
             try:
                 ok = self.protocol.factory_reset(f['ip'], working_pwd)
