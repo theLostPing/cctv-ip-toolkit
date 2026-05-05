@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.4.8"
+APP_VERSION = "4.5.0"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -5994,6 +5994,13 @@ class CCTVToolkitApp:
         # v4.4.8-beta6 — wire diagnostic logging so set_network etc can write to the wizard log
         self.protocol.log_callback = self.log
 
+        # v4.5.0 — atexit cleanup so app close (not just wizard end) tears down
+        # any temp NIC aliases. Combined with the existing wizard-end cleanup and
+        # next-launch crash-recovery, NIC pollution can't outlive a single
+        # wizard step.
+        import atexit as _atexit
+        _atexit.register(self._cleanup_multihome)
+
         self.log_queue = queue.Queue()
         self.cancel_flag = False
         self.preview_image = None
@@ -8079,19 +8086,26 @@ class CCTVToolkitApp:
                     self._save_password_cache_entry(mac_clean, typed_pwd)
                 self.log(f"  {f['ip']}: typed password authenticated — saved to list + cache")
                 working_pwd = typed_pwd
-            self.log(f"  {f['ip']}: auth OK — sending factory_reset")
+            self.log(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            self.log(f"  ▸ Pre-flight chain for {f['ip']} ({f.get('model','?')})")
+            self.log(f"    1/3  Located via {f.get('_via','?')} pass — MAC {f['mac']}")
+            self.log(f"    2/3  Authenticated as root with saved password{' (cached)' if f.get('working_pwd') else ''}")
+            self.log(f"    3/3  Sending factory_reset…")
             try:
                 ok = self.protocol.factory_reset(f['ip'], working_pwd)
                 if ok:
-                    self.log(f"  {f['ip']}: factory-reset accepted — camera will reboot")
+                    self.log(f"         ✓ accepted — camera rebooting now")
+                    self.log(f"         awaiting fresh DHCP DISCOVER / mDNS announce on the wait loop")
                     reset_count += 1
                 else:
-                    self.log(f"  {f['ip']}: factory_reset returned False")
+                    self.log(f"         ✗ factory_reset returned False — skipping this slot")
             except Exception as e:
-                self.log(f"  {f['ip']}: factory_reset error: {e}")
+                self.log(f"         ✗ factory_reset exception: {e}")
+            self.log(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
         if reset_count:
-            self.log(f"Pre-flight: {reset_count} camera(s) factory-reset. Pausing 8s for them to drop offline before the wait loop starts.")
+            self.log(f"\nPre-flight complete: {reset_count} camera(s) factory-reset and rebooting.")
+            self.log(f"Pausing 8s for them to drop offline, then the wait loop will catch them as they come back at factory IP / DHCP / link-local.")
             time.sleep(8)
         return reset_count
 
@@ -10544,16 +10558,23 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
-        "4.4.8": (
-            "What's new in v4.4.8 (beta)",
+        "4.5.0": (
+            "What's new in v4.5.0",
             [
-                "• NEW: Wizard pre-flight — find & factory-reset previously-configured cameras automatically. When the programming wizard starts, it sweeps common deployment /24s on the selected NIC (default: 10.0.0, 10.0.1, 192.168.0, 192.168.1, 192.168.50, 172.16.0), finds any Axis MACs whose subnets the PC has no path to, prompts per-camera to factory-reset, walks the saved password list to authenticate, and fires factory_reset. Reset cameras reboot and the regular wait loop catches them as they come back at factory IP / DHCP / link-local — no more 'wizard sits forever waiting because the camera has a hardcoded IP from a previous job'. Requires admin (alias adds need it); skipped silently if not elevated.",
-                "• NEW: Tools → Find Camera Anywhere… The same /24 sweep as a manual tool, with per-result actions (Open Web UI, Factory Default…, Copy IP). Useful for one-off lookups outside a wizard run.",
-                "• start_factory_default_wizard now accepts an optional prefill_ip — for the Find Anywhere → Factory Default handoff, but also usable from any flow that already knows the camera's address.",
-                "• Aliases added by either flow register in the same multihome_state.json as the existing Auto Multi-Home, so cleanup at wizard end / next launch is automatic and crash-resilient.",
-                "• beta7: wizard auto-saves the chosen password to the Passwords tab on run start. Without this, a partial-failure run (create_initial_user OK, set_network fails) would lock the toolkit out of the camera it just programmed — pre-flight on the retry couldn't authenticate. Now retries Just Work.",
-                "• beta6: set_network now logs every leg (ONVIF gw / SetNetworkInterfaces / VAPIX DHCP/router/subnet/IP) with status code and body snippet to the wizard log. Plus per-MAC password cache (CONFIG_DIR/password_cache.json) so subsequent factory-resets on a known camera skip the 800-entry walk.",
-                "• Beta build — install side-by-side via the prerelease installer, exercise on real reuse cameras, file feedback before stable 4.4.8 ships.",
+                "• HEADLINE: 'Plug in, click Program, camera IS here, defaulting to HERE.' The programming wizard now hunts down previously-configured cameras autonomously and brings them back to programmable state — no manual factory-resets, no manual IP arithmetic, no per-tech-PC network gymnastics.",
+                "• NEW: Two-stage pre-flight at wizard start. Stage 1 (smart): mDNS at link-local → no-auth probe → walk saved passwords (per-MAC cache means subsequent runs are instant) → ask the camera its real configured IP via param.cgi Network → auto-alias just that /24 on the selected NIC. One alias, one camera, exact subnet. Stage 2 (sweep, fallback): six common deployment /24s ARP-probed for cameras smart-pass missed (HTTP-dead at link-local cases). Per-camera factory-reset prompt; walks pwd list with inline 'Provide camera password' prompt if the saved walk fails.",
+                "• NEW: Tools → Find Camera Anywhere… A manual one-off version of the same wide-net discovery, with per-result actions (Open Web UI, Factory Default…, Copy IP).",
+                "• NEW: Auto-route to discovered cameras on unknown subnets — the wizard's mDNS Phase 3 fallback now offers (per-camera, with consent) to add a same-subnet alias when discovery surfaces a camera at a previously-configured static IP outside any of your NICs' subnets.",
+                "• NEW: Per-MAC password cache (CONFIG_DIR/password_cache.json). First successful auth on a camera saves the working pwd; subsequent factory-resets on the same camera (or any camera using the same root pwd) skip the 800-entry walk and authenticate in one HTTP roundtrip.",
+                "• NEW: Wizard auto-saves chosen password to the Passwords list at run start. Closes the partial-failure trap where create_initial_user succeeded but set_network failed — the new pwd was on the camera but not in the toolkit's saved list, so retries couldn't authenticate.",
+                "• NEW: Wait-loop heartbeat every 15s with elapsed time + active discovery modes + 'plug in / reboot to trigger fresh DHCP DISCOVER' hint. No more silent 30-60s stretches that look frozen.",
+                "• NEW: set_network diagnostic logging. Every leg (ONVIF gw / SetNetworkInterfaces / VAPIX DHCP/router/subnet/IP) writes status code + body snippet to the wizard log, so when set_network fails on quirky firmware we can see exactly which call rejected what.",
+                "• NEW: atexit cleanup. Aliases added during a run are removed on app close even if the wizard didn't finish. Combined with the existing wizard-end cleanup and next-launch crash-recovery, NIC pollution is now bounded by the duration of a wizard step at worst.",
+                "• NEW: Pre-flight chain log lines around the factory-reset prompt. You see explicitly: located via smart/sweep pass → authenticated → factory_reset sent → awaiting reboot → step 1/N programming → … so you always know which stage of the chain a camera is in.",
+                "• Find Anywhere dialog: opens centered on the toolkit's parent window (not monitor 1), description re-wraps cleanly when resized.",
+                "• start_factory_default_wizard accepts an optional prefill_ip (for the Find Anywhere → Factory Default handoff).",
+                "• All temp aliases register in multihome_state.json — same machinery as v4.3 Auto Multi-Home — so cleanup is automatic at wizard end + at app close + crash-resilient on next launch.",
+                "• Cooked over a long real-world reuse session 2026-05-04/05 against a P3265-LV with a hardcoded 10.0.0.26 from a prior site, on a programming NIC with no 10.0.0.x address. Beta1 → beta10 iteration log lives in the cctv_ip_toolkit Gitea repo.",
             ],
         ),
         "4.4.7": (
