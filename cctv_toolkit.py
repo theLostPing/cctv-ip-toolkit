@@ -10380,6 +10380,8 @@ Email: axisprogrammer@thelostping.net
                 "• NEW: Tools → Find Camera Anywhere… The same /24 sweep as a manual tool, with per-result actions (Open Web UI, Factory Default…, Copy IP). Useful for one-off lookups outside a wizard run.",
                 "• start_factory_default_wizard now accepts an optional prefill_ip — for the Find Anywhere → Factory Default handoff, but also usable from any flow that already knows the camera's address.",
                 "• Aliases added by either flow register in the same multihome_state.json as the existing Auto Multi-Home, so cleanup at wizard end / next launch is automatic and crash-resilient.",
+                "• beta7: wizard auto-saves the chosen password to the Passwords tab on run start. Without this, a partial-failure run (create_initial_user OK, set_network fails) would lock the toolkit out of the camera it just programmed — pre-flight on the retry couldn't authenticate. Now retries Just Work.",
+                "• beta6: set_network now logs every leg (ONVIF gw / SetNetworkInterfaces / VAPIX DHCP/router/subnet/IP) with status code and body snippet to the wizard log. Plus per-MAC password cache (CONFIG_DIR/password_cache.json) so subsequent factory-resets on a known camera skip the 800-entry walk.",
                 "• Beta build — install side-by-side via the prerelease installer, exercise on real reuse cameras, file feedback before stable 4.4.8 ships.",
             ],
         ),
@@ -10798,7 +10800,16 @@ https://buymeacoffee.com/thelostping""")
         if password != confirm:
             messagebox.showerror("Mismatch", "Passwords don't match!")
             return
-        
+
+        # v4.4.8-beta7 — auto-save the wizard's password to the saved list. If
+        # this run partially succeeds (create_initial_user OK, set_network
+        # fails), the camera ends up with this password set; future pre-flight
+        # walks need to find it in the list to authenticate. Without this,
+        # we'd silently lock ourselves out of cameras we just programmed.
+        if password and password not in self.password_data.get_all():
+            self.password_data.add(password)
+            self.log(f"Saved wizard password to Passwords list (auto, so retries can authenticate).")
+
         # Get factory IP and hostname option
         prog_opts = ProgramOptionsDialog(self.root,
             factory_ip=self.protocol.FACTORY_IP,
@@ -11560,6 +11571,13 @@ https://buymeacoffee.com/thelostping""")
         discovery_mode = opts['discovery_mode']
         set_hostname = opts['set_hostname']
         add_additional_users = opts['add_additional_users']
+
+        # v4.4.8-beta7 — auto-save the wizard's password to the saved list so
+        # retries after a partial-failure run can authenticate. See note in
+        # classic wizard counterpart.
+        if password and password not in self.password_data.get_all():
+            self.password_data.add(password)
+            self.log(f"Saved wizard password to Passwords list (auto, so retries can authenticate).")
         # v4.3 — session top-bar overrides the wizard. Interface and DHCP
         # are declared once for the whole app, not per-wizard.
         session_iface = self._resolve_session_iface()
