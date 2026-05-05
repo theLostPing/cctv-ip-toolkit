@@ -104,6 +104,10 @@ SETTINGS_FILE         = str(CONFIG_DIR / "settings.ini")
 CAMERAS_FILE          = str(CONFIG_DIR / "cameras.json")
 PASSWORDS_FILE        = str(CONFIG_DIR / "passwords.json")
 ADDITIONAL_USERS_FILE = str(CONFIG_DIR / "additional_users.json")
+# v4.4.8-beta6 — last working password per MAC, so the wizard's pre-flight
+# factory-reset doesn't have to re-walk 800+ entries on a camera we've already
+# authenticated against. Format: {"<mac_no_separators_uppercase>": "<password>"}.
+PASSWORD_CACHE_FILE   = str(CONFIG_DIR / "password_cache.json")
 
 # Export files (visible, user-configurable). These are rebuilt whenever EXPORT_DIR changes
 # via _rebind_export_paths() so the rest of the code can keep using the module-level names.
@@ -1734,6 +1738,20 @@ class AxisProtocol(CameraProtocol):
         auth = HTTPDigestAuth("root", password)
         cidr = sum(bin(int(x)).count('1') for x in subnet.split('.')) if subnet else 24
 
+        # v4.4.8-beta6 — diagnostic capture. Each leg appends one line; on
+        # overall failure the wizard logger gets the full breakdown so we can
+        # see which path/status caused the failure without re-running with a
+        # packet sniffer.
+        def _diag(msg):
+            try:
+                cb = getattr(self, 'log_callback', None)
+                if callable(cb):
+                    cb(f"      [set_network] {msg}")
+            except Exception:
+                pass
+
+        _diag(f"target ip={new_ip}/{cidr} gw={gateway} via current_ip={ip} as user=root")
+
         # --- ONVIF path ---
         onvif_ok = False
         # Gateway has to go in its own SOAP call. Tried merging it into the
@@ -1745,11 +1763,14 @@ class AxisProtocol(CameraProtocol):
                    f'<IPv4Address>{gateway}</IPv4Address>'
                    f'</SetNetworkDefaultGateway></Body></Envelope>')
         try:
-            requests.post(f"http://{ip}/vapix/services", data=gw_soap,
+            r_gw = requests.post(f"http://{ip}/vapix/services", data=gw_soap,
                 headers={"Content-Type": "application/soap+xml"},
                 auth=auth, timeout=TIMEOUT)
-        except:
-            pass  # gw failure isn't fatal — IP can still be set, we'll just retry gw
+            snippet = (r_gw.text or '')[:240].replace('\n', ' ').replace('\r', '')
+            _diag(f"ONVIF SetNetworkDefaultGateway → status={r_gw.status_code} body[:240]={snippet}")
+        except Exception as e:
+            _diag(f"ONVIF SetNetworkDefaultGateway → exception: {type(e).__name__}: {e}")
+            # gw failure isn't fatal — IP can still be set, we'll just retry gw
 
         # Now the static IP + DHCP off in one shot. PrefixLength is CIDR notation
         # (the /24 in 192.168.1.0/24), Axis expects an integer here.
@@ -1769,17 +1790,22 @@ class AxisProtocol(CameraProtocol):
             r = requests.post(f"http://{ip}/vapix/services", data=ip_soap,
                 headers={"Content-Type": "application/soap+xml"},
                 auth=auth, timeout=TIMEOUT)
+            snippet = (r.text or '')[:240].replace('\n', ' ').replace('\r', '')
+            has_fault = 'Fault' in (r.text or '')
+            _diag(f"ONVIF SetNetworkInterfaces → status={r.status_code} fault_in_body={has_fault} body[:240]={snippet}")
             # Axis returns 200 even on a failed config change, so the body has
             # to be checked for <Fault>. Found this on a P3245 that wouldn't
             # stick a static IP and was lying about it — a 200 with a Fault
             # block. Why they don't return 4xx in that case I do not know.
-            if r.status_code == 200 and 'Fault' not in r.text:
+            if r.status_code == 200 and not has_fault:
                 onvif_ok = True
-        except:
-            pass
+        except Exception as e:
+            _diag(f"ONVIF SetNetworkInterfaces → exception: {type(e).__name__}: {e}")
 
         if onvif_ok:
+            _diag("ONVIF path SUCCESS")
             return True
+        _diag("ONVIF path failed — falling back to VAPIX param.cgi")
 
         # --- VAPIX fallback ---
         # Order matters here. If you set IP first then DHCP, the camera goes
@@ -1787,15 +1813,18 @@ class AxisProtocol(CameraProtocol):
         # subnet, IP last — that order has been bulletproof since at least
         # the M-series firmware in 2012.
         try:
-            requests.get(f"http://{ip}/axis-cgi/param.cgi",
+            r1 = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.IPv4.DHCP": "no"},
                 auth=auth, timeout=TIMEOUT)
-            requests.get(f"http://{ip}/axis-cgi/param.cgi",
+            _diag(f"VAPIX DHCP=no → status={r1.status_code} body[:160]={(r1.text or '')[:160]!r}")
+            r2 = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.DefaultRouter": gateway},
                 auth=auth, timeout=TIMEOUT)
-            requests.get(f"http://{ip}/axis-cgi/param.cgi",
+            _diag(f"VAPIX DefaultRouter={gateway} → status={r2.status_code} body[:160]={(r2.text or '')[:160]!r}")
+            r3 = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.SubnetMask": subnet},
                 auth=auth, timeout=TIMEOUT)
+            _diag(f"VAPIX SubnetMask={subnet} → status={r3.status_code} body[:160]={(r3.text or '')[:160]!r}")
             # Setting IPAddress is the call that yanks the rug — the response
             # may never come back because the kernel has switched interfaces
             # by the time it tries to ack. Hence the ConnectionError below
@@ -1803,13 +1832,18 @@ class AxisProtocol(CameraProtocol):
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.IPAddress": new_ip},
                 auth=auth, timeout=TIMEOUT)
-            return r.status_code == 200
+            _diag(f"VAPIX IPAddress={new_ip} → status={r.status_code} body[:160]={(r.text or '')[:160]!r}")
+            ok = r.status_code == 200
+            _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200)'}")
+            return ok
         except requests.exceptions.ConnectionError:
+            _diag("VAPIX path → ConnectionError on final IPAddress write — treating as SUCCESS (kernel swapped iface mid-response)")
             # Connection died mid-call — that's actually GOOD on this one,
             # means the IP change took effect. Return True; verification step
             # higher up will confirm the camera is reachable on the new IP.
             return True
-        except:
+        except Exception as e:
+            _diag(f"VAPIX path → exception: {type(e).__name__}: {e}")
             return False
 
     def set_hostname(self, ip, password, hostname):
@@ -5957,6 +5991,8 @@ class CCTVToolkitApp:
         if saved_brand not in PROTOCOLS:
             saved_brand = 'axis'
         self.protocol = PROTOCOLS[saved_brand]()
+        # v4.4.8-beta6 — wire diagnostic logging so set_network etc can write to the wizard log
+        self.protocol.log_callback = self.log
 
         self.log_queue = queue.Queue()
         self.cancel_flag = False
@@ -6010,6 +6046,7 @@ class CCTVToolkitApp:
             dialog = BrandSelectionDialog(self.root, self.protocol.BRAND_KEY)
             if dialog.result:
                 self.protocol = PROTOCOLS[dialog.result]()
+                self.protocol.log_callback = self.log
                 self.brand_var.set(dialog.result)
                 self.settings.set('general', 'brand', dialog.result)
                 self.factory_ip_label.config(
@@ -6166,6 +6203,7 @@ class CCTVToolkitApp:
         if new_brand not in PROTOCOLS:
             return
         self.protocol = PROTOCOLS[new_brand]()
+        self.protocol.log_callback = self.log
         self.settings.set('general', 'brand', new_brand)
         self.factory_ip_label.config(
             text=f"Factory IP: {self.protocol.FACTORY_IP}  |  User: {self.protocol.DEFAULT_USER}")
@@ -7671,20 +7709,55 @@ class CCTVToolkitApp:
         self.log(f"  ✗ netsh add {chosen}/24 to interface {iface_idx} failed.")
         return False
 
-    def _find_working_password(self, ip, timeout_per=2):
-        """v4.4.8 — Walk the toolkit's saved password list (the Passwords tab
-        list) and return the first one that authenticates against
-        basicdeviceinfo.cgi on the camera. Tries HTTP Digest first (Axis
-        FW 10+ default) then Basic. Returns None if nothing authenticates —
-        caller treats that as 'don't know the camera's existing root pwd,
-        can't factory-reset autonomously'."""
-        pwds = list(self.password_data.get_all() or [])
-        if '' not in pwds:
-            pwds.insert(0, '')
+    def _load_password_cache(self):
+        """v4.4.8-beta6 — load {mac_no_sep_upper: password} cache."""
+        try:
+            if not os.path.exists(PASSWORD_CACHE_FILE):
+                return {}
+            with open(PASSWORD_CACHE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _save_password_cache_entry(self, mac_clean, password):
+        """v4.4.8-beta6 — persist a working password for a MAC."""
+        if not mac_clean:
+            return
+        try:
+            cache = self._load_password_cache()
+            cache[mac_clean] = password
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(PASSWORD_CACHE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, indent=2)
+        except Exception:
+            pass
+
+    def _find_working_password(self, ip, timeout_per=2, known_mac=None):
+        """v4.4.8 — Find a password that authenticates against the camera at
+        `ip` via basicdeviceinfo.cgi. Tries HTTP Digest first (Axis FW 10+
+        default) then Basic.
+
+        beta6: if `known_mac` is given (or we can probe one cheaply via
+        no-auth basicdeviceinfo), check the per-MAC password cache first —
+        that turns a 2-minute walk into one HTTP roundtrip on cameras we've
+        already authenticated against. On success, the working password is
+        saved back to the cache for next time.
+
+        Returns the working password string, or None."""
+        # Cheap MAC probe so we can hit the cache. Axis basicdeviceinfo
+        # no-auth returns SerialNumber == MAC.
+        mac_clean = (known_mac or '').upper().replace(':', '').replace('-', '') or None
+        if not mac_clean:
+            try:
+                info = self.protocol.probe_unrestricted(ip) if hasattr(self, 'protocol') else {}
+                m = (info or {}).get('mac', '')
+                mac_clean = (m or '').upper().replace(':', '').replace('-', '') or None
+            except Exception:
+                pass
+
         from requests.auth import HTTPBasicAuth, HTTPDigestAuth
-        for pwd in pwds:
-            if getattr(self, 'cancel_flag', False):
-                return None
+
+        def _try(pwd):
             for auth_cls in (HTTPDigestAuth, HTTPBasicAuth):
                 try:
                     r = requests.post(
@@ -7693,9 +7766,30 @@ class CCTVToolkitApp:
                         auth=auth_cls('root', pwd),
                         timeout=timeout_per)
                     if r.status_code == 200:
-                        return pwd
+                        return True
                 except Exception:
                     continue
+            return False
+
+        # 1. Cache hit?
+        if mac_clean:
+            cache = self._load_password_cache()
+            cached = cache.get(mac_clean)
+            if cached is not None and _try(cached):
+                self.log(f"  {ip}: auth via cached password for MAC {mac_clean}")
+                return cached
+
+        # 2. Walk the saved list.
+        pwds = list(self.password_data.get_all() or [])
+        if '' not in pwds:
+            pwds.insert(0, '')
+        for pwd in pwds:
+            if getattr(self, 'cancel_flag', False):
+                return None
+            if _try(pwd):
+                if mac_clean:
+                    self._save_password_cache_entry(mac_clean, pwd)
+                return pwd
         return None
 
     def _wizard_findreset_pass(self, opts):
@@ -7802,7 +7896,7 @@ class CCTVToolkitApp:
                 self.log(f"  {f['ip']}: skipped by operator")
                 continue
             self.log(f"  {f['ip']}: walking saved passwords for auth…")
-            working_pwd = self._find_working_password(f['ip'])
+            working_pwd = self._find_working_password(f['ip'], known_mac=f.get('mac'))
             if working_pwd is None:
                 self.log(f"  {f['ip']}: no saved password authenticated — skipped")
                 self.root.after(0, lambda f=f: messagebox.showwarning(
