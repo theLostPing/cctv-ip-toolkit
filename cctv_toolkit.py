@@ -7671,6 +7671,165 @@ class CCTVToolkitApp:
         self.log(f"  ✗ netsh add {chosen}/24 to interface {iface_idx} failed.")
         return False
 
+    def _find_working_password(self, ip, timeout_per=2):
+        """v4.4.8 — Walk the toolkit's saved password list (the Passwords tab
+        list) and return the first one that authenticates against
+        basicdeviceinfo.cgi on the camera. Tries HTTP Digest first (Axis
+        FW 10+ default) then Basic. Returns None if nothing authenticates —
+        caller treats that as 'don't know the camera's existing root pwd,
+        can't factory-reset autonomously'."""
+        pwds = list(self.password_data.get_all() or [])
+        if '' not in pwds:
+            pwds.insert(0, '')
+        from requests.auth import HTTPBasicAuth, HTTPDigestAuth
+        for pwd in pwds:
+            if getattr(self, 'cancel_flag', False):
+                return None
+            for auth_cls in (HTTPDigestAuth, HTTPBasicAuth):
+                try:
+                    r = requests.post(
+                        f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
+                        json={"apiVersion": "1.0", "method": "getAllProperties"},
+                        auth=auth_cls('root', pwd),
+                        timeout=timeout_per)
+                    if r.status_code == 200:
+                        return pwd
+                except Exception:
+                    continue
+        return None
+
+    def _wizard_findreset_pass(self, opts):
+        """v4.4.8 — Pre-flight pass at wizard start. Sweeps common deployment
+        /24s on the SELECTED interface, finds Axis MACs whose subnets the PC
+        has no path to (typically reused cameras with hardcoded IPs from
+        prior sites), prompts per-camera to factory-reset, walks the saved
+        password list to authenticate, fires factory_reset. Reset cameras
+        reboot and the regular Phase 1+2+3 wait loop catches them as they
+        come back at factory IP / DHCP / link-local — they then program as
+        normal slots from the cameras.json list.
+
+        Skipped silently when:
+          - toolkit not running as admin (alias adds need it)
+          - no interface is selected
+          - protocol doesn't expose factory_reset
+
+        Aliases that hit something stay registered in multihome_state.json
+        so cleanup at wizard end is automatic; aliases that found nothing
+        are removed inline."""
+        if not _is_admin_windows():
+            return 0
+        if not hasattr(self, 'protocol') or not hasattr(self.protocol, 'factory_reset'):
+            return 0
+        iface = (opts or {}).get('interface') or {}
+        iface_idx = iface.get('index') or (
+            self._get_interface_index() if hasattr(self, '_get_interface_index') else None)
+        if not iface_idx:
+            return 0
+
+        self.log(f"\nPre-flight: sweeping {len(DEFAULT_FIND_ANYWHERE_SUBNETS)} /24(s) for previously-configured cameras on the programming NIC...")
+
+        found = []
+        for sn in DEFAULT_FIND_ANYWHERE_SUBNETS:
+            if getattr(self, 'cancel_flag', False):
+                break
+            already = _have_route_to(f"{sn}.1")
+            alias_ip = None
+            if already and already.get('iface_index') == iface_idx:
+                pass
+            else:
+                chosen = _pick_free_host_ip(sn, '255.255.255.0',
+                    candidates=(99, 98, 97, 250, 249, 200, 150, 100, 50))
+                if not chosen:
+                    continue
+                if not _netsh_add_ip(iface_idx, chosen, '255.255.255.0'):
+                    continue
+                alias_ip = chosen
+                time.sleep(0.5)
+            _tcp_probe_sweep(sn)
+            time.sleep(0.5)
+            matches = _arp_matches_in_subnet(sn)
+            if matches:
+                for m in matches:
+                    model = '?'
+                    try:
+                        info = self.protocol.probe_unrestricted(m['ip']) or {}
+                        if info.get('model'):
+                            model = info['model']
+                    except Exception:
+                        pass
+                    found.append({'ip': m['ip'], 'mac': m['mac'], 'model': model,
+                                  'subnet': sn})
+                if alias_ip:
+                    existing = _load_multihome_state() or []
+                    existing.append({'iface_index': iface_idx, 'ip': alias_ip,
+                                     'mask': '255.255.255.0', 'subnet_base': sn,
+                                     '_added_by': 'wizard_findreset', '_kept': True})
+                    _save_multihome_state(existing)
+            else:
+                if alias_ip:
+                    _netsh_remove_ip(iface_idx, alias_ip)
+
+        if not found:
+            self.log("Pre-flight: none found — proceeding to normal wait loop.")
+            return 0
+
+        self.log(f"Pre-flight: {len(found)} previously-configured camera(s) detected.")
+        reset_count = 0
+        for f in found:
+            if getattr(self, 'cancel_flag', False):
+                break
+            result = [None]
+            def _show(f=f):
+                msg = (f"Pre-existing camera detected on the programming NIC:\n\n"
+                       f"  IP:    {f['ip']}\n"
+                       f"  MAC:   {f['mac']}\n"
+                       f"  Model: {f['model']}\n\n"
+                       f"This camera carries a hardcoded IP from a previous "
+                       f"deployment. Factory-reset it so the wizard can program "
+                       f"it as a fresh slot from your camera list?\n\n"
+                       f"  Yes    — walk saved passwords, factory-reset, continue\n"
+                       f"  No     — leave it alone (skip this camera)\n"
+                       f"  Cancel — abort the wizard run")
+                result[0] = messagebox.askyesnocancel(
+                    f"Factory-reset {f['ip']}?", msg, parent=self.root)
+            self.root.after(0, _show)
+            while result[0] is None and not getattr(self, 'cancel_flag', False):
+                time.sleep(0.05)
+            if result[0] is None:
+                self.cancel_flag = True
+                break
+            if not result[0]:
+                self.log(f"  {f['ip']}: skipped by operator")
+                continue
+            self.log(f"  {f['ip']}: walking saved passwords for auth…")
+            working_pwd = self._find_working_password(f['ip'])
+            if working_pwd is None:
+                self.log(f"  {f['ip']}: no saved password authenticated — skipped")
+                self.root.after(0, lambda f=f: messagebox.showwarning(
+                    "Password not found",
+                    f"None of the saved passwords authenticated against "
+                    f"{f['ip']}.\n\nAdd the camera's current root password to "
+                    f"the Passwords tab, then re-run the wizard. Or factory-"
+                    f"reset this camera manually with the existing Factory "
+                    f"Default tool.",
+                    parent=self.root))
+                continue
+            self.log(f"  {f['ip']}: auth OK — sending factory_reset")
+            try:
+                ok = self.protocol.factory_reset(f['ip'], working_pwd)
+                if ok:
+                    self.log(f"  {f['ip']}: factory-reset accepted — camera will reboot")
+                    reset_count += 1
+                else:
+                    self.log(f"  {f['ip']}: factory_reset returned False")
+            except Exception as e:
+                self.log(f"  {f['ip']}: factory_reset error: {e}")
+
+        if reset_count:
+            self.log(f"Pre-flight: {reset_count} camera(s) factory-reset. Pausing 8s for them to drop offline before the wait loop starts.")
+            time.sleep(8)
+        return reset_count
+
     def _cleanup_multihome(self):
         """Tear down whatever _offer_multihome added. Idempotent — safe to
         call even if no multi-home was set up. Removes the state file when
@@ -10123,10 +10282,11 @@ Email: axisprogrammer@thelostping.net
         "4.4.8": (
             "What's new in v4.4.8 (beta)",
             [
-                "• NEW: Tools → Find Camera Anywhere… A wide-net discovery for the case where mDNS/DHCP only surface a camera at link-local (or not at all) but the camera is actually bound to a previously-configured static IP on a subnet your NIC has no path to. Sweeps a configurable list of common deployment /24s (default: 10.0.0, 10.0.1, 192.168.0, 192.168.1, 192.168.50, 172.16.0), temporarily aliases each subnet on the selected NIC, ARPs via TCP probes, and keeps the alias only for /24s where an Axis MAC actually replied. Aliases register in the same multihome_state.json so cleanup at wizard end / next launch is automatic and crash-resilient.",
-                "• Per-result actions on the Find Anywhere result list: Open Web UI, Factory Default… (hands off to the existing standalone factory-default flow with the IP pre-filled), Copy IP.",
-                "• start_factory_default_wizard now accepts an optional prefill_ip — for the Find Anywhere → Factory Default handoff, but also usable from any other flow that already knows the camera's address.",
-                "• Beta build — install side-by-side via the prerelease installer, exercise on real reuse cameras, file feedback before the stable 4.4.8 ships.",
+                "• NEW: Wizard pre-flight — find & factory-reset previously-configured cameras automatically. When the programming wizard starts, it sweeps common deployment /24s on the selected NIC (default: 10.0.0, 10.0.1, 192.168.0, 192.168.1, 192.168.50, 172.16.0), finds any Axis MACs whose subnets the PC has no path to, prompts per-camera to factory-reset, walks the saved password list to authenticate, and fires factory_reset. Reset cameras reboot and the regular wait loop catches them as they come back at factory IP / DHCP / link-local — no more 'wizard sits forever waiting because the camera has a hardcoded IP from a previous job'. Requires admin (alias adds need it); skipped silently if not elevated.",
+                "• NEW: Tools → Find Camera Anywhere… The same /24 sweep as a manual tool, with per-result actions (Open Web UI, Factory Default…, Copy IP). Useful for one-off lookups outside a wizard run.",
+                "• start_factory_default_wizard now accepts an optional prefill_ip — for the Find Anywhere → Factory Default handoff, but also usable from any flow that already knows the camera's address.",
+                "• Aliases added by either flow register in the same multihome_state.json as the existing Auto Multi-Home, so cleanup at wizard end / next launch is automatic and crash-resilient.",
+                "• Beta build — install side-by-side via the prerelease installer, exercise on real reuse cameras, file feedback before stable 4.4.8 ships.",
             ],
         ),
         "4.4.7": (
@@ -10587,6 +10747,11 @@ https://buymeacoffee.com/thelostping""")
 
             # v4.3 #11 — Auto NIC multi-home (with explicit consent dialog)
             self._offer_multihome(_r0, cameras)
+
+            # v4.4.8 — Pre-flight: find any previously-configured cameras on
+            # the programming NIC across common /24s and offer to factory-reset
+            # them so they come back as fresh slots in the wait loop below.
+            self._wizard_findreset_pass(_r0)
 
             _ensure_output_csv_header()
 
@@ -11372,6 +11537,11 @@ https://buymeacoffee.com/thelostping""")
 
             # v4.3 #11 — Auto NIC multi-home (with explicit consent dialog)
             self._offer_multihome(opts, cameras)
+
+            # v4.4.8 — Pre-flight: find any previously-configured cameras on
+            # the programming NIC across common /24s and offer to factory-reset
+            # them so they come back as fresh slots in the wait loop below.
+            self._wizard_findreset_pass(opts)
 
             _ensure_output_csv_header()
 
