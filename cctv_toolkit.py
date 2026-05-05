@@ -7497,12 +7497,20 @@ class CCTVToolkitApp:
                     for sn in valid:
                         if cancel_token['cancel']:
                             break
-                        # Skip if PC already has an IP in this /24 — no alias needed.
+                        # Skip aliasing only if PC already has an IP in this /24 ON THE
+                        # SELECTED INTERFACE. If a different NIC covers the subnet (e.g.
+                        # home-LAN Ethernet has 10.0.7.11/16 which technically covers
+                        # 10.0.0.0/24), the OS would route via that NIC — not the
+                        # programming NIC where the camera is physically attached. In
+                        # that case we still need to alias /24 on the selected iface
+                        # so a more-specific /24 route wins for our probes.
                         already = _have_route_to(f"{sn}.1")
                         alias_ip = None
-                        if already:
-                            self.log(f"  [{sn}.x] already routable from {already['ip']}/{already['prefix_len']}")
+                        if already and already.get('iface_index') == iface_idx:
+                            self.log(f"  [{sn}.x] already routable on selected iface from {already['ip']}/{already['prefix_len']}")
                         else:
+                            if already:
+                                self.log(f"  [{sn}.x] {already['ip']}/{already['prefix_len']} is on iface {already.get('iface_index')} (wrong NIC) — aliasing /24 on selected iface {iface_idx} for a more-specific match")
                             # Pick a free host (skip .1 gateway slot).
                             chosen = _pick_free_host_ip(sn, '255.255.255.0',
                                 candidates=(99, 98, 97, 250, 249, 200, 150, 100, 50))
