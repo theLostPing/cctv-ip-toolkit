@@ -10742,6 +10742,7 @@ Email: axisprogrammer@thelostping.net
                 "• If the toolkit gets stuck logging in during programming, it now tries one auto-rescue: factory-reset with the password you provided, wait for the camera to come back, and pick up where it left off. You don't have to do anything.",
                 "• If you've already factory-reset a camera by hand and put it back on the bench, the toolkit recognizes that and stops nagging you for the old password. New 'Already factory-reset' button on the password prompt for the older cameras that don't auto-detect.",
                 "• Stuck-camera retry spam — fixed. If the same camera fails factory-reset twice in a row, the toolkit now stops hammering it, prints clear instructions to paperclip-reset it, and waits quietly for 30 seconds. No more 30-times-in-a-row 'wrong existing password' messages while you're already trying to physically reset the camera.",
+                "• The big green ✓ DONE banner now stays on the screen until you actually unplug the just-programmed camera. As soon as the toolkit sees the camera disappear from the network, the screen flips to PLUG IN CAMERA for the next one. No more guessing whether the previous camera finished — the banner waits for you, not the other way around.",
                 "• Net effect: plug in, click Program, and the toolkit handles the awkward middle states (reused cameras, stale passwords, slow cameras) without bouncing back to you.",
             ],
         ),
@@ -13050,22 +13051,50 @@ https://buymeacoffee.com/thelostping""")
                 remaining.pop(cam_idx)
 
                 if remaining and not self.cancel_flag:
-                    # No continue dialog — banner tells the user what to do
+                    # v4.5.1-beta5: keep the SUCCESS banner up until the
+                    # camera physically disappears from the network (ping
+                    # at its programmed IP fails). Brian's ask 2026-05-05:
+                    # "keep the completion note up UNTIL you see the
+                    # programmed camera disappear from the network. I
+                    # unplugged > Plug in camera x". So the screen flips
+                    # to PLUG IN exactly when the operator unplugs.
+                    #
+                    # 3s minimum hold for fast-unplug case (so the banner
+                    # is at least seen even if you're already unplugging),
+                    # then poll ping(static_ip) every 1s. Two consecutive
+                    # ping failures = unplugged → transition.
+                    time.sleep(3)
+                    ping_target = static_ip
+                    if ping_target and self.ping_camera(ping_target, timeout_ms=800):
+                        self.status_log(
+                            f"  Holding ✓ {cam_name} DONE banner until you unplug the camera…")
+                        miss_streak = 0
+                        wait_start = time.time()
+                        last_heartbeat = wait_start
+                        while not self.cancel_flag:
+                            if self.ping_camera(ping_target, timeout_ms=800):
+                                miss_streak = 0
+                            else:
+                                miss_streak += 1
+                                if miss_streak >= 2:
+                                    self.status_log(
+                                        f"  ✓ {cam_name} unplugged after {int(time.time() - wait_start)}s — moving on.")
+                                    break
+                            now_t = time.time()
+                            if now_t - last_heartbeat >= 30:
+                                self.status_log(
+                                    f"  ...still plugged in at {ping_target} ({int(now_t - wait_start)}s elapsed) — unplug when ready")
+                                last_heartbeat = now_t
+                            time.sleep(1)
+
                     _ui(self.status_set_camera, '—',
                         f'{programmed_count} of {len(cameras)} done · {len(remaining)} remaining')
-                    time.sleep(5)  # v4.5.1-beta2: 2s → 5s so the success callout actually lingers
 
-                    # 2026-04-30 hot fix: wait for the just-programmed camera to leave
-                    # factory IP before entering next discovery. Without this guard, if
-                    # the user hasn't unplugged yet, the next iteration finds the SAME
-                    # camera at factory IP, ARP query (post-unpin) returns None so the
-                    # seen_macs check is bypassed, and we try to program the next slot
-                    # onto the previous still-plugged-in camera. Auth fails, network
-                    # call appears to "succeed" but actually does nothing useful, then
-                    # the script bails. Belt-and-suspenders: ping is the source of truth
-                    # for "is the previous camera still here", since ARP cache is stale
-                    # after arp_unpin.
-                    if factory_ip:
+                    # Belt-and-suspenders factory_ip wait — only fires if
+                    # somehow the camera is still answering at 192.168.0.90
+                    # (rare, mostly defensive against the 2026-04-30 same-MAC
+                    # double-program case).
+                    if factory_ip and self.ping_camera(factory_ip, timeout_ms=800):
                         wait_start = time.time()
                         last_heartbeat = wait_start
                         announced = False
