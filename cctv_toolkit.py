@@ -7792,24 +7792,132 @@ class CCTVToolkitApp:
                 return pwd
         return None
 
+    def _smart_preflight_via_linklocal(self, iface_idx):
+        """v4.4.8-beta10 — Smart pre-flight: ask the camera where it lives.
+
+        Steps:
+          1. mDNS scan on the selected interface — finds cameras at link-local.
+          2. Probe basicdeviceinfo no-auth at the link-local IP — confirms
+             camera HTTP is alive and gets model + serial.
+          3. Walk the saved password list (with per-MAC cache + add-pwd-prompt
+             fallback) to authenticate via Digest.
+          4. With creds, call verify_camera_state at the link-local IP. The
+             camera tells us its configured Network.eth0.IPAddress / Subnet /
+             Gateway — its REAL operating address, not the link-local fallback.
+          5. If that configured IP is on a subnet our selected NIC can't reach,
+             auto-alias just that /24 (no per-camera prompt — implicit consent
+             from running pre-flight) and re-probe at the configured IP to
+             confirm.
+          6. Return list of {ip, mac, model, working_pwd, subnet, link_local_ip}.
+
+        Falls back gracefully to (returns []) when:
+          - mDNS finds nothing,
+          - HTTP at link-local doesn't respond (camera userspace wedged or
+            bound only to its configured static — dumb /24 sweep handles those).
+
+        Costs ONE temporary alias per camera at its actual subnet, vs the dumb
+        sweep's six. No NIC pollution for empty subnets."""
+        out = []
+        try:
+            mdns_cams = AxisMDNSDiscovery.discover(timeout=4)
+        except Exception:
+            return out
+        if not mdns_cams:
+            return out
+
+        # Make sure link-local route is up so we can talk over 169.254.x.x
+        try:
+            self.add_linklocal_route()
+        except Exception:
+            pass
+
+        for mc in mdns_cams:
+            if getattr(self, 'cancel_flag', False):
+                break
+            ll_ip = mc.get('ip', '')
+            ll_mac = (mc.get('mac', '') or '').upper()
+            if not ll_ip or not ll_mac:
+                continue
+            mac_clean = ll_mac.replace(':', '').replace('-', '')
+
+            # Confirm HTTP at link-local actually responds (no-auth probe).
+            try:
+                noauth = self.protocol.probe_unrestricted(ll_ip) or {}
+            except Exception:
+                noauth = {}
+            model = noauth.get('model') or mc.get('model', '?')
+            if not noauth.get('model'):
+                # No-auth probe failed — the camera might require auth even
+                # for getAllUnrestrictedProperties (some FW does), or HTTP
+                # isn't bound at link-local. Try a quick TCP connect to /80
+                # — if that's dead, the dumb sweep is our only path.
+                import socket
+                try:
+                    with socket.create_connection((ll_ip, 80), timeout=1.5):
+                        pass
+                except Exception:
+                    self.log(f"  smart: {ll_ip} ({ll_mac}) — HTTP dead at link-local, deferring to dumb sweep")
+                    continue
+
+            # Walk passwords (cache hits in <100ms on a known camera).
+            self.log(f"  smart: {ll_ip} ({ll_mac}, {model}) — auth via saved passwords…")
+            pwd = self._find_working_password(ll_ip, known_mac=mac_clean)
+            if pwd is None:
+                self.log(f"  smart: {ll_ip} — no saved pwd authenticated, deferring to dumb sweep")
+                continue
+
+            # Ask the camera what it thinks its real address is.
+            try:
+                state = self.protocol.verify_camera_state(ll_ip, pwd)
+            except Exception:
+                state = {}
+            actual_ip = (state or {}).get('actual_ip') or ''
+            actual_subnet = (state or {}).get('actual_subnet') or '255.255.255.0'
+
+            target_ip = actual_ip if actual_ip else ll_ip
+            subnet_base = '.'.join(target_ip.split('.')[:3]) if '.' in target_ip else None
+
+            if actual_ip and actual_ip != ll_ip and not actual_ip.startswith('169.254.'):
+                # Need a route to the configured IP. Auto-alias without per-camera
+                # consent prompt (running pre-flight = implicit consent).
+                self.log(f"  smart: {ll_ip} → camera reports its real IP is {actual_ip}/{actual_subnet}")
+                if self._ensure_route_to_camera(actual_ip, ask_consent=False):
+                    # Re-probe at the configured IP to confirm reachability.
+                    try:
+                        confirm = self.protocol.probe_unrestricted(actual_ip) or {}
+                        if confirm.get('model'):
+                            self.log(f"  smart: confirmed reachable at {actual_ip}")
+                            target_ip = actual_ip
+                    except Exception:
+                        pass
+
+            out.append({'ip': target_ip, 'mac': ll_mac, 'model': model,
+                        'subnet': subnet_base or 'unknown',
+                        'link_local_ip': ll_ip,
+                        'working_pwd': pwd,
+                        '_via': 'smart'})
+        return out
+
     def _wizard_findreset_pass(self, opts):
-        """v4.4.8 — Pre-flight pass at wizard start. Sweeps common deployment
-        /24s on the SELECTED interface, finds Axis MACs whose subnets the PC
-        has no path to (typically reused cameras with hardcoded IPs from
-        prior sites), prompts per-camera to factory-reset, walks the saved
-        password list to authenticate, fires factory_reset. Reset cameras
-        reboot and the regular Phase 1+2+3 wait loop catches them as they
-        come back at factory IP / DHCP / link-local — they then program as
-        normal slots from the cameras.json list.
+        """v4.4.8 — Pre-flight pass at wizard start. Two stages now:
+
+        1. SMART pass (beta10): mDNS at link-local, no-auth probe + saved-pwd
+           walk + verify_camera_state to learn the camera's real configured
+           IP, then auto-alias just that /24. One alias, one camera, exact
+           subnet.
+
+        2. DUMB /24 sweep (beta5): six default deployment subnets, blind
+           ARP-probe. Catches cameras where HTTP at link-local is dead OR
+           mDNS doesn't surface them.
+
+        Cameras found by stage 1 are MAC-deduped from stage 2 so we don't
+        double-prompt. After both stages, per-camera factory-reset prompt
+        with cached creds (smart) or fresh pwd walk (dumb).
 
         Skipped silently when:
           - toolkit not running as admin (alias adds need it)
           - no interface is selected
-          - protocol doesn't expose factory_reset
-
-        Aliases that hit something stay registered in multihome_state.json
-        so cleanup at wizard end is automatic; aliases that found nothing
-        are removed inline."""
+          - protocol doesn't expose factory_reset"""
         if not _is_admin_windows():
             return 0
         if not hasattr(self, 'protocol') or not hasattr(self.protocol, 'factory_reset'):
@@ -7820,9 +7928,20 @@ class CCTVToolkitApp:
         if not iface_idx:
             return 0
 
-        self.log(f"\nPre-flight: sweeping {len(DEFAULT_FIND_ANYWHERE_SUBNETS)} /24(s) for previously-configured cameras on the programming NIC...")
+        # ---- Stage 1: smart pass via link-local mDNS + camera self-report ----
+        self.log("\nPre-flight (smart): mDNS on link-local + ask each camera its real IP…")
+        smart_found = self._smart_preflight_via_linklocal(iface_idx)
+        seen_macs_smart = set((f['mac'] or '').upper().replace(':', '').replace('-', '')
+                              for f in smart_found if f.get('mac'))
+        if smart_found:
+            self.log(f"Pre-flight (smart): {len(smart_found)} camera(s) located via self-report.")
+        else:
+            self.log("Pre-flight (smart): nothing found via link-local — falling through to subnet sweep.")
 
-        found = []
+        # ---- Stage 2: dumb /24 sweep for everything smart pass missed ----
+        self.log(f"Pre-flight (sweep): scanning {len(DEFAULT_FIND_ANYWHERE_SUBNETS)} /24(s) on the programming NIC…")
+
+        found = list(smart_found)
         for sn in DEFAULT_FIND_ANYWHERE_SUBNETS:
             if getattr(self, 'cancel_flag', False):
                 break
@@ -7842,6 +7961,9 @@ class CCTVToolkitApp:
             _tcp_probe_sweep(sn)
             time.sleep(0.5)
             matches = _arp_matches_in_subnet(sn)
+            # v4.4.8-beta10 — drop matches whose MAC was already located by the
+            # smart pass; otherwise we'd prompt the operator twice.
+            matches = [m for m in matches if (m.get('mac', '') or '').upper().replace(':', '').replace('-', '') not in seen_macs_smart]
             if matches:
                 for m in matches:
                     model = '?'
@@ -7852,7 +7974,7 @@ class CCTVToolkitApp:
                     except Exception:
                         pass
                     found.append({'ip': m['ip'], 'mac': m['mac'], 'model': model,
-                                  'subnet': sn})
+                                  'subnet': sn, '_via': 'sweep'})
                 if alias_ip:
                     existing = _load_multihome_state() or []
                     existing.append({'iface_index': iface_idx, 'ip': alias_ip,
@@ -7895,8 +8017,13 @@ class CCTVToolkitApp:
             if not result[0]:
                 self.log(f"  {f['ip']}: skipped by operator")
                 continue
-            self.log(f"  {f['ip']}: walking saved passwords for auth…")
-            working_pwd = self._find_working_password(f['ip'], known_mac=f.get('mac'))
+            # v4.4.8-beta10 — smart pass already authenticated; reuse the pwd.
+            if f.get('working_pwd') is not None:
+                working_pwd = f['working_pwd']
+                self.log(f"  {f['ip']}: reusing pwd from smart-pass auth")
+            else:
+                self.log(f"  {f['ip']}: walking saved passwords for auth…")
+                working_pwd = self._find_working_password(f['ip'], known_mac=f.get('mac'))
             if working_pwd is None:
                 # v4.4.8-beta8 — saved walk failed. Don't silently skip; prompt
                 # the operator inline so they can type the password they know
