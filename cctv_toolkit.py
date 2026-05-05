@@ -8074,6 +8074,45 @@ class CCTVToolkitApp:
             self.log("Pre-flight: none found — proceeding to normal wait loop.")
             return 0
 
+        # v4.5.1-beta3: filter out cameras that are already factory-clean.
+        # If the operator has already manually reset a camera (paperclip)
+        # but its MAC still matches one in the Camera List, the old code
+        # would still prompt "Factory-reset?" and demand the existing
+        # password — which is blank because the camera IS factory.
+        # Detection: no-auth basicdeviceinfo probe AND no-auth pwdgrp.cgi
+        # action=list returns 200 (only true on FW 11+ factory cams).
+        # FW 10.x factory cams will fall through to the normal flow and
+        # the wizard's auth-fallback handles them.
+        already_clean = []
+        truly_used = []
+        for f in found:
+            try:
+                r1 = requests.post(
+                    f"http://{f['ip']}/axis-cgi/basicdeviceinfo.cgi",
+                    json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
+                    timeout=4)
+                if r1.status_code == 200:
+                    r2 = requests.get(
+                        f"http://{f['ip']}/axis-cgi/pwdgrp.cgi",
+                        params={"action": "list"},
+                        timeout=4)
+                    if r2.status_code == 200:
+                        already_clean.append(f)
+                        continue
+            except Exception:
+                pass
+            truly_used.append(f)
+
+        if already_clean:
+            self.log(f"Pre-flight: {len(already_clean)} camera(s) already factory-clean — no reset prompt needed:")
+            for f in already_clean:
+                self.log(f"  ✓ {f['ip']}  MAC {f['mac']}  ({f.get('model', '?')})  — will be programmed as fresh")
+        found = truly_used
+
+        if not found:
+            self.log("Pre-flight: every detected camera is already factory-clean — proceeding to normal wait loop.")
+            return 0
+
         self.log(f"Pre-flight: {len(found)} previously-configured camera(s) detected.")
         reset_count = 0
         for f in found:
@@ -8115,23 +8154,79 @@ class CCTVToolkitApp:
                 # without going hunting in the Passwords tab. If it works, save
                 # it (list + per-MAC cache) so this never happens again for
                 # this camera or any other camera using the same root pwd.
+                # v4.5.1-beta3: ALSO offer "Already factory-reset, skip" so
+                # the operator who already paperclipped the camera doesn't
+                # get stuck in an infinite password loop. (Brian KBO field
+                # session 2026-05-05 — manually-reset camera with MAC still
+                # in Camera List was unprogrammable because there was no way
+                # past the password prompt.)
                 self.log(f"  {f['ip']}: no saved password authenticated — prompting operator")
+
+                # Custom 3-button dialog: [OK with pwd] / [Already Factory-Reset] / [Skip]
+                choice = [None]  # 'pwd' / 'already_factory' / 'skip'
                 pwd_holder = [None]
                 def _ask_pwd(f=f):
-                    pwd_holder[0] = simpledialog.askstring(
-                        "Provide camera password",
-                        f"None of {len(self.password_data.get_all() or [])} saved "
-                        f"passwords authenticated against {f['ip']} "
-                        f"({f.get('model', '?')}).\n\n"
-                        f"Enter the camera's existing root password to factory-"
-                        f"reset it (or Cancel to skip this camera):",
-                        show='*', parent=self.root)
+                    dlg = tk.Toplevel(self.root)
+                    dlg.title("Provide camera password")
+                    dlg.resizable(False, False)
+                    dlg.transient(self.root)
+                    dlg.grab_set()
+                    body = ttk.Frame(dlg, padding=15)
+                    body.pack(fill='both', expand=True)
+                    msg = (f"None of {len(self.password_data.get_all() or [])} saved "
+                           f"passwords authenticated against {f['ip']} "
+                           f"({f.get('model', '?')}).\n\n"
+                           f"Three options:\n"
+                           f"  • Type the password and click OK to factory-reset\n"
+                           f"  • Click 'Already factory-reset' if you've already "
+                           f"paperclipped this camera (no password needed)\n"
+                           f"  • Click Skip to leave this camera alone")
+                    ttk.Label(body, text=msg, wraplength=460,
+                              justify='left').pack(anchor='w', pady=(0, 10))
+                    pwd_var = tk.StringVar()
+                    row = ttk.Frame(body)
+                    row.pack(fill='x', pady=(0, 12))
+                    ttk.Label(row, text="Password:").pack(side='left')
+                    e = ttk.Entry(row, textvariable=pwd_var, show='*', width=30)
+                    e.pack(side='left', padx=(6, 0))
+                    e.focus_set()
+                    def _ok():
+                        choice[0] = 'pwd'
+                        pwd_holder[0] = pwd_var.get()
+                        dlg.destroy()
+                    def _already():
+                        choice[0] = 'already_factory'
+                        dlg.destroy()
+                    def _skip():
+                        choice[0] = 'skip'
+                        dlg.destroy()
+                    btn_row = ttk.Frame(body)
+                    btn_row.pack(fill='x')
+                    ttk.Button(btn_row, text="OK", command=_ok, width=10).pack(side='right')
+                    ttk.Button(btn_row, text="Skip", command=_skip,
+                               width=10).pack(side='right', padx=(0, 6))
+                    ttk.Button(btn_row, text="Already factory-reset",
+                               command=_already, width=22).pack(side='left')
+                    dlg.bind('<Return>', lambda _e: _ok())
+                    dlg.bind('<Escape>', lambda _e: _skip())
+                    try:
+                        self._center_on_parent(dlg)
+                    except Exception:
+                        pass
                 self.root.after(0, _ask_pwd)
-                while pwd_holder[0] is None and not getattr(self, 'cancel_flag', False):
+                while choice[0] is None and not getattr(self, 'cancel_flag', False):
                     time.sleep(0.05)
+
+                if choice[0] == 'skip' or choice[0] is None:
+                    self.log(f"  {f['ip']}: operator skipped")
+                    continue
+                if choice[0] == 'already_factory':
+                    self.log(f"  {f['ip']}: operator confirmed already factory — no reset needed; wizard will program it as fresh")
+                    reset_count += 1  # treat as if reset succeeded — wizard's main loop will program it on next discovery
+                    continue
                 typed_pwd = pwd_holder[0]
                 if not typed_pwd:
-                    self.log(f"  {f['ip']}: operator cancelled — skipped")
+                    self.log(f"  {f['ip']}: empty password — skipped")
                     continue
                 # Try the typed password.
                 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
@@ -10645,6 +10740,7 @@ Email: axisprogrammer@thelostping.net
                 "• Smarter detection of which cameras really need a factory reset and which are already clean. Old check would sometimes claim a camera was clean when it wasn't, then get stuck. New check is honest about it.",
                 "• Reusing a camera that already has a password? If the password you typed in matches what's on the camera, the toolkit just changes it to the new one — no factory reset needed.",
                 "• If the toolkit gets stuck logging in during programming, it now tries one auto-rescue: factory-reset with the password you provided, wait for the camera to come back, and pick up where it left off. You don't have to do anything.",
+                "• If you've already factory-reset a camera by hand and put it back on the bench, the toolkit recognizes that and stops nagging you for the old password. New 'Already factory-reset' button on the password prompt for the older cameras that don't auto-detect.",
                 "• Net effect: plug in, click Program, and the toolkit handles the awkward middle states (reused cameras, stale passwords, slow cameras) without bouncing back to you.",
             ],
         ),
