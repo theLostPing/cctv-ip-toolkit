@@ -1728,24 +1728,42 @@ class AxisProtocol(CameraProtocol):
         if the user is already gone, returns True (no-op).
         Returns True on success or already-absent, False on a real failure
         (auth fail, network unreachable, SOAP fault). Non-fatal at the wizard
-        level — wizard logs a warning if False but keeps going."""
-        try:
-            soap = (f'<?xml version="1.0"?>'
-                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
-                    f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
-                    f'<Username>{username}</Username>'
-                    f'</DeleteUsers></Body></Envelope>')
-            r = requests.post(f"http://{ip}/vapix/services", data=soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-            if r.status_code in (200, 204):
-                return True
-            # 4xx with "user not found" SOAP fault = already deleted; treat as ok
-            if 'NoSuchUser' in r.text or 'not found' in r.text.lower():
-                return True
-            return False
-        except Exception:
-            return False
+        level — wizard logs a warning if False but keeps going.
+        v4.5.1: 3 attempts with 4s back-off — same pattern as set_network.
+        FW 10.x cameras frequently 401 the first DeleteUsers right after the
+        IP swap because they're still reconfiguring auth state. The retry
+        catches the case where it succeeds on the second or third try."""
+        soap = (f'<?xml version="1.0"?>'
+                f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
+                f'<Username>{username}</Username>'
+                f'</DeleteUsers></Body></Envelope>')
+        last_status = None
+        for attempt in range(3):
+            try:
+                r = requests.post(f"http://{ip}/vapix/services", data=soap,
+                    headers={"Content-Type": "application/soap+xml"},
+                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+                last_status = r.status_code
+                if r.status_code in (200, 204):
+                    return True
+                # 4xx with "user not found" SOAP fault = already deleted; treat as ok
+                if 'NoSuchUser' in r.text or 'not found' in r.text.lower():
+                    return True
+                # Transient 401 / 500 / 503 — retry
+                if r.status_code in (401, 500, 503) and attempt < 2:
+                    time.sleep(4)
+                    continue
+                return False
+            except (requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError):
+                if attempt < 2:
+                    time.sleep(4)
+                    continue
+                return False
+            except Exception:
+                return False
+        return False
 
     def set_network(self, ip, password, new_ip, subnet, gateway):
         # Two paths: ONVIF SOAP first because it's atomic — gateway/IP/DHCP
@@ -10743,6 +10761,7 @@ Email: axisprogrammer@thelostping.net
                 "• If you've already factory-reset a camera by hand and put it back on the bench, the toolkit recognizes that and stops nagging you for the old password. New 'Already factory-reset' button on the password prompt for the older cameras that don't auto-detect.",
                 "• Stuck-camera retry spam — fixed. If the same camera fails factory-reset twice in a row, the toolkit now stops hammering it, prints clear instructions to paperclip-reset it, and waits quietly for 30 seconds. No more 30-times-in-a-row 'wrong existing password' messages while you're already trying to physically reset the camera.",
                 "• The big green ✓ DONE banner now stays on the screen until you actually unplug the just-programmed camera. As soon as the toolkit sees the camera disappear from the network, the screen flips to PLUG IN CAMERA for the next one. No more guessing whether the previous camera finished — the banner waits for you, not the other way around.",
+                "• ONVIF cleanup at the end of programming retries automatically if the camera is briefly busy. Stops the cosmetic 'leftover ONVIF account' warning that used to show up on a few percent of cameras even though the camera itself was fine.",
                 "• Net effect: plug in, click Program, and the toolkit handles the awkward middle states (reused cameras, stale passwords, slow cameras) without bouncing back to you.",
             ],
         ),
