@@ -64,9 +64,11 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.5.1"
+APP_VERSION = "4.5.2"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
+GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
+GITHUB_RELEASES_INDEX = "https://github.com/theLostPing/cctv-ip-toolkit/releases"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
 # show up in the same download analytics as the website. The tracker 302s
 # straight to the GitHub release asset.
@@ -222,6 +224,7 @@ DEFAULT_SETTINGS = {
         'export_dir': '',  # blank = use default Documents/CCTV Toolkit
         'last_seen_version': '',  # for "what's new" popup on first launch of a new version
         'last_dismissed_version': '',  # suppresses nag when user chose "remind me later"
+        'update_channel': 'stable',  # 'stable' (tagged v* releases only) or 'beta' (also includes beta/** prereleases)
     },
     'warnings': {
         'show_incomplete_camera_warning': 'true',
@@ -10564,28 +10567,60 @@ Email: axisprogrammer@thelostping.net
     # Update checking
     # ------------------------------------------------------------------
     def _fetch_latest_release(self, timeout=6):
-        """Return (tag, body, html_url, installer_url) of the latest published release, or None.
-        installer_url is the direct download URL of the Inno Setup installer asset
-        (CCTVIPToolkit-Setup-vX.Y.Z.exe), or None if no installer is published for this release
-        (older releases shipped only the bare .exe — those fall back to browser-download)."""
+        """Return (tag, body, html_url, installer_url, is_prerelease) of the
+        most recent applicable release, or None.
+
+        Channel-aware (v4.5.1+):
+          - 'stable' (default): only tagged v* releases (GitHub /releases/latest).
+          - 'beta':              the most recent release of ANY kind, including
+                                 beta/** branch prereleases. If a stable is newer
+                                 than any beta, stable wins.
+
+        installer_url is the direct download URL of the Inno Setup installer
+        asset; None if the release shipped only the bare exe."""
+        channel = 'stable'
         try:
-            req = urllib.request.Request(
-                GITHUB_LATEST_API,
-                headers={"User-Agent": f"CCTVIPToolkit/{APP_VERSION}",
-                         "Accept": "application/vnd.github+json"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            channel = (self.settings.get('general', 'update_channel') or 'stable').strip().lower()
+        except Exception:
+            pass
+        if channel not in ('stable', 'beta'):
+            channel = 'stable'
+
+        def _pick_installer(assets):
+            for asset in (assets or []):
+                name = (asset.get("name") or "").lower()
+                if "setup" in name and name.endswith(".exe"):
+                    return asset.get("browser_download_url")
+            return None
+
+        headers = {"User-Agent": f"CCTVIPToolkit/{APP_VERSION}",
+                   "Accept": "application/vnd.github+json"}
+        try:
+            if channel == 'beta':
+                # Fetch the recent-releases list and pick the most recent that
+                # isn't a draft. Includes prereleases. Compare published_at to
+                # find "most recent" rather than relying on order alone.
+                req = urllib.request.Request(GITHUB_ALL_RELEASES_API, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    rels = json.loads(resp.read().decode("utf-8"))
+                if not isinstance(rels, list) or not rels:
+                    return None
+                rels = [r for r in rels if not r.get('draft')]
+                if not rels:
+                    return None
+                rels.sort(key=lambda r: r.get('published_at') or '', reverse=True)
+                data = rels[0]
+            else:
+                req = urllib.request.Request(GITHUB_LATEST_API, headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+
             tag = (data.get("tag_name") or "").lstrip("vV").strip()
             body = (data.get("body") or "").strip()
             url = data.get("html_url") or GITHUB_RELEASES_PAGE
-            installer_url = None
-            for asset in (data.get("assets") or []):
-                name = (asset.get("name") or "").lower()
-                if "setup" in name and name.endswith(".exe"):
-                    installer_url = asset.get("browser_download_url")
-                    break
-            return tag, body, url, installer_url
+            installer_url = _pick_installer(data.get("assets"))
+            is_prerelease = bool(data.get("prerelease"))
+            return tag, body, url, installer_url, is_prerelease
         except Exception:
             return None
 
@@ -10613,15 +10648,17 @@ Email: axisprogrammer@thelostping.net
                     f"You can check manually at:\n{GITHUB_RELEASES_PAGE}",
                 )
             return
-        latest_tag, body, url, installer_url = result
+        latest_tag, body, url, installer_url, is_prerelease = result
         latest_tup = self._version_tuple(latest_tag)
         current_tup = self._version_tuple(APP_VERSION)
 
         if latest_tup <= current_tup:
             if not silent:
+                ch = (self.settings.get('general', 'update_channel') or 'stable').strip().lower()
+                ch_label = 'beta' if ch == 'beta' else 'stable'
                 messagebox.showinfo(
                     "You're Up to Date",
-                    f"Running v{APP_VERSION} - latest published is v{latest_tag}.\n\nYou're current.",
+                    f"Running v{APP_VERSION} - latest on the {ch_label} channel is v{latest_tag}.\n\nYou're current.",
                 )
             return
 
@@ -10629,19 +10666,26 @@ Email: axisprogrammer@thelostping.net
         if silent and self.settings.get('general', 'last_dismissed_version') == latest_tag:
             return
 
-        self._show_update_dialog(latest_tag, body, url, installer_url)
+        self._show_update_dialog(latest_tag, body, url, installer_url, is_prerelease=is_prerelease)
 
-    def _show_update_dialog(self, latest_tag, body, url, installer_url=None):
+    def _show_update_dialog(self, latest_tag, body, url, installer_url=None, is_prerelease=False):
         """Toplevel showing version diff + release notes + action buttons."""
         w = tk.Toplevel(self.root)
-        w.title("Update Available")
+        w.title("Update Available" + (" — beta" if is_prerelease else ""))
         w.transient(self.root)
         w.grab_set()
 
-        ttk.Label(w, text=f"New version: v{latest_tag}",
+        title_text = f"New version: v{latest_tag}"
+        if is_prerelease:
+            title_text += "  (beta)"
+        ttk.Label(w, text=title_text,
                   font=('Helvetica', 16, 'bold')).pack(pady=(18, 4))
         ttk.Label(w, text=f"You're on v{APP_VERSION}",
-                  foreground='gray', font=('Helvetica', 10)).pack(pady=(0, 10))
+                  foreground='gray', font=('Helvetica', 10)).pack(pady=(0, 2))
+        if is_prerelease:
+            ttk.Label(w,
+                text="Beta build — not a stable release. You opted in via Settings → Update channel.",
+                foreground='#d97706', font=('Helvetica', 9)).pack(pady=(0, 8))
 
         notes_frame = ttk.LabelFrame(w, text="Release Notes", padding=8)
         notes_frame.pack(fill=tk.BOTH, expand=True, padx=18, pady=6)
@@ -10749,6 +10793,13 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.5.2": (
+            "What's new in v4.5.2",
+            [
+                "• New 'Update Channel' setting in Settings → Update Channel. Pick 'Stable releases only' (the default) or 'Beta + stable' to also receive beta builds for early access to fixes being tested in the field.",
+                "• Beta updates show a clear 'beta' label in the update prompt so you always know what kind of build you're about to install. Switch back to Stable any time and the toolkit goes back to tagged releases only.",
+            ],
+        ),
         "4.5.1": (
             "What's new in v4.5.1",
             [
@@ -11051,25 +11102,50 @@ https://buymeacoffee.com/thelostping""")
         # Warnings section
         warnings_frame = ttk.LabelFrame(frame, text="Show Warnings", padding="15")
         warnings_frame.pack(fill=tk.X, pady=(0, 15))
-        
+
         warning_vars = {}
         warnings = [
             ('show_incomplete_camera_warning', 'Incomplete camera data warning'),
             ('show_batch_test_explanation', 'Batch test explanation'),
             ('show_programming_intro', 'Programming introduction'),
         ]
-        
+
         for key, label in warnings:
             var = tk.BooleanVar(value=self.settings.get_bool('warnings', key))
             ttk.Checkbutton(warnings_frame, text=label, variable=var).pack(anchor=tk.W, pady=3)
             warning_vars[key] = var
-        
+
+        # Update channel section (v4.5.1+)
+        update_frame = ttk.LabelFrame(frame, text="Update Channel", padding="15")
+        update_frame.pack(fill=tk.X, pady=(0, 15))
+
+        current_channel = (self.settings.get('general', 'update_channel') or 'stable').strip().lower()
+        if current_channel not in ('stable', 'beta'):
+            current_channel = 'stable'
+        channel_var = tk.StringVar(value=current_channel)
+        ttk.Radiobutton(update_frame, text="Stable releases only (recommended)",
+                        variable=channel_var, value='stable').pack(anchor=tk.W, pady=2)
+        ttk.Radiobutton(update_frame, text="Beta + stable (early access to new features and fixes)",
+                        variable=channel_var, value='beta').pack(anchor=tk.W, pady=2)
+        ttk.Label(update_frame,
+                  text="Beta builds are pushed automatically when fixes are being tested in the field. "
+                       "They may be less polished than stable releases. The auto-update prompt clearly labels each build.",
+                  foreground='gray', font=('Helvetica', 9), wraplength=540, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
+
         # Save button
         def save_settings():
             for key, entry in settings_entries.items():
                 self.settings.set('general', key, entry.get())
             for key, var in warning_vars.items():
                 self.settings.set('warnings', key, str(var.get()).lower())
+            # Update channel
+            new_channel = channel_var.get()
+            if new_channel != current_channel:
+                # Clear last_dismissed_version so the user immediately sees a beta
+                # offer if one is newer than current; otherwise the stale dismiss
+                # would suppress it.
+                self.settings.set('general', 'last_dismissed_version', '')
+            self.settings.set('general', 'update_channel', new_channel)
             # Export dir: blank = default
             new_export = (export_var.get() or '').strip()
             default_export = str(_default_export_dir())
@@ -11083,7 +11159,7 @@ https://buymeacoffee.com/thelostping""")
         btn_frame.pack(pady=15)
         ttk.Button(btn_frame, text="💾 Save Settings", command=save_settings).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=w.destroy).pack(side=tk.LEFT, padx=5)
-        _center_on_parent(w, self.root, 650, 550)
+        _center_on_parent(w, self.root, 680, 720)
 
     def open_export_folder(self):
         """Open the folder where CSVs, screenshots, and FTP pulls land."""
