@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.5.0"
+APP_VERSION = "4.5.1"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
 # In-app upgrade link routes through the fieldtoolkit.com tracker so upgrades
@@ -1450,8 +1450,10 @@ class CameraProtocol(ABC):
     MAC_OUIS = []
 
     @abstractmethod
-    def create_initial_user(self, ip, password):
-        """Set password on a factory-default camera. Returns True/False."""
+    def create_initial_user(self, ip, password, existing_pwd=None):
+        """Set password on a factory-default camera. Returns True/False.
+        existing_pwd is an optional fallback for protocols that can change
+        an existing root user's password when bootstrap fails (Axis v4.5.1)."""
 
     @abstractmethod
     def set_network(self, ip, password, new_ip, subnet, gateway):
@@ -1546,14 +1548,16 @@ class AxisProtocol(CameraProtocol):
     # newer ARTPEC chips (M30/M32 series and up); 00:40:8c is older P-series.
     MAC_OUIS = [b'\x00\x40\x8c', b'\xac\xcc\x8e', b'\xb8\xa4\x4f']
 
-    def create_initial_user(self, ip, password):
+    def create_initial_user(self, ip, password, existing_pwd=None):
         # FW 11+: factory cams accept pwdgrp.cgi with NO auth — the first call
         #         creates root and locks the camera down.
         # FW 10.x and earlier: pwdgrp.cgi ALWAYS requires auth, even on a
         #         factory camera. The camera creates root from the auth header
         #         on the very first request. So we try open first, and on 401
         #         retry with HTTP Digest using root:<the password we're setting>.
-        # b9 captured the FW-10.x 401 → b10 handles it.
+        # v4.5.1: 3rd tier — if we still 401 and the operator gave us
+        #         existing_pwd, the camera has root with that pwd; use action=
+        #         update to change it to the new pwd.
         self._last_create_user_error = None
         params = {"action": "add", "user": "root", "pwd": password,
                   "grp": "root", "sgrp": "admin:operator:viewer:ptz"}
@@ -1566,6 +1570,20 @@ class AxisProtocol(CameraProtocol):
                 r = requests.get(url, params=params,
                                  auth=HTTPDigestAuth("root", password),
                                  timeout=TIMEOUT)
+            if r.status_code == 401 and existing_pwd:
+                # 3rd tier — root already exists with existing_pwd; switch the
+                # call to action=update and re-aim with old creds. Net effect:
+                # change root's password to the new one, no factory reset.
+                upd = {"action": "update", "user": "root", "pwd": password}
+                r = requests.get(url, params=upd,
+                                 auth=HTTPDigestAuth("root", existing_pwd),
+                                 timeout=TIMEOUT)
+                if r.status_code == 200:
+                    body_text = (r.text or '').strip().lower()
+                    if not (body_text.startswith('error') or 'error:' in body_text[:60]):
+                        # password updated. Skip ONVIF-CreateUsers below — root
+                        # already exists in ONVIF too, just trust new pwd.
+                        return True
             if r.status_code != 200:
                 body = (r.text or '')[:300].replace('\n', ' | ').replace('\r', '')
                 self._last_create_user_error = (
@@ -1710,24 +1728,42 @@ class AxisProtocol(CameraProtocol):
         if the user is already gone, returns True (no-op).
         Returns True on success or already-absent, False on a real failure
         (auth fail, network unreachable, SOAP fault). Non-fatal at the wizard
-        level — wizard logs a warning if False but keeps going."""
-        try:
-            soap = (f'<?xml version="1.0"?>'
-                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
-                    f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
-                    f'<Username>{username}</Username>'
-                    f'</DeleteUsers></Body></Envelope>')
-            r = requests.post(f"http://{ip}/vapix/services", data=soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-            if r.status_code in (200, 204):
-                return True
-            # 4xx with "user not found" SOAP fault = already deleted; treat as ok
-            if 'NoSuchUser' in r.text or 'not found' in r.text.lower():
-                return True
-            return False
-        except Exception:
-            return False
+        level — wizard logs a warning if False but keeps going.
+        v4.5.1: 3 attempts with 4s back-off — same pattern as set_network.
+        FW 10.x cameras frequently 401 the first DeleteUsers right after the
+        IP swap because they're still reconfiguring auth state. The retry
+        catches the case where it succeeds on the second or third try."""
+        soap = (f'<?xml version="1.0"?>'
+                f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
+                f'<Username>{username}</Username>'
+                f'</DeleteUsers></Body></Envelope>')
+        last_status = None
+        for attempt in range(3):
+            try:
+                r = requests.post(f"http://{ip}/vapix/services", data=soap,
+                    headers={"Content-Type": "application/soap+xml"},
+                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+                last_status = r.status_code
+                if r.status_code in (200, 204):
+                    return True
+                # 4xx with "user not found" SOAP fault = already deleted; treat as ok
+                if 'NoSuchUser' in r.text or 'not found' in r.text.lower():
+                    return True
+                # Transient 401 / 500 / 503 — retry
+                if r.status_code in (401, 500, 503) and attempt < 2:
+                    time.sleep(4)
+                    continue
+                return False
+            except (requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError):
+                if attempt < 2:
+                    time.sleep(4)
+                    continue
+                return False
+            except Exception:
+                return False
+        return False
 
     def set_network(self, ip, password, new_ip, subnet, gateway):
         # Two paths: ONVIF SOAP first because it's atomic — gateway/IP/DHCP
@@ -1752,6 +1788,46 @@ class AxisProtocol(CameraProtocol):
 
         _diag(f"target ip={new_ip}/{cidr} gw={gateway} via current_ip={ip} as user=root")
 
+        # v4.5.1-beta2 — settling delay. P3267-LV / FW 10.12.240 returns 503
+        # with empty body and ONVIF ReadTimeout for ~5s after fresh user
+        # creation. Brian 2026-05-05 KBO-012: 1s between admin user created
+        # and set_network → 503 storm. Give the camera time to flush its
+        # config service before hammering it with network changes.
+        time.sleep(5)
+
+        # v4.5.1-beta2 — retry helper. Transient 503 / ReadTimeout /
+        # ConnectionError on the network-config endpoints means the camera
+        # is busy, not broken. Three attempts with 4s back-off. Returns the
+        # last response object (or None on total exception). Distinct from
+        # the raw try-blocks below because each leg needs its own diag log.
+        def _retry(method, url, *, attempts=3, delay=4, **kwargs):
+            last_exc = None
+            last_resp = None
+            for i in range(attempts):
+                try:
+                    r = method(url, **kwargs)
+                    last_resp = r
+                    # 503 + empty body = camera busy. Retry.
+                    if r.status_code == 503 and not (r.text or '').strip():
+                        if i + 1 < attempts:
+                            _diag(f"  503-busy on attempt {i+1}/{attempts}; retrying in {delay}s")
+                            time.sleep(delay)
+                            continue
+                    return r
+                except (requests.exceptions.ReadTimeout,
+                        requests.exceptions.ConnectionError) as e:
+                    last_exc = e
+                    if i + 1 < attempts:
+                        _diag(f"  {type(e).__name__} on attempt {i+1}/{attempts}; retrying in {delay}s")
+                        time.sleep(delay)
+                        continue
+                    raise
+            if last_resp is not None:
+                return last_resp
+            if last_exc:
+                raise last_exc
+            return None
+
         # --- ONVIF path ---
         onvif_ok = False
         # Gateway has to go in its own SOAP call. Tried merging it into the
@@ -1763,9 +1839,10 @@ class AxisProtocol(CameraProtocol):
                    f'<IPv4Address>{gateway}</IPv4Address>'
                    f'</SetNetworkDefaultGateway></Body></Envelope>')
         try:
-            r_gw = requests.post(f"http://{ip}/vapix/services", data=gw_soap,
+            r_gw = _retry(requests.post,
+                f"http://{ip}/vapix/services", data=gw_soap,
                 headers={"Content-Type": "application/soap+xml"},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=15)  # bumped from TIMEOUT (5s) — SetNetworkDefaultGateway can sit on the camera 5-10s before responding
             snippet = (r_gw.text or '')[:240].replace('\n', ' ').replace('\r', '')
             _diag(f"ONVIF SetNetworkDefaultGateway → status={r_gw.status_code} body[:240]={snippet}")
         except Exception as e:
@@ -1787,9 +1864,10 @@ class AxisProtocol(CameraProtocol):
                    f'<tt:DHCP>false</tt:DHCP></tt:IPv4></tds:NetworkInterface>'
                    f'</tds:SetNetworkInterfaces></Body></Envelope>')
         try:
-            r = requests.post(f"http://{ip}/vapix/services", data=ip_soap,
+            r = _retry(requests.post,
+                f"http://{ip}/vapix/services", data=ip_soap,
                 headers={"Content-Type": "application/soap+xml"},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=15)  # SetNetworkInterfaces is the slow one
             snippet = (r.text or '')[:240].replace('\n', ' ').replace('\r', '')
             has_fault = 'Fault' in (r.text or '')
             _diag(f"ONVIF SetNetworkInterfaces → status={r.status_code} fault_in_body={has_fault} body[:240]={snippet}")
@@ -1813,25 +1891,26 @@ class AxisProtocol(CameraProtocol):
         # subnet, IP last — that order has been bulletproof since at least
         # the M-series firmware in 2012.
         try:
-            r1 = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+            r1 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.IPv4.DHCP": "no"},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=10)
             _diag(f"VAPIX DHCP=no → status={r1.status_code} body[:160]={(r1.text or '')[:160]!r}")
-            r2 = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+            r2 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.DefaultRouter": gateway},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=10)
             _diag(f"VAPIX DefaultRouter={gateway} → status={r2.status_code} body[:160]={(r2.text or '')[:160]!r}")
-            r3 = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+            r3 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.SubnetMask": subnet},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=10)
             _diag(f"VAPIX SubnetMask={subnet} → status={r3.status_code} body[:160]={(r3.text or '')[:160]!r}")
             # Setting IPAddress is the call that yanks the rug — the response
             # may never come back because the kernel has switched interfaces
             # by the time it tries to ack. Hence the ConnectionError below
-            # being treated as success.
+            # being treated as success. Don't retry this one — connection drop
+            # IS the success signal.
             r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                 params={"action": "update", "root.Network.IPAddress": new_ip},
-                auth=auth, timeout=TIMEOUT)
+                auth=auth, timeout=10)
             _diag(f"VAPIX IPAddress={new_ip} → status={r.status_code} body[:160]={(r.text or '')[:160]!r}")
             ok = r.status_code == 200
             _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200)'}")
@@ -2203,10 +2282,13 @@ class AxisProtocol(CameraProtocol):
         gateway = cam['gateway']
         subnet = cam['subnet']
         set_hostname = options.get('set_hostname', False) if options else False
+        # v4.5.1: forward existing_root_pwd into create_initial_user so the
+        # 3rd-tier change-password fallback can fire if open + new-pwd both 401.
+        existing_root_pwd = options.get('existing_root_pwd') if options else None
 
         steps = [
             ("Creating system user + ONVIF user",
-             lambda: self.create_initial_user(ip, password)),
+             lambda: self.create_initial_user(ip, password, existing_pwd=existing_root_pwd)),
             ("Setting gateway + IP + disabling DHCP",
              lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
         ]
@@ -2281,7 +2363,8 @@ class BoschProtocol(CameraProtocol):
                                     # networks — fun for tech support calls
     MAC_OUIS = [b'\x00\x07\x5f']    # Robert Bosch GmbH OUI; basically all their cams
 
-    def create_initial_user(self, ip, password):
+    def create_initial_user(self, ip, password, existing_pwd=None):
+        # Bosch ignores existing_pwd — RCP+ writes blast through regardless.
         # Change all three password tiers in one shot. Walking high->low so if
         # the service write fails (the only one that's REALLY bad), we bail
         # before partially-resetting the lower-priv ones. Return False only on
@@ -2548,7 +2631,7 @@ class HanwhaProtocol(CameraProtocol):
             kwargs['data'] = data
         return requests.post(f"http://{ip}{path}", **kwargs)
 
-    def create_initial_user(self, ip, password):
+    def create_initial_user(self, ip, password, existing_pwd=None):
         # Hanwha factory cameras don't have a default password — they REQUIRE
         # you to set one before anything else works (similar to Axis 7.10+).
         # Password rules are 8-15 chars and 3+ character types (upper/lower/
@@ -7197,25 +7280,27 @@ class CCTVToolkitApp:
         frame.pack(fill=tk.BOTH, expand=True)
 
         # ---- Big banner ----
-        self._status_banner_frame = tk.Frame(frame, bg='#9E9E9E', padx=20, pady=18)
+        # v4.5.1-beta2: bumped fonts so the wizard banner is legible
+        # from across the room. Brian's training-room ask 2026-05-05.
+        self._status_banner_frame = tk.Frame(frame, bg='#9E9E9E', padx=20, pady=22)
         self._status_banner_frame.pack(fill=tk.X)
         self._status_banner_label = tk.Label(self._status_banner_frame,
             text="READY", bg='#9E9E9E', fg='white',
-            font=('Helvetica', 28, 'bold'))
+            font=('Helvetica', 42, 'bold'))
         self._status_banner_label.pack()
         self._status_banner_sub = tk.Label(self._status_banner_frame,
             text="Start a programming run from the Operations tab.",
-            bg='#9E9E9E', fg='white', font=('Helvetica', 11))
-        self._status_banner_sub.pack(pady=(4, 0))
+            bg='#9E9E9E', fg='white', font=('Helvetica', 18, 'bold'))
+        self._status_banner_sub.pack(pady=(6, 0))
 
         # ---- Camera + progress row ----
         info_row = ttk.Frame(frame)
-        info_row.pack(fill=tk.X, pady=(15, 5))
+        info_row.pack(fill=tk.X, pady=(18, 5))
         self._status_camera_label = ttk.Label(info_row,
-            text="—", font=('Helvetica', 14, 'bold'))
+            text="—", font=('Helvetica', 24, 'bold'))
         self._status_camera_label.pack(side=tk.LEFT)
         self._status_progress_label = ttk.Label(info_row,
-            text="", font=('Helvetica', 11), foreground='#555')
+            text="", font=('Helvetica', 14), foreground='#555')
         self._status_progress_label.pack(side=tk.RIGHT)
 
         # ---- Two columns: checklist on left, preview on right ----
@@ -7285,8 +7370,19 @@ class CCTVToolkitApp:
     # ---------- Status view API (called from worker thread via root.after) ----
     def status_set_banner(self, text, subtitle='', color='#9E9E9E'):
         self._status_banner_frame.config(bg=color)
-        self._status_banner_label.config(text=text, bg=color)
-        self._status_banner_sub.config(text=subtitle, bg=color)
+        self._status_banner_label.config(text=text, bg=color,
+            font=('Helvetica', 42, 'bold'))
+        self._status_banner_sub.config(text=subtitle, bg=color,
+            font=('Helvetica', 18, 'bold'))
+
+    def status_set_banner_big(self, text, subtitle='', color='#4CAF50'):
+        """v4.5.1-beta2: extra-large, room-visible success callout. Used
+        for per-camera DONE so it survives a tech glancing away."""
+        self._status_banner_frame.config(bg=color)
+        self._status_banner_label.config(text=text, bg=color,
+            font=('Helvetica', 60, 'bold'))
+        self._status_banner_sub.config(text=subtitle, bg=color,
+            font=('Helvetica', 22, 'bold'))
 
     def status_set_camera(self, name='—', detail=''):
         self._status_camera_label.config(text=name)
@@ -7996,6 +8092,45 @@ class CCTVToolkitApp:
             self.log("Pre-flight: none found — proceeding to normal wait loop.")
             return 0
 
+        # v4.5.1-beta3: filter out cameras that are already factory-clean.
+        # If the operator has already manually reset a camera (paperclip)
+        # but its MAC still matches one in the Camera List, the old code
+        # would still prompt "Factory-reset?" and demand the existing
+        # password — which is blank because the camera IS factory.
+        # Detection: no-auth basicdeviceinfo probe AND no-auth pwdgrp.cgi
+        # action=list returns 200 (only true on FW 11+ factory cams).
+        # FW 10.x factory cams will fall through to the normal flow and
+        # the wizard's auth-fallback handles them.
+        already_clean = []
+        truly_used = []
+        for f in found:
+            try:
+                r1 = requests.post(
+                    f"http://{f['ip']}/axis-cgi/basicdeviceinfo.cgi",
+                    json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
+                    timeout=4)
+                if r1.status_code == 200:
+                    r2 = requests.get(
+                        f"http://{f['ip']}/axis-cgi/pwdgrp.cgi",
+                        params={"action": "list"},
+                        timeout=4)
+                    if r2.status_code == 200:
+                        already_clean.append(f)
+                        continue
+            except Exception:
+                pass
+            truly_used.append(f)
+
+        if already_clean:
+            self.log(f"Pre-flight: {len(already_clean)} camera(s) already factory-clean — no reset prompt needed:")
+            for f in already_clean:
+                self.log(f"  ✓ {f['ip']}  MAC {f['mac']}  ({f.get('model', '?')})  — will be programmed as fresh")
+        found = truly_used
+
+        if not found:
+            self.log("Pre-flight: every detected camera is already factory-clean — proceeding to normal wait loop.")
+            return 0
+
         self.log(f"Pre-flight: {len(found)} previously-configured camera(s) detected.")
         reset_count = 0
         for f in found:
@@ -8037,23 +8172,79 @@ class CCTVToolkitApp:
                 # without going hunting in the Passwords tab. If it works, save
                 # it (list + per-MAC cache) so this never happens again for
                 # this camera or any other camera using the same root pwd.
+                # v4.5.1-beta3: ALSO offer "Already factory-reset, skip" so
+                # the operator who already paperclipped the camera doesn't
+                # get stuck in an infinite password loop. (Brian KBO field
+                # session 2026-05-05 — manually-reset camera with MAC still
+                # in Camera List was unprogrammable because there was no way
+                # past the password prompt.)
                 self.log(f"  {f['ip']}: no saved password authenticated — prompting operator")
+
+                # Custom 3-button dialog: [OK with pwd] / [Already Factory-Reset] / [Skip]
+                choice = [None]  # 'pwd' / 'already_factory' / 'skip'
                 pwd_holder = [None]
                 def _ask_pwd(f=f):
-                    pwd_holder[0] = simpledialog.askstring(
-                        "Provide camera password",
-                        f"None of {len(self.password_data.get_all() or [])} saved "
-                        f"passwords authenticated against {f['ip']} "
-                        f"({f.get('model', '?')}).\n\n"
-                        f"Enter the camera's existing root password to factory-"
-                        f"reset it (or Cancel to skip this camera):",
-                        show='*', parent=self.root)
+                    dlg = tk.Toplevel(self.root)
+                    dlg.title("Provide camera password")
+                    dlg.resizable(False, False)
+                    dlg.transient(self.root)
+                    dlg.grab_set()
+                    body = ttk.Frame(dlg, padding=15)
+                    body.pack(fill='both', expand=True)
+                    msg = (f"None of {len(self.password_data.get_all() or [])} saved "
+                           f"passwords authenticated against {f['ip']} "
+                           f"({f.get('model', '?')}).\n\n"
+                           f"Three options:\n"
+                           f"  • Type the password and click OK to factory-reset\n"
+                           f"  • Click 'Already factory-reset' if you've already "
+                           f"paperclipped this camera (no password needed)\n"
+                           f"  • Click Skip to leave this camera alone")
+                    ttk.Label(body, text=msg, wraplength=460,
+                              justify='left').pack(anchor='w', pady=(0, 10))
+                    pwd_var = tk.StringVar()
+                    row = ttk.Frame(body)
+                    row.pack(fill='x', pady=(0, 12))
+                    ttk.Label(row, text="Password:").pack(side='left')
+                    e = ttk.Entry(row, textvariable=pwd_var, show='*', width=30)
+                    e.pack(side='left', padx=(6, 0))
+                    e.focus_set()
+                    def _ok():
+                        choice[0] = 'pwd'
+                        pwd_holder[0] = pwd_var.get()
+                        dlg.destroy()
+                    def _already():
+                        choice[0] = 'already_factory'
+                        dlg.destroy()
+                    def _skip():
+                        choice[0] = 'skip'
+                        dlg.destroy()
+                    btn_row = ttk.Frame(body)
+                    btn_row.pack(fill='x')
+                    ttk.Button(btn_row, text="OK", command=_ok, width=10).pack(side='right')
+                    ttk.Button(btn_row, text="Skip", command=_skip,
+                               width=10).pack(side='right', padx=(0, 6))
+                    ttk.Button(btn_row, text="Already factory-reset",
+                               command=_already, width=22).pack(side='left')
+                    dlg.bind('<Return>', lambda _e: _ok())
+                    dlg.bind('<Escape>', lambda _e: _skip())
+                    try:
+                        self._center_on_parent(dlg)
+                    except Exception:
+                        pass
                 self.root.after(0, _ask_pwd)
-                while pwd_holder[0] is None and not getattr(self, 'cancel_flag', False):
+                while choice[0] is None and not getattr(self, 'cancel_flag', False):
                     time.sleep(0.05)
+
+                if choice[0] == 'skip' or choice[0] is None:
+                    self.log(f"  {f['ip']}: operator skipped")
+                    continue
+                if choice[0] == 'already_factory':
+                    self.log(f"  {f['ip']}: operator confirmed already factory — no reset needed; wizard will program it as fresh")
+                    reset_count += 1  # treat as if reset succeeded — wizard's main loop will program it on next discovery
+                    continue
                 typed_pwd = pwd_holder[0]
                 if not typed_pwd:
-                    self.log(f"  {f['ip']}: operator cancelled — skipped")
+                    self.log(f"  {f['ip']}: empty password — skipped")
                     continue
                 # Try the typed password.
                 from requests.auth import HTTPBasicAuth, HTTPDigestAuth
@@ -10558,6 +10749,22 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.5.1": (
+            "What's new in v4.5.1",
+            [
+                "• Programming screen now reads from across the room. Bigger banner, bigger camera name, bigger 'plug in / programming / done' callout.",
+                "• When a camera finishes, the green ✓ DONE flashes large and stays up for a few seconds before the next 'plug in camera' message. No more glancing back at the screen and missing whether the previous one worked.",
+                "• Cameras that took a moment to finish setting up before the toolkit tried to assign them an IP — fixed. The toolkit now gives the camera a beat to catch its breath, and retries automatically if the camera is briefly busy.",
+                "• Smarter detection of which cameras really need a factory reset and which are already clean. Old check would sometimes claim a camera was clean when it wasn't, then get stuck. New check is honest about it.",
+                "• Reusing a camera that already has a password? If the password you typed in matches what's on the camera, the toolkit just changes it to the new one — no factory reset needed.",
+                "• If the toolkit gets stuck logging in during programming, it now tries one auto-rescue: factory-reset with the password you provided, wait for the camera to come back, and pick up where it left off. You don't have to do anything.",
+                "• If you've already factory-reset a camera by hand and put it back on the bench, the toolkit recognizes that and stops nagging you for the old password. New 'Already factory-reset' button on the password prompt for the older cameras that don't auto-detect.",
+                "• Stuck-camera retry spam — fixed. If the same camera fails factory-reset twice in a row, the toolkit now stops hammering it, prints clear instructions to paperclip-reset it, and waits quietly for 30 seconds. No more 30-times-in-a-row 'wrong existing password' messages while you're already trying to physically reset the camera.",
+                "• The big green ✓ DONE banner now stays on the screen until you actually unplug the just-programmed camera. As soon as the toolkit sees the camera disappear from the network, the screen flips to PLUG IN CAMERA for the next one. No more guessing whether the previous camera finished — the banner waits for you, not the other way around.",
+                "• ONVIF cleanup at the end of programming retries automatically if the camera is briefly busy. Stops the cosmetic 'leftover ONVIF account' warning that used to show up on a few percent of cameras even though the camera itself was fine.",
+                "• Net effect: plug in, click Program, and the toolkit handles the awkward middle states (reused cameras, stale passwords, slow cameras) without bouncing back to you.",
+            ],
+        ),
         "4.5.0": (
             "What's new in v4.5.0",
             [
@@ -11890,6 +12097,13 @@ https://buymeacoffee.com/thelostping""")
             programmed_count = 0
             seen_macs = set()
             consecutive_skips = 0
+            # v4.5.1-beta4: per-MAC factory_reset failure counter. After
+            # the same MAC fails reset 2 times in a row we stop hammering
+            # the camera and tell the operator in plain English to paperclip
+            # it. Field session 2026-05-05: KBO-033 / KBO-034 burned ~5min
+            # each looping factory-reset → 401 → bail-this-slot → re-discover
+            # → repeat 30+ times before the camera came back factory-clean.
+            factory_reset_fail_count = {}
 
             # Banner suppression: only print "Waiting for camera N" once per real new
             # camera. When we re-enter the outer loop after waiting for the previous
@@ -12117,29 +12331,52 @@ https://buymeacoffee.com/thelostping""")
                 existing_pwd = opts.get('existing_root_pwd') or ''
                 if factory_first and existing_pwd and hasattr(self.protocol, 'factory_reset'):
                     # Skip the reset if the camera is ALREADY factory-clean.
-                    # Detection: no-auth probe succeeds AND old root password
-                    # gets a 401 on an authed endpoint. (Brian's 2026-05-03
-                    # test: a freshly-reset cam triggered factory_first and
-                    # bailed because the existing password was now invalid.)
+                    # v4.5.1 fix: the old detection trusted a 401 from
+                    # restart.cgi+existing_pwd as proof of "no users yet."
+                    # That's ambiguous — a 401 also fires when root EXISTS
+                    # but our existing_pwd is wrong, leading to a false
+                    # positive that broke create_initial_user (also 401)
+                    # and bailed the slot mid-job (P3267-LV / FW 10.12.240,
+                    # 2026-05-05).
+                    # New detection requires a POSITIVE factory signal:
+                    # either (a) the existing_pwd actually authenticates
+                    # successfully (camera is not factory but creds work,
+                    # we'll change_password later) — bail this branch and
+                    # let the reset path or the auth-fallback handle it; OR
+                    # (b) the camera responds 200 to an unauthenticated
+                    # bootstrap probe that ONLY a true factory cam answers.
                     already_factory = False
                     try:
                         if hasattr(self.protocol, 'is_factory_state'):
                             already_factory = bool(self.protocol.is_factory_state(camera_ip, existing_pwd))
                         elif hasattr(self.protocol, 'BRAND_KEY') and self.protocol.BRAND_KEY == 'axis':
-                            # Inline Axis check: getAllUnrestrictedProperties is
-                            # no-auth on factory cams. Then prove the old root
-                            # password is INVALID by hitting an authed endpoint.
+                            # Probe 1: no-auth basicdeviceinfo (proves L7 alive).
                             r1 = requests.post(
                                 f"http://{camera_ip}/axis-cgi/basicdeviceinfo.cgi",
                                 json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
                                 timeout=4)
                             if r1.status_code == 200:
-                                r2 = requests.get(
-                                    f"http://{camera_ip}/axis-cgi/admin/restart.cgi",
-                                    auth=requests.auth.HTTPBasicAuth('root', existing_pwd),
-                                    timeout=4)
-                                if r2.status_code == 401:
-                                    already_factory = True
+                                # Probe 2: positive factory signal — pwdgrp.cgi
+                                # action=list with NO auth. On FW 11+ factory
+                                # cams this responds 200 (no users to list yet).
+                                # On any configured cam: 401. Distinguishes
+                                # truly clean from "wrong-pwd-on-configured."
+                                # FW 10.x factory cams 401 here too — they
+                                # require auth even on the bootstrap call —
+                                # but that's fine: we'll fall through to the
+                                # reset path, which will succeed if existing_pwd
+                                # works, and otherwise the new bootstrap
+                                # auth-fallback in create_initial_user picks it
+                                # up downstream.
+                                try:
+                                    r2 = requests.get(
+                                        f"http://{camera_ip}/axis-cgi/pwdgrp.cgi",
+                                        params={"action": "list"},
+                                        timeout=4)
+                                    if r2.status_code == 200:
+                                        already_factory = True
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     if already_factory:
@@ -12147,10 +12384,44 @@ https://buymeacoffee.com/thelostping""")
                         # whole reset+wait dance. Programming proceeds normally.
                         self.status_log("  ✓ Camera is already factory-clean — skipping reset")
                     else:
+                        # v4.5.1-beta4: cap the bail-and-retry loop. After 2
+                        # consecutive factory_reset failures for the same MAC,
+                        # stop hammering and pause for 30s with clear plain-
+                        # English instructions, then keep waiting (don't bail
+                        # the whole wizard, just stop the spam). Lets the
+                        # operator paperclip-reset the camera in peace.
+                        mac_key = (pinned_mac or '').upper().replace(':', '').replace('-', '')
+                        prior_fails = factory_reset_fail_count.get(mac_key, 0)
+
                         self.status_log(f"Factory-resetting {pinned_mac} via existing password...")
                         if not self.protocol.factory_reset(camera_ip, existing_pwd):
                             self.status_log("  ✗ Factory reset failed — wrong existing password? bailing this slot")
                             errors.append('factory_reset_failed')
+                            new_fails = prior_fails + 1
+                            factory_reset_fail_count[mac_key] = new_fails
+                            if new_fails >= 2:
+                                self.status_log(
+                                    f"  ⚠ {pinned_mac} has failed factory-reset {new_fails}× in a row.")
+                                self.status_log(
+                                    f"  ⚠ The 'existing password' you provided isn't accepted by this camera.")
+                                self.status_log(
+                                    f"  ⚠ ACTION: paperclip-reset the camera (hold the button for ~10s")
+                                self.status_log(
+                                    f"  ⚠         until the LED blinks amber, then release). The wizard")
+                                self.status_log(
+                                    f"  ⚠         will pick it up at 192.168.0.90 once it's back.")
+                                self.status_log(
+                                    f"  ⚠ Pausing 30s before re-checking — paperclip now.")
+                                # Quiet wait. Don't bounce back to outer loop;
+                                # let the camera come back to factory state
+                                # without retry-spam. Reset the per-MAC counter
+                                # so we don't immediately re-trip after the
+                                # paperclip when it shows up factory-clean.
+                                factory_reset_fail_count[mac_key] = 0
+                                for _ in range(30):
+                                    if self.cancel_flag:
+                                        break
+                                    time.sleep(1)
                             continue
 
                         self.status_log("  ✓ Reset issued.")
@@ -12415,7 +12686,9 @@ https://buymeacoffee.com/thelostping""")
 
                 # ---- Build steps and split ----
                 cam['_program_ip'] = camera_ip
-                steps = self.protocol.get_programming_steps(cam, password)
+                # v4.5.1: forward opts so create_initial_user gets existing_root_pwd
+                # for the change-password fallback tier.
+                steps = self.protocol.get_programming_steps(cam, password, options=opts)
                 network_keywords = ('gateway', 'network', 'ip', 'dhcp')
                 auth_steps = []
                 network_steps = []
@@ -12440,6 +12713,91 @@ https://buymeacoffee.com/thelostping""")
                     if step_fn():
                         self.status_log("    ✓ Done.")
                     else:
+                        # v4.5.1 rescue: if the failing step is create_initial_user
+                        # AND factory_first gave us existing_pwd, the detection
+                        # was a false positive — camera has root with some pwd
+                        # we don't know, but maybe existing_pwd works against
+                        # factory_reset itself. Try the reset, wait for the
+                        # camera back, retry the step. ONE SHOT only — if reset
+                        # fails too, fall through to the normal failure path.
+                        is_user_step = ('user' in desc.lower())
+                        rescue_pwd = (opts.get('existing_root_pwd') or '') if is_user_step else ''
+                        rescued = False
+                        if (is_user_step and rescue_pwd
+                                and hasattr(self.protocol, 'factory_reset')):
+                            self.status_log(
+                                "    ↺ Bootstrap 401 — attempting auto-rescue via factory_reset(existing_pwd)…")
+                            try:
+                                rr = self.protocol.factory_reset(camera_ip, rescue_pwd)
+                            except Exception:
+                                rr = False
+                            if rr:
+                                self.status_log(
+                                    "      ✓ Reset issued. Waiting up to 120s for camera to return…")
+                                old_ip = camera_ip
+                                target_mac_norm = (pinned_mac or '').upper().replace(':', '').replace('-', '')
+                                rescue_ip = None
+                                rescue_deadline = time.time() + 120
+                                rendezvous = [old_ip, '192.168.0.90']
+                                while time.time() < rescue_deadline and not self.cancel_flag:
+                                    for try_ip in rendezvous:
+                                        if not try_ip:
+                                            continue
+                                        if self.ping_camera(try_ip, timeout_ms=800):
+                                            p = self.protocol.probe_unrestricted(try_ip)
+                                            p_mac = (p.get('mac') or '').upper().replace(':', '').replace('-', '')
+                                            if not target_mac_norm or p_mac == target_mac_norm:
+                                                rescue_ip = try_ip
+                                                break
+                                    if rescue_ip:
+                                        break
+                                    time.sleep(2)
+                                if rescue_ip:
+                                    camera_ip = rescue_ip
+                                    cam['_program_ip'] = camera_ip
+                                    self.status_log(f"      ✓ Camera back at {camera_ip} (factory state) — retrying bootstrap")
+                                    # Rebuild steps so the new ip is captured
+                                    new_steps = self.protocol.get_programming_steps(cam, password, options=opts)
+                                    new_user_fn = None
+                                    for d2, f2 in new_steps:
+                                        if 'user' in d2.lower():
+                                            new_user_fn = f2
+                                            break
+                                    if new_user_fn and new_user_fn():
+                                        self.status_log("    ✓ Done. (rescued)")
+                                        rescued = True
+                                        # Replace the remaining work with the
+                                        # freshly-built steps so they bind the new
+                                        # camera IP. Drop the user step (already
+                                        # done) and run any other auth steps now,
+                                        # then swap network_steps for later phase 3.
+                                        new_auth_remaining = [
+                                            (d2, f2) for (d2, f2) in new_steps
+                                            if 'user' not in d2.lower()
+                                            and not any(kw in d2.lower() for kw in network_keywords)
+                                        ]
+                                        for d3, f3 in new_auth_remaining:
+                                            if self.cancel_flag: break
+                                            self.status_log(f"  {d3}")
+                                            if f3():
+                                                self.status_log("    ✓ Done.")
+                                            else:
+                                                self.status_log(f"    ✗ {d3} failed")
+                                                errors.append(d3.lower().split()[0])
+                                                auth_ok = False
+                                        network_steps[:] = [
+                                            (d2, f2) for (d2, f2) in new_steps
+                                            if any(kw in d2.lower() for kw in network_keywords)
+                                        ]
+                                else:
+                                    self.status_log("      ✗ Camera didn't return within 120s")
+                            else:
+                                self.status_log("      ✗ factory_reset(existing_pwd) failed too — giving up the rescue")
+                        if rescued:
+                            # Remaining auth work was handled in the rescue
+                            # block against the new camera_ip. Bail the original
+                            # iteration (its closures still bind the old ip).
+                            break
                         self.status_log(f"    ✗ {desc} failed")
                         # b9 — surface protocol-level last-error if the step set one.
                         # Currently Axis create_initial_user populates this on
@@ -12699,28 +13057,63 @@ https://buymeacoffee.com/thelostping""")
                     self.camera_data.mark_processed(idx)
                     total_ok += 1
                     self.status_log(f"\n*** {cam_name} COMPLETE ***")
-                    _ui(self.status_set_banner, f'DONE  ({total_ok} OK / {total_fail} fail)',
-                        f"{cam_name} complete — plug in next camera", '#4CAF50')
+                    # v4.5.1-beta2: extra-large + long-hold success callout —
+                    # Brian asked for bigger/longer 'success' so a tech who
+                    # looks away during programming doesn't return to find
+                    # only "PLUG IN CAMERA" with no signal that the previous
+                    # one finished. 60pt + 5s hold per ask.
+                    _ui(self.status_set_banner_big,
+                        f'✓  {cam_name}  DONE',
+                        f'  ({total_ok} OK / {total_fail} fail) — plug in next camera  ',
+                        '#4CAF50')
 
                 remaining.pop(cam_idx)
 
                 if remaining and not self.cancel_flag:
-                    # No continue dialog — banner tells the user what to do
+                    # v4.5.1-beta5: keep the SUCCESS banner up until the
+                    # camera physically disappears from the network (ping
+                    # at its programmed IP fails). Brian's ask 2026-05-05:
+                    # "keep the completion note up UNTIL you see the
+                    # programmed camera disappear from the network. I
+                    # unplugged > Plug in camera x". So the screen flips
+                    # to PLUG IN exactly when the operator unplugs.
+                    #
+                    # 3s minimum hold for fast-unplug case (so the banner
+                    # is at least seen even if you're already unplugging),
+                    # then poll ping(static_ip) every 1s. Two consecutive
+                    # ping failures = unplugged → transition.
+                    time.sleep(3)
+                    ping_target = static_ip
+                    if ping_target and self.ping_camera(ping_target, timeout_ms=800):
+                        self.status_log(
+                            f"  Holding ✓ {cam_name} DONE banner until you unplug the camera…")
+                        miss_streak = 0
+                        wait_start = time.time()
+                        last_heartbeat = wait_start
+                        while not self.cancel_flag:
+                            if self.ping_camera(ping_target, timeout_ms=800):
+                                miss_streak = 0
+                            else:
+                                miss_streak += 1
+                                if miss_streak >= 2:
+                                    self.status_log(
+                                        f"  ✓ {cam_name} unplugged after {int(time.time() - wait_start)}s — moving on.")
+                                    break
+                            now_t = time.time()
+                            if now_t - last_heartbeat >= 30:
+                                self.status_log(
+                                    f"  ...still plugged in at {ping_target} ({int(now_t - wait_start)}s elapsed) — unplug when ready")
+                                last_heartbeat = now_t
+                            time.sleep(1)
+
                     _ui(self.status_set_camera, '—',
                         f'{programmed_count} of {len(cameras)} done · {len(remaining)} remaining')
-                    time.sleep(2)  # brief pause so user can see "DONE" before "PLUG IN"
 
-                    # 2026-04-30 hot fix: wait for the just-programmed camera to leave
-                    # factory IP before entering next discovery. Without this guard, if
-                    # the user hasn't unplugged yet, the next iteration finds the SAME
-                    # camera at factory IP, ARP query (post-unpin) returns None so the
-                    # seen_macs check is bypassed, and we try to program the next slot
-                    # onto the previous still-plugged-in camera. Auth fails, network
-                    # call appears to "succeed" but actually does nothing useful, then
-                    # the script bails. Belt-and-suspenders: ping is the source of truth
-                    # for "is the previous camera still here", since ARP cache is stale
-                    # after arp_unpin.
-                    if factory_ip:
+                    # Belt-and-suspenders factory_ip wait — only fires if
+                    # somehow the camera is still answering at 192.168.0.90
+                    # (rare, mostly defensive against the 2026-04-30 same-MAC
+                    # double-program case).
+                    if factory_ip and self.ping_camera(factory_ip, timeout_ms=800):
                         wait_start = time.time()
                         last_heartbeat = wait_start
                         announced = False
