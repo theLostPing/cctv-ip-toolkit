@@ -2011,38 +2011,55 @@ class AxisProtocol(CameraProtocol):
             pass
 
         # User does exist (or GetUsers itself failed) — attempt the delete.
+        # v4.6.0b6 — settling delay before the SOAP write, same fix pattern
+        # that made CreateUsers stop silently failing in b5. The camera just
+        # swapped IPs in set_network; ONVIF auth state propagation lags the
+        # IP change, so an immediate DeleteUsers hits 401 retries that each
+        # eat the 30s timeout (~80s sit on '⚠ ONVIF user delete failed' that
+        # Brian flagged in the b5 test run).
+        try:
+            time.sleep(2)
+        except Exception:
+            pass
+        cb = getattr(self, 'log_callback', None)
+        def _diag(msg):
+            if callable(cb):
+                try: cb(f"      [delete_onvif_user] {msg}")
+                except Exception: pass
         del_soap = (f'<?xml version="1.0"?>'
                     f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
                     f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
                     f'<Username>{username}</Username>'
                     f'</DeleteUsers></Body></Envelope>')
-        last_status = None
         for attempt in range(3):
             try:
-                # v4.6.0b4 — bumped timeout from TIMEOUT (5s) to 30s. ONVIF
-                # SOAP writes on FW 10.x can take 30-60s; 5s was guaranteed
-                # to ReadTimeout.
                 r = requests.post(f"http://{ip}/vapix/services", data=del_soap,
                     headers={"Content-Type": "application/soap+xml"},
                     auth=HTTPDigestAuth("root", password), timeout=30)
-                last_status = r.status_code
                 if r.status_code in (200, 204):
+                    _diag(f"DeleteUsers '{username}' → success (attempt {attempt+1})")
                     return True
                 # 4xx with "user not found" SOAP fault = already deleted; treat as ok
                 if 'NoSuchUser' in r.text or 'not found' in r.text.lower():
+                    _diag(f"DeleteUsers '{username}' → already absent (attempt {attempt+1})")
                     return True
-                # Transient 401 / 500 / 503 — retry
+                # Transient 401 / 500 / 503 — retry with auth-propagation back-off
                 if r.status_code in (401, 500, 503) and attempt < 2:
-                    time.sleep(4)
+                    _diag(f"DeleteUsers '{username}' → {r.status_code} (attempt {attempt+1}), retrying in 3s")
+                    time.sleep(3)
                     continue
+                _diag(f"DeleteUsers '{username}' → status={r.status_code} body[:200]={(r.text or '')[:200]!r}")
                 return False
             except (requests.exceptions.ReadTimeout,
-                    requests.exceptions.ConnectionError):
+                    requests.exceptions.ConnectionError) as e:
                 if attempt < 2:
-                    time.sleep(4)
+                    _diag(f"DeleteUsers '{username}' → {type(e).__name__} (attempt {attempt+1}), retrying in 3s")
+                    time.sleep(3)
                     continue
+                _diag(f"DeleteUsers '{username}' → exhausted retries: {type(e).__name__}: {e}")
                 return False
-            except Exception:
+            except Exception as e:
+                _diag(f"DeleteUsers '{username}' → unexpected: {type(e).__name__}: {e}")
                 return False
         return False
 
@@ -2273,16 +2290,40 @@ class AxisProtocol(CameraProtocol):
             # camera switches to the new static IP on the same write, so the
             # connection drops mid-response (handled below as success). No
             # window where DHCP is off and static isn't set yet.
+            # v4.6.0b6 — 503-busy retry. Brian's 4.6b1slow log showed the
+            # camera returning HTTP 503 with empty body on the first atomic
+            # update (Axis "service busy, retry me" pattern). Without retry
+            # the path falls through to ONVIF SOAP fallback, which is fast
+            # by accident but skips the perf win on FW 10.x. One 4s back-off
+            # retry catches the 503-busy case cleanly.
+            r = None
+            for vapix_attempt in range(3):
+                try:
+                    r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                        params={
+                            "action": "update",
+                            "root.Network.BootProto": "none",
+                            "root.Network.IPAddress": new_ip,
+                            "root.Network.SubnetMask": subnet,
+                            "root.Network.DefaultRouter": gateway,
+                        },
+                        auth=auth, timeout=10)
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.ReadTimeout):
+                    # Camera swapped IPs mid-response — the standard success
+                    # signal. Bubble out and let the outer handler treat it
+                    # as success.
+                    raise
+                if r.status_code == 503 and not (r.text or '').strip():
+                    if vapix_attempt < 2:
+                        _diag(f"VAPIX atomic update → 503-busy (attempt {vapix_attempt+1}/3), retrying in 4s")
+                        try:
+                            proto_self._cancellable_sleep(4)
+                        except ProtocolCancelled:
+                            raise
+                        continue
+                break
             try:
-                r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                    params={
-                        "action": "update",
-                        "root.Network.BootProto": "none",
-                        "root.Network.IPAddress": new_ip,
-                        "root.Network.SubnetMask": subnet,
-                        "root.Network.DefaultRouter": gateway,
-                    },
-                    auth=auth, timeout=10)
                 body = (r.text or '')[:240]
                 _diag(f"VAPIX atomic update (BootProto=none, IP={new_ip}, mask={subnet}, gw={gateway}) → status={r.status_code} body[:240]={body!r}")
                 ok = r.status_code == 200 and _vapix_ok(r.text)
@@ -6501,6 +6542,11 @@ class CCTVToolkitApp:
         # initialized later, which broke the new icon-loader success log.
         self.log_queue = queue.Queue()
         self.cancel_flag = False
+        # v4.6.0b6 — wizard re-entry guard. True while any programming run
+        # thread is alive; gates start_program_wizard / start_program_wizard_classic
+        # so a click on Program while one is already running can't spawn a
+        # second concurrent run() thread.
+        self._wizard_running = False
         # v4.5.3 — visible build identifier in title. CI injects APP_VERSION
         # at build time (e.g. "4.5.3b6.f5178c4" for beta, "4.5.3" for stable)
         # so this shows the running build's identifier without the operator
@@ -12137,6 +12183,14 @@ https://buymeacoffee.com/thelostping""")
     
     def start_program_wizard_classic(self):
         """Classic programming flow — original combined-options dialog + log-only UI."""
+        # v4.6.0b6 — same re-entry guard as start_program_wizard.
+        if getattr(self, '_wizard_running', False):
+            messagebox.showwarning(
+                "A programming run is already active",
+                "Click Cancel on the active run first, or wait for it to "
+                "finish.",
+                parent=self.root)
+            return
         cameras = self.validate_cameras_for_programming()
         if not cameras:
             return
@@ -12934,13 +12988,38 @@ https://buymeacoffee.com/thelostping""")
             self._cleanup_multihome()  # v4.3 #11 — tear down any auto-added IPs
             self._close_wizard_run_log()
 
-        threading.Thread(target=run, daemon=True).start()
+        # v4.6.0b6 — re-entry guard. Set BEFORE thread spawn (race window),
+        # cleared in finally inside the wrapper so any exit path releases it.
+        self._wizard_running = True
+        def _run_with_flag():
+            try:
+                run()
+            finally:
+                self._wizard_running = False
+        threading.Thread(target=_run_with_flag, daemon=True).start()
 
     # ========================================================================
     # NEW PROGRAMMING FLOW (step-by-step wizard + live status view)
     # ========================================================================
     def start_program_wizard(self):
         """Step-by-step programming flow with live checklist UI."""
+        # v4.6.0b6 — re-entry guard. Without this, clicking Program a second
+        # time before the first run fully exits leaves TWO run() threads
+        # alive. They both look at the same camera list, both factory-reset
+        # the same camera, and their set_network calls race. Brian's
+        # 4.6b1slow.pcap from 2026-05-10 caught it: thread #1's
+        # set_network was atomically writing the new IP while thread #2's
+        # factory_first reset path was wiping the camera that #1 had just
+        # finished programming. ~80s of redo + interleaved log spam.
+        if getattr(self, '_wizard_running', False):
+            messagebox.showwarning(
+                "A programming run is already active",
+                "Click Cancel on the active run first, or wait for it to "
+                "finish.\n\nStarting a second run while another is in flight "
+                "races both runs on the same camera list and can corrupt "
+                "in-progress programming.",
+                parent=self.root)
+            return
         cameras = self.validate_cameras_for_programming()
         if not cameras:
             return
@@ -14193,7 +14272,14 @@ https://buymeacoffee.com/thelostping""")
             self._bundled_dhcp = None
             self._close_wizard_run_log()
 
-        threading.Thread(target=run, daemon=True).start()
+        # v4.6.0b6 — re-entry guard wrapper (see comment in classic flow).
+        self._wizard_running = True
+        def _run_with_flag():
+            try:
+                run()
+            finally:
+                self._wizard_running = False
+        threading.Thread(target=_run_with_flag, daemon=True).start()
 
     def start_factory_default_wizard(self, prefill_ip=None):
         """v4.3 — Standalone factory default. Asks for IP + existing root
