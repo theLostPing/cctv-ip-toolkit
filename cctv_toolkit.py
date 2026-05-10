@@ -89,9 +89,37 @@ def _default_config_dir() -> Path:
         root = os.environ.get('XDG_CONFIG_HOME') or str(Path.home() / '.config')
     return Path(root) / APP_NAME
 
+def _windows_documents() -> Path:
+    """Return the Windows-canonical Documents folder, honoring User Shell
+    Folders redirection. Brian's Documents (and probably others') is
+    redirected to a Nextcloud / OneDrive / Dropbox path; Path.home() /
+    'Documents' would silently return the legacy default profile location
+    where nothing actually goes anymore.
+
+    Returns Path('') on non-Windows or if the registry read fails (caller
+    should fall back to Path.home() / 'Documents')."""
+    if sys.platform != 'win32':
+        return Path('')
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
+        ) as k:
+            val, _ = winreg.QueryValueEx(k, 'Personal')
+        # Value can contain %USERPROFILE% etc. that need expansion.
+        return Path(os.path.expandvars(val))
+    except Exception:
+        return Path('')
+
+
 def _default_export_dir() -> Path:
-    # Documents folder if it resolves; otherwise home.
-    docs = Path.home() / 'Documents'
+    # Honor Windows User Shell Folders redirection (Nextcloud / OneDrive /
+    # Dropbox-mapped Documents). Falls back to Path.home() / 'Documents' if
+    # the registry read fails or we're on a non-Windows OS.
+    docs = _windows_documents()
+    if not docs or not docs.exists():
+        docs = Path.home() / 'Documents'
     if not docs.exists():
         docs = Path.home()
     return docs / 'CCTV Toolkit'
@@ -180,10 +208,80 @@ def _migrate_legacy_data():
     if copied:
         _MIGRATION_NOTE.append((str(legacy), str(CONFIG_DIR), str(EXPORT_DIR), copied))
 
-# Create dirs + run migration before any data manager touches disk.
+def _migrate_export_dir_to_redirected():
+    """v4.5.3 — one-time copy of EXPORT_DIR contents from the legacy default
+    profile path (~/Documents/CCTV Toolkit) into the Windows-redirected
+    Documents path when they differ. Brian's Documents is redirected to
+    Nextcloud, so prior versions of the toolkit (which used Path.home() /
+    'Documents' verbatim) were writing to a path Windows doesn't consider
+    Documents anymore. This catches existing users up so their CSVs / wizard
+    logs / screenshots aren't orphaned.
+
+    Idempotent — gated by a marker file. Source kept as a backup."""
+    if sys.platform != 'win32':
+        return
+    legacy = Path.home() / 'Documents' / 'CCTV Toolkit'
+    if not legacy.is_dir():
+        return
+    if EXPORT_DIR == legacy:
+        return  # Documents isn't actually redirected on this machine
+    marker = CONFIG_DIR / '.migrated_export_dir_to_redirected'
+    if marker.exists():
+        return
+    # Only auto-copy if the new path is empty / nonexistent — never overwrite
+    # something the user has already started using on the redirected side.
+    try:
+        new_has_content = EXPORT_DIR.is_dir() and any(EXPORT_DIR.iterdir())
+    except Exception:
+        new_has_content = False
+    if new_has_content:
+        # Both paths have data. Don't auto-merge — leave a marker explaining
+        # the situation but don't touch anything.
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            marker.write_text(
+                f"skipped at {datetime.now().isoformat()}\n"
+                f"legacy: {legacy}\n"
+                f"redirected: {EXPORT_DIR}\n"
+                f"reason: redirected path already has content; not auto-merging\n"
+            )
+        except Exception:
+            pass
+        _MIGRATION_NOTE.append(('export_dir_skipped', str(legacy), str(EXPORT_DIR), []))
+        return
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    copied = []
+    for item in legacy.iterdir():
+        try:
+            dst = EXPORT_DIR / item.name
+            if dst.exists():
+                continue
+            if item.is_file():
+                shutil.copy2(item, dst)
+                copied.append(item.name)
+            elif item.is_dir():
+                shutil.copytree(item, dst)
+                copied.append(item.name + '/')
+        except Exception as e:
+            copied.append(f'(error) {item.name}: {e}')
+    try:
+        marker.write_text(
+            f"migrated at {datetime.now().isoformat()}\n"
+            f"legacy: {legacy}\n"
+            f"redirected: {EXPORT_DIR}\n"
+            f"copied: {len(copied)} item(s)\n"
+        )
+    except Exception:
+        pass
+    if copied:
+        _MIGRATION_NOTE.append(('export_dir_redirected', str(legacy), str(EXPORT_DIR), copied))
+
+
+# Create dirs + run migrations before any data manager touches disk.
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 _migrate_legacy_data()
+_migrate_export_dir_to_redirected()
 TIMEOUT = 5
 
 # Bosch camera constants
@@ -6234,21 +6332,54 @@ class CCTVToolkitApp:
         self.create_menu()
         self.create_main_ui()
 
-        # One-time notice if we migrated a legacy ./data/ folder on startup
-        if _MIGRATION_NOTE:
-            legacy, cfg, exp, copied = _MIGRATION_NOTE[0]
-            n_cfg = sum(1 for kind, _ in copied if kind == 'config')
-            n_exp = sum(1 for kind, _ in copied if kind == 'export')
-            self.root.after(400, lambda: messagebox.showinfo(
-                "Data folders moved",
-                "Your existing data folder has been split so upgrades don't wipe it out:\n\n"
-                f"  Config ({n_cfg} file(s)): {cfg}\n"
-                f"    • passwords, camera list, settings\n\n"
-                f"  Exports ({n_exp} item(s)): {exp}\n"
-                f"    • CSVs, screenshots, FTP pulls\n\n"
-                f"Your original folder is untouched at:\n  {legacy}\n"
-                "You can delete it after confirming the new folders look right."
-            ))
+        # One-time notice for any startup data migrations
+        for note in _MIGRATION_NOTE:
+            if not note:
+                continue
+            # Discriminate by length / first element
+            if len(note) == 4 and isinstance(note[0], str) and note[0] == 'export_dir_redirected':
+                _, legacy, new_path, copied = note
+                n = len(copied)
+                self.root.after(400, lambda lg=legacy, np=new_path, n=n: messagebox.showinfo(
+                    "Documents folder is redirected — data moved",
+                    "Windows reports your Documents folder is at a redirected\n"
+                    "location (Nextcloud / OneDrive / similar). Earlier toolkit\n"
+                    "versions wrote to the legacy default profile path.\n\n"
+                    f"Copied {n} item(s) into your real Documents folder:\n"
+                    f"  {np}\n\n"
+                    f"Your original folder is untouched at:\n  {lg}\n"
+                    "You can delete it after confirming the new folder looks right."
+                ))
+            elif len(note) == 4 and isinstance(note[0], str) and note[0] == 'export_dir_skipped':
+                _, legacy, new_path, _ = note
+                self.root.after(400, lambda lg=legacy, np=new_path: messagebox.showinfo(
+                    "Two CCTV Toolkit data folders detected",
+                    "Both your legacy Documents folder AND your redirected\n"
+                    "Documents folder have CCTV Toolkit data — the toolkit\n"
+                    "didn't auto-merge to avoid surprises.\n\n"
+                    f"  Legacy:     {lg}\n"
+                    f"  Redirected: {np}\n\n"
+                    "Going forward the toolkit writes to the redirected path.\n"
+                    "Manually copy anything you want from the legacy folder."
+                ))
+            else:
+                # Original ./data/ split notice (4-tuple of strings + typed list)
+                try:
+                    legacy, cfg, exp, copied = note
+                    n_cfg = sum(1 for kind, _ in copied if kind == 'config')
+                    n_exp = sum(1 for kind, _ in copied if kind == 'export')
+                    self.root.after(400, lambda lg=legacy, c=cfg, e=exp, nc=n_cfg, ne=n_exp: messagebox.showinfo(
+                        "Data folders moved",
+                        "Your existing data folder has been split so upgrades don't wipe it out:\n\n"
+                        f"  Config ({nc} file(s)): {c}\n"
+                        f"    • passwords, camera list, settings\n\n"
+                        f"  Exports ({ne} item(s)): {e}\n"
+                        f"    • CSVs, screenshots, FTP pulls\n\n"
+                        f"Your original folder is untouched at:\n  {lg}\n"
+                        "You can delete it after confirming the new folders look right."
+                    ))
+                except Exception:
+                    pass
 
         # Check for first run
         if self.settings.get_bool('general', 'first_run'):
@@ -11173,7 +11304,8 @@ Email: axisprogrammer@thelostping.net
                 "• Bundled DHCP no longer fails with cryptic 'WinError 10049' when the dropdown's stored IP is stale. The toolkit now re-resolves the interface's current IPv4 by InterfaceIndex at server-start time, and surfaces a friendly message if the NIC has no IPv4 (instead of the raw Windows socket error).",
                 "• FIX: Cancelling a wizard mid-run now removes auto-multihome IP addresses from the NIC immediately. Previously only successful runs cleaned up; cancelled runs left orphan IPs on the NIC until the toolkit was restarted.",
                 "• FIX: Beta-channel update prompt false-positive. The version parser was misreading CI prerelease tags like 'beta-v4.5.3-beta.8e1f789' as '(5,3,8)' instead of '(4,5,3)', making the running build think a newer beta of its own version was available — loop. Now correctly stops at the first non-numeric chunk.",
-                "• FIX: Taskbar icon now matches the file/EXE icon (both lens-style branding). app.ico had drifted to an older tray-with-camera asset while logo.ico was updated to the lens; runtime taskbar icon was loading the stale one.",
+                "• FIX: Taskbar icon now matches the file/EXE icon (both lens-style branding). app.ico had drifted to an older tray-with-camera asset while logo.ico was updated to the lens; runtime taskbar icon was loading the stale one. ALSO switched the runtime loader from iconbitmap to iconphoto via PIL — Tk's iconbitmap silently falls back to the default feather on PNG-encoded ICO entries (which ours are), and the previous bare except:pass was hiding the symptom.",
+                "• FIX: Documents folder location now honors Windows User Shell Folders redirection. If your Documents is redirected (Nextcloud, OneDrive, Dropbox), the toolkit's CSVs / wizard logs / screenshots were quietly going to the legacy default profile path. Now reads the canonical Documents location from the registry, AND auto-migrates existing data from the legacy path on first launch (originals kept as a backup).",
                 "• Misleading 'bailing this slot' log line softened to 'skipping this attempt and continuing to wait' — the wait-loop already had a 30s pause + retry under the hood, but the message made it sound permanent.",
             ],
         ),
