@@ -1802,23 +1802,82 @@ class AxisProtocol(CameraProtocol):
         # SOAP. After programming, the wizard calls delete_onvif_user(static_ip)
         # to remove it (unless the operator opted to keep it). Net effect:
         # camera ends with VAPIX root only, no leftover ONVIF account.
+        # v4.6.0b5 — proper logging + settling delay + retry. Was: bare except
+        # silently swallowed every error, leaving FW 10.x cameras with no
+        # ONVIF user (live verified: GetUsers returned empty body on a
+        # toolkit-programmed FW 10.12.240). VMS clients (Milestone, Genetec)
+        # using ONVIF auth would then fail to connect. Live test with the
+        # same SOAP payload + 45s timeout against the same camera, but a few
+        # minutes after programming, completed in 106ms. Conclusion: the
+        # ONVIF auth state on the camera hadn't propagated the just-created
+        # VAPIX root password by the time CreateUsers fired immediately
+        # after pwdgrp.cgi action=add. Fix: small settling delay + retry on
+        # auth-related failures, with proper diagnostic logging instead of
+        # silent swallow.
+        cb = getattr(self, 'log_callback', None)
+        def _diag(msg):
+            if callable(cb):
+                try: cb(f"      [create_initial_user] {msg}")
+                except Exception: pass
+        # Settle: give the ONVIF service a beat to pick up the new VAPIX
+        # auth state. Empirical: 2s avoids the 401 race on FW 10.x.
         try:
-            soap = (f'<?xml version="1.0"?>'
-                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
-                    f'<CreateUsers xmlns="http://www.onvif.org/ver10/device/wsdl" '
-                    f'xmlns:tt="http://www.onvif.org/ver10/schema">'
-                    f'<User><tt:Username>root</tt:Username>'
-                    f'<tt:Password>{password}</tt:Password>'
-                    f'<tt:UserLevel>Administrator</tt:UserLevel>'
-                    f'</User></CreateUsers></Body></Envelope>')
-            requests.post(f"http://{ip}/vapix/services", data=soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-        except:
-            # Don't fail the whole programming step if this one barfs — older
-            # firmware (pre 6.50) sometimes 500s on this call but the user
-            # still ends up created. Web UI confirms it. Just move on.
+            time.sleep(2)
+        except Exception:
             pass
+        soap = (f'<?xml version="1.0"?>'
+                f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                f'<CreateUsers xmlns="http://www.onvif.org/ver10/device/wsdl" '
+                f'xmlns:tt="http://www.onvif.org/ver10/schema">'
+                f'<User><tt:Username>root</tt:Username>'
+                f'<tt:Password>{password}</tt:Password>'
+                f'<tt:UserLevel>Administrator</tt:UserLevel>'
+                f'</User></CreateUsers></Body></Envelope>')
+        for attempt in range(3):
+            try:
+                r = requests.post(f"http://{ip}/vapix/services", data=soap,
+                    headers={"Content-Type": "application/soap+xml"},
+                    auth=HTTPDigestAuth("root", password), timeout=15)
+                # Success body: <CreateUsersResponse/> (empty self-closing).
+                # Already-exists: SOAP fault with 'UsernameClash'/'username already exists'.
+                body = (r.text or '')
+                if r.status_code in (200, 204):
+                    if 'CreateUsersResponse' in body and 'Fault' not in body:
+                        _diag(f"ONVIF CreateUsers root → success (attempt {attempt+1})")
+                        return True
+                    if 'UsernameClash' in body or 'already exist' in body.lower():
+                        _diag(f"ONVIF CreateUsers root → already exists (attempt {attempt+1}) — fine")
+                        return True
+                    # 200 with unexpected body — log it and treat as success
+                    # since the user might have been created anyway
+                    _diag(f"ONVIF CreateUsers root → status=200 unexpected body[:200]={body[:200]!r}")
+                    return True
+                if r.status_code == 401 and attempt < 2:
+                    _diag(f"ONVIF CreateUsers root → 401 on attempt {attempt+1}, retrying in 3s (auth state may still be propagating)")
+                    try:
+                        time.sleep(3)
+                    except Exception:
+                        pass
+                    continue
+                _diag(f"ONVIF CreateUsers root → status={r.status_code} body[:200]={body[:200]!r}")
+                # Non-fatal: VAPIX user already created above, programming proceeds.
+                # ONVIF clients won't auth until this is rerun or the user is
+                # added some other way.
+                return True
+            except (requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                if attempt < 2:
+                    _diag(f"ONVIF CreateUsers root → {type(e).__name__} on attempt {attempt+1}, retrying in 3s")
+                    try:
+                        time.sleep(3)
+                    except Exception:
+                        pass
+                    continue
+                _diag(f"ONVIF CreateUsers root → exhausted retries: {type(e).__name__}: {e}")
+                return True  # don't fail the whole step
+            except Exception as e:
+                _diag(f"ONVIF CreateUsers root → unexpected: {type(e).__name__}: {e}")
+                return True  # don't fail the whole step
         return True
 
     def add_onvif_user(self, ip, password, new_username, new_password, level='Operator'):
