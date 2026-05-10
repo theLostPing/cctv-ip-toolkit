@@ -8952,6 +8952,26 @@ class CCTVToolkitApp:
         if not iface_idx:
             return 0
 
+        # v4.6.0b10 — short-circuit pre-flight entirely when the bundled DHCP
+        # server says it already has an active lease for a camera-vendor MAC.
+        # The server only ACKs leases to camera-OUI MACs (b1 MAC filter), and
+        # lease_active flips True the instant it sends the ACK — so a True
+        # value means a camera just grabbed the lease, just rebooted, and is
+        # in factory-clean state ready to program. No need to scan 6 /24s
+        # (~34s) looking for previously-configured cameras to reset; there
+        # are none to find. Brian's 4.6b9 test 2026-05-10: 34s of dumb
+        # sweep producing 'already factory-clean — no reset prompt needed'
+        # — pure overhead.
+        srv = getattr(self, 'session_dhcp_server', None)
+        try:
+            if srv and getattr(srv, 'lease_active', False) and getattr(srv, 'last_client_mac', ''):
+                lease_mac = srv.last_client_mac
+                if self._lease_holder_is_camera(lease_mac):
+                    self.log(f"\nPre-flight: bundled DHCP shows camera {lease_mac} at lease IP — already factory-clean, ready to program. Skipping pre-flight discovery scan.")
+                    return 0
+        except Exception:
+            pass  # Fall through to the normal pre-flight if anything goes wrong
+
         # ---- Stage 1: smart pass via link-local mDNS + camera self-report ----
         self.log("\nPre-flight (smart): mDNS on link-local + ask each camera its real IP…")
         smart_found = self._smart_preflight_via_linklocal(iface_idx)
