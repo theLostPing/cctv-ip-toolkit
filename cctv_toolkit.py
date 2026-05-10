@@ -8861,6 +8861,28 @@ class CCTVToolkitApp:
                     self.log(f"  smart: {ll_ip} ({ll_mac}) — HTTP dead at link-local, deferring to dumb sweep")
                     continue
 
+            # v4.6.0b9 — short-circuit factory-clean cameras. Brian's 4.6b8
+            # test 2026-05-10: smart pass walked all 803 saved passwords
+            # against a factory-clean camera (no auth set) for 37 seconds
+            # before giving up. The camera has NO password to match — the
+            # walk was guaranteed to fail. Fast factory-state probe (single
+            # no-auth HTTP request, <100ms): if pwdgrp.cgi action=list
+            # returns 200 without auth, the camera is in factory state with
+            # no users yet. Skip the walk entirely — the dumb sweep / wait
+            # loop will pick this camera up as factory-clean / ready to
+            # program. Saves ~37s on retest cycles where the camera was
+            # just factory-defaulted.
+            try:
+                fc_resp = requests.get(
+                    f"http://{ll_ip}/axis-cgi/pwdgrp.cgi",
+                    params={"action": "list"},
+                    timeout=3)
+                if fc_resp.status_code == 200:
+                    self.log(f"  smart: {ll_ip} ({ll_mac}) — camera is factory-clean (pwdgrp.cgi action=list no-auth=200) — skipping password walk")
+                    continue
+            except Exception:
+                pass  # fall through to the password walk if the probe fails
+
             # Walk passwords (cache hits in <100ms on a known camera).
             self.log(f"  smart: {ll_ip} ({ll_mac}, {model}) — auth via saved passwords…")
             pwd = self._find_working_password(ll_ip, known_mac=mac_clean)
