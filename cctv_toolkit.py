@@ -13267,24 +13267,44 @@ https://buymeacoffee.com/thelostping""")
                 _wait_start = time.time()
                 _last_heartbeat = _wait_start
                 while not self.cancel_flag:
-                    # Bundled DHCP path: when the server is on, the camera
-                    # picks up our lease almost immediately on power-up.
-                    # Check this IP first — it's the "always know" address.
+                    # v4.6.0b8 — FASTEST path: the bundled DHCP server itself
+                    # is the authoritative source of "camera just grabbed the
+                    # lease". `lease_active` flips True the instant the
+                    # server ACKs a REQUEST, and the b1 MAC filter ensures
+                    # only camera-vendor OUIs ever get to that point.
+                    # No need to ICMP-probe — the lease ACK IS the signal.
+                    # Brian 4.6b1 test 2026-05-10: camera at .50 from
+                    # 18:20:36 (DHCP ACK timestamp), toolkit took 42s of
+                    # ping-based polling to find it via mDNS instead. FW 12
+                    # cameras can ARP-probe for tens of seconds before
+                    # responding to ICMP at the new IP, so ICMP-based
+                    # polling is unreliable. Server-side lease state is
+                    # instant and reliable.
                     if self._bundled_dhcp and dhcp_lease_ip:
+                        try:
+                            lease_active = bool(getattr(self._bundled_dhcp, 'lease_active', False))
+                            lease_mac_from_server = getattr(self._bundled_dhcp, 'last_client_mac', '') or ''
+                        except Exception:
+                            lease_active = False
+                            lease_mac_from_server = ''
+                        if lease_active and lease_mac_from_server:
+                            # MAC filter at the DHCP server already guarantees this is
+                            # a camera-vendor MAC, but verify once more for safety.
+                            if self._lease_holder_is_camera(lease_mac_from_server):
+                                camera_ip = dhcp_lease_ip
+                                self.status_log(f"Camera found at bundled DHCP lease {dhcp_lease_ip} (server says {lease_mac_from_server} is active)")
+                                break
+                        # Older slower path: ICMP probe as fallback when the
+                        # lease isn't active yet (e.g. server just started,
+                        # camera hasn't requested DHCP yet, or camera is on a
+                        # static IP at the lease address from a previous run).
                         if self.ping_camera(dhcp_lease_ip, timeout_ms=1000):
-                            # Verify whoever holds the lease matches the
-                            # camera-vendor OUI / whitelist. Managed PoE
-                            # switches and rogue laptops on the segment can
-                            # race for the same single lease IP — without
-                            # this check the wait-loop would falsely declare
-                            # "Camera found" and try to factory-reset them.
                             lease_mac = self._mac_for_ip(dhcp_lease_ip)
                             if not self._lease_holder_is_camera(lease_mac):
                                 self.status_log(
                                     f"  Lease {dhcp_lease_ip} is held by "
                                     f"{lease_mac or '?'} — not a {self.protocol.BRAND_NAME} camera, "
                                     f"ignoring and continuing to wait")
-                                # Pause briefly so we don't spam this on every loop tick
                                 time.sleep(2)
                             else:
                                 camera_ip = dhcp_lease_ip
