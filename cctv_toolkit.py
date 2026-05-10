@@ -1913,26 +1913,59 @@ class AxisProtocol(CameraProtocol):
         """v4.3 #10 — security cleanup after programming completes. The ONVIF
         user that create_initial_user added is a transient TOOL needed for
         set_network's ONVIF SOAP call; once set_network is done it's just a
-        leftover account. Delete via ONVIF DeleteUsers SOAP. Idempotent —
-        if the user is already gone, returns True (no-op).
-        Returns True on success or already-absent, False on a real failure
-        (auth fail, network unreachable, SOAP fault). Non-fatal at the wizard
-        level — wizard logs a warning if False but keeps going.
-        v4.5.1: 3 attempts with 4s back-off — same pattern as set_network.
-        FW 10.x cameras frequently 401 the first DeleteUsers right after the
-        IP swap because they're still reconfiguring auth state. The retry
-        catches the case where it succeeds on the second or third try."""
-        soap = (f'<?xml version="1.0"?>'
-                f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
-                f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
-                f'<Username>{username}</Username>'
-                f'</DeleteUsers></Body></Envelope>')
+        leftover account. Delete via ONVIF DeleteUsers SOAP.
+
+        v4.6.0b4: pre-flight GetUsers first. On FW 10.x the CreateUsers call
+        in create_initial_user fails silently (bare except) because the
+        ONVIF service is finicky there — so the camera has no ONVIF user in
+        the first place, and the previous "delete failed → leftover account"
+        warning was a false alarm (there was nothing to leave behind). Now
+        we check the user table first and only attempt the delete if the
+        target user actually exists. Returns:
+          True  -> no user present (nothing to delete) OR delete succeeded
+          False -> user exists and delete genuinely failed
+        Non-fatal at the wizard level either way."""
+        # Pre-flight: does the user actually exist?
+        get_soap = ('<?xml version="1.0"?>'
+                    '<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                    '<GetUsers xmlns="http://www.onvif.org/ver10/device/wsdl"/>'
+                    '</Body></Envelope>')
+        try:
+            r_get = requests.post(f"http://{ip}/vapix/services", data=get_soap,
+                headers={"Content-Type": "application/soap+xml"},
+                auth=HTTPDigestAuth("root", password), timeout=10)
+            if r_get.status_code == 200:
+                body = r_get.text or ''
+                # User present iff the response contains a <tt:Username>NAME</tt:Username>
+                # for our target. An empty <GetUsersResponse/> means no ONVIF users.
+                if f'<tt:Username>{username}</tt:Username>' not in body:
+                    cb = getattr(self, 'log_callback', None)
+                    if callable(cb):
+                        try:
+                            cb(f"      [delete_onvif_user] no ONVIF '{username}' present — nothing to delete (CreateUsers likely silently failed during programming, common on FW 10.x).")
+                        except Exception:
+                            pass
+                    return True
+        except Exception:
+            # GetUsers itself failed; fall through to attempting the delete.
+            # Better to try than skip and report a false-positive "kept user".
+            pass
+
+        # User does exist (or GetUsers itself failed) — attempt the delete.
+        del_soap = (f'<?xml version="1.0"?>'
+                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                    f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
+                    f'<Username>{username}</Username>'
+                    f'</DeleteUsers></Body></Envelope>')
         last_status = None
         for attempt in range(3):
             try:
-                r = requests.post(f"http://{ip}/vapix/services", data=soap,
+                # v4.6.0b4 — bumped timeout from TIMEOUT (5s) to 30s. ONVIF
+                # SOAP writes on FW 10.x can take 30-60s; 5s was guaranteed
+                # to ReadTimeout.
+                r = requests.post(f"http://{ip}/vapix/services", data=del_soap,
                     headers={"Content-Type": "application/soap+xml"},
-                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+                    auth=HTTPDigestAuth("root", password), timeout=30)
                 last_status = r.status_code
                 if r.status_code in (200, 204):
                     return True
