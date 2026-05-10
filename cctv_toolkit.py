@@ -13496,6 +13496,25 @@ https://buymeacoffee.com/thelostping""")
                     # source; the camera just answered ICMP from us.
                     if not mac:
                         mac = self.get_mac_from_arp(camera_ip)
+                    # v4.6.0b12 — last-resort fallback: when bundled DHCP fed
+                    # us this camera, the server already KNOWS the MAC from
+                    # the DHCP REQUEST. Probe_unrestricted may return empty
+                    # mac during the camera's HTTP-not-yet-ready window post
+                    # DHCP ACK (FW 12 ARP-probe phase, etc.) and ARP cache
+                    # may not be populated yet either. The server-side
+                    # last_client_mac is authoritative. Brian's 4.6b11 test
+                    # 2026-05-10 hit exactly this: 'No MAC from ARP' even
+                    # though session_dhcp_server.last_client_mac was set
+                    # to the correct value 8 seconds prior. Use it.
+                    if not mac:
+                        try:
+                            srv = getattr(self, '_bundled_dhcp', None)
+                            if srv and camera_ip == dhcp_lease_ip:
+                                fallback_mac = getattr(srv, 'last_client_mac', '') or ''
+                                if fallback_mac:
+                                    mac = fallback_mac
+                        except Exception:
+                            pass
                     if mac:
                         mac_norm = mac.upper().replace(':', '').replace('-', '')
                         if mac_norm not in seen_macs:
