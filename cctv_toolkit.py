@@ -6303,6 +6303,12 @@ class LldpDiscoveryDialog(tk.Toplevel):
 class CCTVToolkitApp:
     def __init__(self, root):
         self.root = root
+        # v4.5.3 — initialize log infrastructure FIRST so anything later in
+        # __init__ that logs (icon loader, startup banner, migration notice,
+        # etc.) doesn't AttributeError on self.log_queue. Was previously
+        # initialized later, which broke the new icon-loader success log.
+        self.log_queue = queue.Queue()
+        self.cancel_flag = False
         # v4.5.3 — visible build identifier in title. CI injects APP_VERSION
         # at build time (e.g. "4.5.3b6.f5178c4" for beta, "4.5.3" for stable)
         # so this shows the running build's identifier without the operator
@@ -6391,8 +6397,7 @@ class CCTVToolkitApp:
         import atexit as _atexit
         _atexit.register(self._cleanup_multihome)
 
-        self.log_queue = queue.Queue()
-        self.cancel_flag = False
+        # log_queue + cancel_flag hoisted to top of __init__ in v4.5.3.
         self.preview_image = None
         self.startup_scan_complete = False
         self._scan_running = False
