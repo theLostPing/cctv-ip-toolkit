@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.5.2"
+APP_VERSION = "4.5.3"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -225,6 +225,13 @@ DEFAULT_SETTINGS = {
         'last_seen_version': '',  # for "what's new" popup on first launch of a new version
         'last_dismissed_version': '',  # suppresses nag when user chose "remind me later"
         'update_channel': 'stable',  # 'stable' (tagged v* releases only) or 'beta' (also includes beta/** prereleases)
+        # Bundled DHCP MAC filter — keeps non-camera devices on the programming
+        # switch (managed PoE switches with web UIs, stray laptops, printers)
+        # from racing the cameras for the single lease IP. Defaults ON: only
+        # MACs whose OUI matches the active brand are ACK'd. Whitelist accepts
+        # additional full MACs (one per line, any common format).
+        'dhcp_mac_filter_enabled': 'true',
+        'dhcp_mac_whitelist': '',
     },
     'warnings': {
         'show_incomplete_camera_warning': 'true',
@@ -419,6 +426,46 @@ DEFAULT_FIND_ANYWHERE_SUBNETS = (
 )
 # Axis OUI prefixes — dash-formatted to match Get-NetNeighbor output.
 AXIS_OUI_PREFIXES = ('B8-A4-4F', '00-40-8C', 'AC-CC-8E')
+
+
+def _normalize_mac(mac):
+    """'B8:A4:4F:8B:F3:BB' / 'b8-a4-4f-8b-f3-bb' / 'B8A44F8BF3BB' → 'B8A44F8BF3BB'.
+    Returns '' if not parseable as a 12-hex-digit MAC."""
+    if not mac:
+        return ''
+    s = ''.join(c for c in str(mac) if c not in ':-. ').upper()
+    if len(s) == 12 and all(c in '0123456789ABCDEF' for c in s):
+        return s
+    return ''
+
+
+def _parse_mac_whitelist(text):
+    """Split free-form text (lines, commas, semicolons) into a set of normalized
+    12-hex-digit MACs. Used to allow specific non-camera-OUI devices through
+    the bundled DHCP MAC filter (e.g. an unusual rebadged camera, a deliberate
+    test rig)."""
+    out = set()
+    if not text:
+        return out
+    for chunk in str(text).replace(',', '\n').replace(';', '\n').splitlines():
+        m = _normalize_mac(chunk.strip())
+        if m:
+            out.add(m)
+    return out
+
+
+def _mac_oui_allowed(mac, oui_bytes_list):
+    """True if the MAC's first 3 bytes match any entry in oui_bytes_list.
+    oui_bytes_list is the same b'\\x..\\x..\\x..' form used by per-protocol
+    MAC_OUIS class attributes (so we can pass `protocol.MAC_OUIS` directly)."""
+    norm = _normalize_mac(mac)
+    if not norm or not oui_bytes_list:
+        return False
+    try:
+        prefix = bytes.fromhex(norm[:6])
+    except ValueError:
+        return False
+    return any(prefix == oui for oui in oui_bytes_list)
 
 
 def _arp_table():
@@ -3084,7 +3131,8 @@ class BundledDHCPServer:
     starting on any non-isolated network."""
 
     def __init__(self, iface_ip, lease_ip, subnet_mask='255.255.255.0',
-                 router_ip=None, dns_ip='8.8.8.8', lease_secs=300, log_fn=None):
+                 router_ip=None, dns_ip='8.8.8.8', lease_secs=300, log_fn=None,
+                 is_allowed_mac=None):
         self.iface_ip = iface_ip
         self.lease_ip = lease_ip
         self.subnet_mask = subnet_mask
@@ -3097,6 +3145,14 @@ class BundledDHCPServer:
         self._stop = _bs_threading.Event()
         self._last_client_mac = None
         self._lease_active = False
+        # MAC filter — when set, only ACK leases to MACs that pass this check.
+        # Keeps managed PoE switches and other non-camera devices on the
+        # programming segment from racing the camera for the single lease IP.
+        # None = no filter (back-compat for any caller that doesn't pass one).
+        self._is_allowed_mac = is_allowed_mac
+        # Throttle the per-MAC "ignored" log so a chatty foreign device doesn't
+        # flood the wizard log. Map: normalized-MAC → last-logged epoch.
+        self._ignored_log_at = {}
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -3160,6 +3216,17 @@ class BundledDHCPServer:
                 continue
             mt = parsed.get('msg_type')
             mac = parsed.get('mac', '?')
+            # MAC filter — drop disallowed MACs before they enter the lease
+            # state machine. Throttled to one log line per MAC per 60s so a
+            # noisy foreign device (managed switch, rogue laptop) doesn't
+            # flood the wizard log.
+            if self._is_allowed_mac is not None and not self._is_allowed_mac(mac):
+                now = time.time()
+                key = _normalize_mac(mac) or mac
+                if now - self._ignored_log_at.get(key, 0) >= 60:
+                    self._log(f"DHCP from {mac} IGNORED — not in MAC filter (whitelist or camera-vendor OUI)")
+                    self._ignored_log_at[key] = now
+                continue
             if mt == _DHCP_MSG_DISCOVER:
                 self._log(f"DHCP DISCOVER from {mac} → offering {self.lease_ip}")
                 self._send_reply(parsed, _DHCP_MSG_OFFER)
@@ -5254,7 +5321,12 @@ class ProgramWizardDialog(tk.Toplevel):
 
         # Auto NIC multi-home (v4.3 #11)
         ttk.Checkbutton(f, text="Auto multi-home interface for this run (helps reach cameras on multiple subnets)",
-                        variable=self.auto_multihome_var).pack(anchor='w', pady=(15, 2))
+                        variable=self.auto_multihome_var,
+                        command=self._on_multihome_toggle).pack(anchor='w', pady=(15, 2))
+        ttk.Label(f, text="    REQUIRES a specific INTERFACE in the top bar of the main window —\n"
+                          "    Auto-detect WILL NOT WORK. The run will be aborted if you start it\n"
+                          "    with this on but no interface picked.",
+                  foreground='#B71C1C', font=('Helvetica', 9, 'bold')).pack(anchor='w')
         ttk.Label(f, text="    Adds host IPs on the selected interface for every camera-list subnet,\n"
                           "    so the toolkit can talk to cameras on different gateways without\n"
                           "    manual netsh. Requires admin (toolkit will prompt). Cleanup runs\n"
@@ -5387,6 +5459,28 @@ class ProgramWizardDialog(tk.Toplevel):
         else:
             self.ip_entry.configure(state='normal')
             self.ip_label.configure(foreground='black')
+
+    def _on_multihome_toggle(self):
+        """Called when the Auto multi-home checkbox changes. On enable, hit
+        the user with a hard reminder that this requires a specific INTERFACE
+        in the top bar of the main window — without one, the run will be
+        aborted at start-time. They can OK to proceed (assumes they will pick
+        one before clicking Start) or Cancel to uncheck."""
+        if not self.auto_multihome_var.get():
+            return
+        proceed = messagebox.askokcancel(
+            "Auto multi-home — INTERFACE required",
+            "Auto multi-home REQUIRES a specific INTERFACE selected in the\n"
+            "top bar of the main window (NOT 'Auto-detect').\n\n"
+            "Without one, the toolkit cannot add the per-subnet host IPs that\n"
+            "let it reach cameras after they move to their target IPs — "
+            "programming would write the new IP and then have no route to\n"
+            "verify the camera came back online.\n\n"
+            "Click OK if you've picked (or will pick) a specific interface\n"
+            "in the top bar before starting. Click Cancel to turn this off.",
+            parent=self, icon='warning')
+        if not proceed:
+            self.auto_multihome_var.set(False)
 
     def finish(self):
         # Resolve interface selection
@@ -6324,6 +6418,125 @@ class CCTVToolkitApp:
         self.session_iface = None
         return None
 
+    def _current_ipv4_for_index(self, iface_index):
+        """Live-lookup the current IPv4 assigned to a given InterfaceIndex.
+        Returns the first non-link-local IPv4 found (preferring public/RFC1918
+        over 169.254), or '' if the NIC has no IPv4. Used at DHCP enable time
+        to avoid binding to the dropdown's stale snapshot (WinError 10049).
+        """
+        if iface_index in (None, '', 0):
+            return ''
+        try:
+            import subprocess
+            cmd = (f"Get-NetIPAddress -InterfaceIndex {int(iface_index)} -AddressFamily IPv4 "
+                   "-ErrorAction SilentlyContinue | Select-Object -ExpandProperty IPAddress")
+            r = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=5,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if r.returncode != 0:
+                return ''
+            ips = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+            # Prefer non-link-local
+            non_ll = [ip for ip in ips if not ip.startswith('169.254.')]
+            if non_ll:
+                return non_ll[0]
+            if ips:
+                return ips[0]
+        except Exception:
+            pass
+        return ''
+
+    def _mac_for_ip(self, ip):
+        """Look up the MAC that's currently answering for `ip` via the OS ARP
+        table. Returns the normalized 12-hex MAC, or '' if not resolvable.
+        Used by the wait-loop OUI gate to verify lease holders."""
+        try:
+            import subprocess
+            r = subprocess.run(['arp', '-a', ip],
+                               capture_output=True, text=True, timeout=3,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if r.returncode != 0:
+                return ''
+            for line in r.stdout.splitlines():
+                # Look for a hex-MAC token on the same line as the IP
+                parts = line.split()
+                for tok in parts:
+                    if _normalize_mac(tok):
+                        return _normalize_mac(tok)
+        except Exception:
+            pass
+        return ''
+
+    def _lease_holder_is_camera(self, mac):
+        """True if the given MAC is consistent with the active brand's
+        camera-vendor OUI list OR the user's MAC whitelist. Empty MAC means
+        we couldn't resolve — treat as "yes, give it a chance" so we don't
+        block legitimate cameras when ARP hasn't populated yet."""
+        if not mac:
+            return True  # ARP not populated yet — let downstream auth decide
+        try:
+            whitelist = _parse_mac_whitelist(self.settings.get('general', 'dhcp_mac_whitelist') or '')
+        except Exception:
+            whitelist = set()
+        norm = _normalize_mac(mac)
+        if norm and norm in whitelist:
+            return True
+        try:
+            brand_ouis = list(getattr(self.protocol, 'MAC_OUIS', []) or [])
+        except Exception:
+            brand_ouis = []
+        if not brand_ouis:
+            return True  # No brand-OUIs registered — fail open, can't enforce
+        return _mac_oui_allowed(mac, brand_ouis)
+
+    def _build_dhcp_mac_filter(self):
+        """Build the MAC-allowlist callable passed into BundledDHCPServer.
+        Returns a function(mac_str) → bool. None means "filter disabled —
+        accept everyone" (back-compat with the old DHCP behavior).
+
+        The filter passes a MAC if EITHER:
+          1. Its OUI (first 3 bytes) is in the active brand's MAC_OUIS, OR
+          2. The full MAC is in the user's whitelist setting.
+
+        Built fresh on every DHCP enable so brand switches and whitelist
+        edits take effect on the next DHCP toggle (no app restart needed)."""
+        try:
+            enabled = (self.settings.get('general', 'dhcp_mac_filter_enabled') or 'true').strip().lower() == 'true'
+        except Exception:
+            enabled = True
+        if not enabled:
+            return None
+
+        try:
+            brand_ouis = list(getattr(self.protocol, 'MAC_OUIS', []) or [])
+        except Exception:
+            brand_ouis = []
+        try:
+            whitelist = _parse_mac_whitelist(self.settings.get('general', 'dhcp_mac_whitelist') or '')
+        except Exception:
+            whitelist = set()
+
+        if not brand_ouis and not whitelist:
+            # Nothing to enforce — treat as disabled rather than refusing every
+            # request (would leave the DHCP server functionally dead).
+            self.log("[dhcp] MAC filter ON but active brand has no OUIs and whitelist is empty — filter inactive for this run.")
+            return None
+
+        # Snapshot for closure capture
+        ouis_snapshot = tuple(brand_ouis)
+        wl_snapshot = frozenset(whitelist)
+
+        def is_allowed(mac):
+            norm = _normalize_mac(mac)
+            if not norm:
+                return False
+            if norm in wl_snapshot:
+                return True
+            return _mac_oui_allowed(mac, ouis_snapshot)
+
+        return is_allowed
+
     def _on_session_iface_change(self, event=None):
         """Interface picker changed — if DHCP server is running, stop it
         (it was bound to the previous NIC)."""
@@ -6368,6 +6581,30 @@ class CCTVToolkitApp:
             self.session_dhcp_var.set(False)
             return
 
+        # v4.5.x — re-resolve the iface IP RIGHT NOW. The dropdown's snapshot
+        # of `iface['ip']` was taken when the dropdown was populated and can
+        # be stale: auto-multihome adds/removes IPs, the user reselects the
+        # interface, DHCP renews on the laptop's own NIC, etc. If the cached
+        # IP is no longer assigned, sock.bind() fails with WinError 10049
+        # (WSAEADDRNOTAVAIL). Look up the current IPv4 by InterfaceIndex
+        # instead and refuse cleanly if the NIC has no IPv4.
+        fresh_ip = self._current_ipv4_for_index(iface.get('index'))
+        if not fresh_ip:
+            messagebox.showerror(
+                "Interface has no IPv4",
+                f"The selected interface (index {iface.get('index')}, "
+                f"label '{iface.get('label', '?')}') currently has NO IPv4 "
+                "address assigned.\n\n"
+                "Pick a different interface, or assign an IPv4 to this one "
+                "(static or via DHCP) and try again.",
+                parent=self.root)
+            self.session_dhcp_var.set(False)
+            return
+        if fresh_ip != iface.get('ip'):
+            self.log(f"Bundled DHCP: iface IP refreshed {iface.get('ip')} → {fresh_ip} (snapshot was stale)")
+            iface = dict(iface)  # don't mutate the dropdown's stored dict
+            iface['ip'] = fresh_ip
+
         cfg = self.session_dhcp_config
         lease_ip = cfg.get('lease_ip', '').strip()
         if not lease_ip:
@@ -6406,6 +6643,12 @@ class CCTVToolkitApp:
             self.session_dhcp_status.configure(text="cancelled", foreground='gray')
             return
 
+        # MAC filter — only ACK leases to camera-vendor OUIs (active brand) +
+        # user-whitelisted MACs. Disabling the filter restores the old
+        # accept-everyone behavior. Built fresh on every start so brand /
+        # whitelist changes take effect on the next DHCP toggle.
+        is_allowed_mac = self._build_dhcp_mac_filter()
+
         # Start the server
         try:
             self.session_dhcp_server = BundledDHCPServer(
@@ -6416,6 +6659,7 @@ class CCTVToolkitApp:
                 dns_ip=cfg.get('dns_ip', '8.8.8.8'),
                 lease_secs=int(cfg.get('lease_secs', 300)),
                 log_fn=lambda m: self.log(f"[dhcp] {m}"),
+                is_allowed_mac=is_allowed_mac,
             )
             self.session_dhcp_server.start()
             self.session_dhcp_confirmed = True
@@ -6423,8 +6667,18 @@ class CCTVToolkitApp:
                 text=f"serving {lease_ip} on {iface['ip']}", foreground='#2E7D32')
             self.log(f"Bundled DHCP server started — leasing {lease_ip} on {iface['ip']}")
         except Exception as e:
+            # Translate the most common cryptic Windows error.
+            err_msg = str(e)
+            if '10049' in err_msg or 'WSAEADDRNOTAVAIL' in err_msg.upper() or 'requested address is not valid' in err_msg.lower():
+                err_msg = (f"WinError 10049: The IP we tried to bind to "
+                           f"({iface['ip']}) is not currently assigned to any "
+                           f"NIC.\n\n"
+                           "This usually means the dropdown's snapshot is stale. "
+                           "Re-select the interface from the top-bar dropdown to "
+                           "refresh, then try again.\n\n"
+                           f"(Original: {e})")
             messagebox.showerror("DHCP server failed to start",
-                                 f"Could not start bundled DHCP server:\n\n{e}",
+                                 f"Could not start bundled DHCP server:\n\n{err_msg}",
                                  parent=self.root)
             self.session_dhcp_server = None
             self.session_dhcp_var.set(False)
@@ -6522,6 +6776,42 @@ class CCTVToolkitApp:
             ent.grid(row=i, column=1, sticky='w', pady=3, ipady=2)
             entries[key] = v
 
+        # MAC filter section — keeps managed switches and stray devices on the
+        # programming segment from racing the cameras for the single lease IP.
+        # Default ON: only camera-vendor OUIs (active brand) get leases.
+        # Whitelist accepts additional full MACs.
+        ttk.Separator(body, orient='horizontal').grid(
+            row=10, column=0, columnspan=2, sticky='ew', pady=(14, 8))
+        ttk.Label(body, text="MAC filter (anti-race protection)",
+                  font=('Helvetica', 11, 'bold')).grid(
+            row=11, column=0, columnspan=2, sticky='w')
+        ttk.Label(body,
+            text="Without this, a managed PoE switch with a web UI (or any\n"
+                 "stray DHCP client on the segment) can grab the lease IP\n"
+                 "before your camera does. The filter ACKs only camera-vendor\n"
+                 "OUIs for the active brand, plus the whitelist below.",
+            foreground='gray', font=('Helvetica', 9)).grid(
+            row=12, column=0, columnspan=2, sticky='w', pady=(2, 6))
+
+        filter_enabled_var = tk.BooleanVar(
+            value=(self.settings.get('general', 'dhcp_mac_filter_enabled') or 'true').strip().lower() == 'true')
+        ttk.Checkbutton(body, text="Enable MAC filter (recommended — default ON)",
+                        variable=filter_enabled_var).grid(
+            row=13, column=0, columnspan=2, sticky='w', pady=(0, 6))
+
+        ttk.Label(body, text="Whitelist (extra MACs to allow — one per line):",
+                  font=('Helvetica', 10)).grid(
+            row=14, column=0, columnspan=2, sticky='w')
+        whitelist_text = tk.Text(body, height=4, width=36, font=('Consolas', 9),
+                                 relief=tk.SUNKEN, borderwidth=1)
+        whitelist_text.grid(row=15, column=0, columnspan=2, sticky='w', pady=(2, 2))
+        whitelist_text.insert('1.0', self.settings.get('general', 'dhcp_mac_whitelist') or '')
+        ttk.Label(body,
+            text="Format: B8:A4:4F:8B:F3:BB or B8-A4-4F-8B-F3-BB or B8A44F8BF3BB.\n"
+                 "One per line, or comma/semicolon separated.",
+            foreground='gray', font=('Helvetica', 8)).grid(
+            row=16, column=0, columnspan=2, sticky='w', pady=(0, 4))
+
         btns = ttk.Frame(body)
         btns.grid(row=20, column=0, columnspan=2, sticky='e', pady=(15, 0))
 
@@ -6539,6 +6829,11 @@ class CCTVToolkitApp:
                 else:
                     new_cfg[key] = val
             self.session_dhcp_config = new_cfg
+            # Persist MAC filter settings (these are global, not per-config-dict)
+            self.settings.set('general', 'dhcp_mac_filter_enabled',
+                              'true' if filter_enabled_var.get() else 'false')
+            wl_raw = whitelist_text.get('1.0', tk.END).strip()
+            self.settings.set('general', 'dhcp_mac_whitelist', wl_raw)
             self.log("Bundled DHCP config updated.")
             if self.session_dhcp_server:
                 if messagebox.askyesno(
@@ -10793,6 +11088,17 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.5.3": (
+            "What's new in v4.5.3",
+            [
+                "• HEADLINE: Bundled DHCP server now ignores non-camera devices on the programming switch. Managed PoE switches with web UIs and other stray devices were grabbing the lease IP before the camera could, causing programming to falsely 'find' the wrong device and fail. The DHCP server now ACKs leases only to camera-vendor MACs (active brand's OUI) plus anything you whitelist.",
+                "• NEW: MAC whitelist setting in Configure DHCP… → Whitelist. Drop in any specific full MACs you want allowed (rebadged cameras, test rigs). Format: B8:A4:4F:8B:F3:BB or any common form, one per line.",
+                "• NEW: Wait-loop now verifies the MAC of whatever holds the lease IP before declaring 'Camera found.' Stops the 'try to factory-reset a network switch' false-positive cold.",
+                "• Wizard refuses to start with Auto multi-home enabled but no specific interface picked in the top bar. Previously it would silently 'skip multi-home' and the post-program verify would time out — now you get a clear modal at toggle-time AND at run-start so the run isn't doomed before it begins.",
+                "• Bundled DHCP no longer fails with cryptic 'WinError 10049' when the dropdown's stored IP is stale. The toolkit now re-resolves the interface's current IPv4 by InterfaceIndex at server-start time, and surfaces a friendly message if the NIC has no IPv4 (instead of the raw Windows socket error).",
+                "• Misleading 'bailing this slot' log line softened to 'skipping this attempt and continuing to wait' — the wait-loop already had a 30s pause + retry under the hood, but the message made it sound permanent.",
+            ],
+        ),
         "4.5.2": (
             "What's new in v4.5.2",
             [
@@ -12078,6 +12384,28 @@ https://buymeacoffee.com/thelostping""")
             opts['interface'] = session_iface
         else:
             selected_iface = opts.get('interface')
+
+        # HARD GATE — Auto multi-home requires a specific interface. Without
+        # one, set_network would write the camera's new IP and then have no
+        # route to verify it came back online (the post-program wait loop
+        # would silently time out). Refuse to start the run rather than
+        # silently "skipping" multi-home and burning a factory reset.
+        if opts.get('auto_multihome') and not selected_iface:
+            messagebox.showerror(
+                "Cannot start — INTERFACE not selected",
+                "Auto multi-home is enabled, but no specific interface is\n"
+                "selected in the top bar of the main window.\n\n"
+                "Without a specific interface, the toolkit cannot add the\n"
+                "per-subnet host IPs needed to reach cameras after they move\n"
+                "to their target IPs — programming would appear to succeed\n"
+                "but post-program verification would time out.\n\n"
+                "Fix one of these and try again:\n"
+                "  •  Pick a specific INTERFACE in the top bar (not 'Auto-detect'), OR\n"
+                "  •  Re-open the wizard and uncheck 'Auto multi-home' on Step 3.",
+                parent=self.root)
+            self.log("Programming aborted — auto multi-home enabled without a specific interface selected.")
+            return
+
         if self.session_dhcp_server and self.session_dhcp_confirmed:
             opts['dhcp_server_enabled'] = True
             opts['dhcp_lease_ip'] = self.session_dhcp_config.get('lease_ip')
@@ -12226,9 +12554,24 @@ https://buymeacoffee.com/thelostping""")
                     # Check this IP first — it's the "always know" address.
                     if self._bundled_dhcp and dhcp_lease_ip:
                         if self.ping_camera(dhcp_lease_ip, timeout_ms=1000):
-                            camera_ip = dhcp_lease_ip
-                            self.status_log(f"Camera found at bundled DHCP lease {dhcp_lease_ip}")
-                            break
+                            # Verify whoever holds the lease matches the
+                            # camera-vendor OUI / whitelist. Managed PoE
+                            # switches and rogue laptops on the segment can
+                            # race for the same single lease IP — without
+                            # this check the wait-loop would falsely declare
+                            # "Camera found" and try to factory-reset them.
+                            lease_mac = self._mac_for_ip(dhcp_lease_ip)
+                            if not self._lease_holder_is_camera(lease_mac):
+                                self.status_log(
+                                    f"  Lease {dhcp_lease_ip} is held by "
+                                    f"{lease_mac or '?'} — not a {self.protocol.BRAND_NAME} camera, "
+                                    f"ignoring and continuing to wait")
+                                # Pause briefly so we don't spam this on every loop tick
+                                time.sleep(2)
+                            else:
+                                camera_ip = dhcp_lease_ip
+                                self.status_log(f"Camera found at bundled DHCP lease {dhcp_lease_ip}")
+                                break
 
                     if discovery_mode in ('factory', 'both'):
                         # b12 — require HTTP confirmation, not just ICMP. Older
@@ -12471,7 +12814,7 @@ https://buymeacoffee.com/thelostping""")
 
                         self.status_log(f"Factory-resetting {pinned_mac} via existing password...")
                         if not self.protocol.factory_reset(camera_ip, existing_pwd):
-                            self.status_log("  ✗ Factory reset failed — wrong existing password? bailing this slot")
+                            self.status_log("  ✗ Factory reset failed — wrong existing password? skipping this attempt and continuing to wait")
                             errors.append('factory_reset_failed')
                             new_fails = prior_fails + 1
                             factory_reset_fail_count[mac_key] = new_fails
