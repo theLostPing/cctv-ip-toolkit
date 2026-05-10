@@ -2138,17 +2138,14 @@ class AxisProtocol(CameraProtocol):
 
         _diag(f"target ip={new_ip}/{cidr} gw={gateway} via current_ip={ip} as user=root")
 
-        # v4.5.1-beta2 — settling delay. P3267-LV / FW 10.12.240 returns 503
-        # with empty body and ONVIF ReadTimeout for ~5s after fresh user
-        # creation. Brian 2026-05-05 KBO-012: 1s between admin user created
-        # and set_network → 503 storm. Give the camera time to flush its
-        # config service before hammering it with network changes.
-        # v4.5.3: cancellable so a click on Cancel exits within ~100ms.
-        try:
-            self._cancellable_sleep(5)
-        except ProtocolCancelled:
-            _diag("cancelled during settling delay")
-            return False
+        # v4.6.0b7 — settling delay DROPPED. The 5s blind sleep used to be
+        # needed because FW 10.12.240 returned 503 with empty body for ~5s
+        # after fresh user creation, and the toolkit had no retry handling.
+        # b6 added 503-busy retry on the VAPIX atomic update + on _retry()
+        # for ONVIF SOAP, so a first-attempt 503 is now handled gracefully.
+        # The 5s blind sleep was duplicate insurance — drop it, let the retry
+        # logic do the work. Save: ~5s per camera. (Cancel still responsive
+        # because the retry sleeps are cancellable.)
 
         # v4.5.1-beta2 — retry helper. Transient 503 / ReadTimeout /
         # ConnectionError on the network-config endpoints means the camera
@@ -2316,9 +2313,13 @@ class AxisProtocol(CameraProtocol):
                     raise
                 if r.status_code == 503 and not (r.text or '').strip():
                     if vapix_attempt < 2:
-                        _diag(f"VAPIX atomic update → 503-busy (attempt {vapix_attempt+1}/3), retrying in 4s")
+                        # v4.6.0b7 — back-off tightened from 4s to 2s. Camera
+                        # busy-window after user-create is typically <2s on
+                        # FW 10.x; 4s was overkill. Save ~4s on the common
+                        # case of 1-2 busy retries before success.
+                        _diag(f"VAPIX atomic update → 503-busy (attempt {vapix_attempt+1}/3), retrying in 2s")
                         try:
-                            proto_self._cancellable_sleep(4)
+                            proto_self._cancellable_sleep(2)
                         except ProtocolCancelled:
                             raise
                         continue
@@ -6053,6 +6054,29 @@ class CameraEditorDialog(tk.Toplevel):
                    command=lambda: set_subnet('255.0.0.0')).pack(side=tk.LEFT, padx=2)
         row += 1
 
+        # MAC Address — editable with Clear button. v4.6.0b7: re-test workflow
+        # ask from 2026-05-10 — the toolkit stamps the discovered MAC onto a
+        # camera-list entry after programming. When re-using the same physical
+        # camera to test repeatedly, the bound MAC made the camera look "already
+        # programmed" to subsequent runs even after a factory default. Clear
+        # button wipes the field so the camera looks fresh on the next run.
+        ttk.Label(frame, text="MAC Address:").grid(row=row, column=0, sticky='w', pady=3)
+        mac_frame = ttk.Frame(frame)
+        mac_frame.grid(row=row, column=1, sticky='ew', pady=3, padx=(10, 0))
+        mac_entry = ttk.Entry(mac_frame, width=22)
+        mac_entry.pack(side=tk.LEFT)
+        if camera and camera.get('mac'):
+            mac_entry.insert(0, camera['mac'])
+        self.entries['mac'] = mac_entry
+        def _clear_mac():
+            mac_entry.delete(0, tk.END)
+        ttk.Button(mac_frame, text="Clear", width=7,
+                   command=_clear_mac).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(frame, text="(clear to detach the previously-discovered camera so re-tests look fresh)",
+                  foreground='gray', font=('Helvetica', 8)).grid(
+            row=row + 1, column=1, sticky='w', padx=(10, 0))
+        row += 2
+
         # Remaining fields
         for label, key in [("New IP (for updates):", "new_ip"),
                            ("Hostname (optional):", "hostname"),
@@ -6158,7 +6182,9 @@ class CameraEditorDialog(tk.Toplevel):
             'new_ip': self.entries['new_ip'].get().strip(),
             'dhcp': 'Yes' if self.dhcp_var.get() else 'No',
             'serial': self.camera.get('serial', '') if self.camera else '',
-            'mac': self.camera.get('mac', '') if self.camera else '',
+            # v4.6.0b7: MAC is now an editable field. Empty value clears the
+            # binding so the same physical camera looks fresh on next run.
+            'mac': self.entries['mac'].get().strip(),
             'brand': self.camera.get('brand', 'axis') if self.camera else 'axis',
             'pending': pending,
             'processed': False
@@ -9169,8 +9195,30 @@ class CCTVToolkitApp:
 
         if reset_count:
             self.log(f"\nPre-flight complete: {reset_count} camera(s) factory-reset and rebooting.")
-            self.log(f"Pausing 8s for them to drop offline, then the wait loop will catch them as they come back at factory IP / DHCP / link-local.")
-            time.sleep(8)
+            # v4.6.0b7 — was: blind time.sleep(8) regardless of actual camera
+            # state. Now: poll the reset IPs every 500ms for up to 8s, exit
+            # as soon as ALL of them have stopped responding to ping (which
+            # means they've successfully gone offline for the reboot). On a
+            # fast camera (most modern Axis), this saves 5-7s vs the blind
+            # sleep. Worst case still capped at 8s like before.
+            self.log(f"Waiting (up to 8s) for camera(s) to drop offline before the wait loop catches them coming back…")
+            reset_ips = []
+            for entry in found:
+                ip = entry.get('ip', '')
+                if ip and ip not in reset_ips:
+                    reset_ips.append(ip)
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                all_offline = True
+                for ip in reset_ips:
+                    if self.ping_camera(ip, timeout_ms=400):
+                        all_offline = False
+                        break
+                if all_offline:
+                    elapsed = 8.0 - (deadline - time.time())
+                    self.log(f"  ✓ All {reset_count} camera(s) confirmed offline after {elapsed:.1f}s")
+                    break
+                time.sleep(0.5)
         return reset_count
 
     def _cleanup_multihome(self):
