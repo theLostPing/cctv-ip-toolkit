@@ -6149,16 +6149,40 @@ class CCTVToolkitApp:
             sh = self.root.winfo_screenheight()
             self.root.geometry(f"{sw}x{sh}+0+0")
         
-        # Try to set icon (app icon, not the personal logo)
+        # Set the window/taskbar icon. v4.5.3 robustness: previously this used
+        # iconbitmap() with a bare except:pass, which silently fell back to the
+        # default Tk feather whenever the ICO contained PNG-encoded sub-images
+        # (Tk's iconbitmap on Windows is finicky about PNG-in-ICO). Our app.ico
+        # has all-PNG sub-images, so the feather was visible despite app.ico
+        # being on disk and the AUMI being correct. Now uses iconphoto via PIL,
+        # which handles PNG-encoded ICO entries natively.
         try:
             import sys
             if getattr(sys, 'frozen', False):
                 icon_path = os.path.join(sys._MEIPASS, 'app.ico')
             else:
                 icon_path = 'app.ico'
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(icon_path)
-        except: pass
+            if not os.path.exists(icon_path):
+                self.log(f"Icon file not found at {icon_path} — using Tk default")
+            else:
+                icon_loaded = False
+                # Preferred: PIL/ImageTk handles PNG-in-ICO natively
+                try:
+                    from PIL import Image, ImageTk
+                    img = Image.open(icon_path)
+                    self._app_icon_photo = ImageTk.PhotoImage(img)  # GC anchor on self
+                    self.root.iconphoto(True, self._app_icon_photo)
+                    icon_loaded = True
+                except Exception as e_pil:
+                    self.log(f"iconphoto via PIL failed: {e_pil} — falling back to iconbitmap")
+                # Fallback: native iconbitmap (works on BMP-encoded ICO entries)
+                if not icon_loaded:
+                    try:
+                        self.root.iconbitmap(default=icon_path)
+                    except Exception as e_ib:
+                        self.log(f"iconbitmap also failed: {e_ib} — Tk default feather will show")
+        except Exception as e:
+            self.log(f"Icon setup error: {e}")
         
         # Initialize managers
         self.settings = SettingsManager()
