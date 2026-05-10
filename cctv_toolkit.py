@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.5.3"
+APP_VERSION = "4.6.0"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -1954,14 +1954,65 @@ class AxisProtocol(CameraProtocol):
                 return False
         return False
 
-    def set_network(self, ip, password, new_ip, subnet, gateway):
-        # Two paths: ONVIF SOAP first because it's atomic — gateway/IP/DHCP
-        # all flip together so the camera doesn't end up in a half-configured
-        # state if the connection drops. VAPIX param.cgi is the fallback for
-        # older firmware (anything before like 7.10 or so) where the ONVIF
-        # SetNetworkInterfaces call returns a Fault.
+    def _probe_firmware_quick(self, ip, timeout=2):
+        """Cheap no-auth firmware probe via basicdeviceinfo.cgi. Returns the
+        Version string (e.g. '10.12.240' or '12.10.68') or '' on failure.
+        Used by set_network when the caller didn't supply firmware so we can
+        choose the right path-ordering without an extra DHCP-roundtrip's worth
+        of latency.
+
+        Axis OS 10.x and 11.x both respond no-auth to this endpoint with the
+        unrestricted properties; OS 12 also responds. ~50ms on a healthy LAN."""
+        try:
+            r = requests.post(
+                f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
+                json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
+                timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                return ((data.get('data') or {}).get('propertyList') or {}).get('Version', '') or ''
+        except Exception:
+            pass
+        return ''
+
+    def set_network(self, ip, password, new_ip, subnet, gateway, firmware=None):
+        # Two paths: ONVIF SOAP and VAPIX param.cgi. Which goes first depends
+        # on firmware (v4.6.0 — the big perf win):
+        #
+        # FW 12.0+ : ONVIF SOAP is FAST (~1s commit). It's atomic — gateway/
+        #   IP/DHCP flip together so the camera can't end up half-configured
+        #   if the connection drops mid-write. Original design choice.
+        # FW < 12  : ONVIF SetNetworkDefaultGateway takes 60-90 seconds to
+        #   commit on FW 10.12.x (camera ACKs the request, holds the TCP
+        #   connection open, eventually responds 200/500 a minute later).
+        #   The toolkit's 15s read timeout × 3 retries fires before the
+        #   camera finishes, and the retries stack up behind the in-flight
+        #   write (each one takes a full 60s to drain). Browser/web-UI is
+        #   fast on the same camera because the web UI uses VAPIX
+        #   /axis-cgi/network_settings.cgi, NOT ONVIF SOAP — different
+        #   handler, different commit pipeline, ~5s end-to-end.
+        #   So on FW < 12 we skip ONVIF entirely and use VAPIX first.
+        #   Trade-off: VAPIX is 4 separate param.cgi calls (DHCP=no, gateway,
+        #   subnet, IP) — if the link drops between calls the camera ends
+        #   up in a partial state. On FW 10.x that's a fair price for going
+        #   from ~90s to ~5s per camera.
         auth = HTTPDigestAuth("root", password)
         cidr = sum(bin(int(x)).count('1') for x in subnet.split('.')) if subnet else 24
+
+        # Resolve firmware version. If caller passed it (wizard already knows
+        # it from probe_unrestricted), use that. Otherwise probe quickly via
+        # the no-auth basicdeviceinfo endpoint so we don't blow away the
+        # speed advantage we're trying to gain.
+        prefer_vapix = False
+        try:
+            fw = firmware or self._probe_firmware_quick(ip)
+            if fw:
+                # Match a leading major.minor — anything < 12 prefers VAPIX
+                m = re.match(r'^(\d+)', str(fw))
+                if m and int(m.group(1)) < 12:
+                    prefer_vapix = True
+        except Exception:
+            prefer_vapix = False  # safe default: try ONVIF first (current behavior)
 
         # v4.4.8-beta6 — diagnostic capture. Each leg appends one line; on
         # overall failure the wizard logger gets the full breakdown so we can
@@ -2040,108 +2091,121 @@ class AxisProtocol(CameraProtocol):
                 raise last_exc
             return None
 
-        # --- ONVIF path ---
-        onvif_ok = False
-        # Gateway has to go in its own SOAP call. Tried merging it into the
-        # SetNetworkInterfaces envelope once — Axis silently ignored it. This
-        # is the supported pattern in the ONVIF Network Configuration spec.
-        gw_soap = (f'<?xml version="1.0"?>'
-                   f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
-                   f'<SetNetworkDefaultGateway xmlns="http://www.onvif.org/ver10/device/wsdl">'
-                   f'<IPv4Address>{gateway}</IPv4Address>'
-                   f'</SetNetworkDefaultGateway></Body></Envelope>')
-        try:
-            r_gw = _retry(requests.post,
-                f"http://{ip}/vapix/services", data=gw_soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=auth, timeout=15)  # bumped from TIMEOUT (5s) — SetNetworkDefaultGateway can sit on the camera 5-10s before responding
-            snippet = (r_gw.text or '')[:240].replace('\n', ' ').replace('\r', '')
-            _diag(f"ONVIF SetNetworkDefaultGateway → status={r_gw.status_code} body[:240]={snippet}")
-        except ProtocolCancelled:
-            raise  # let cancel propagate — don't fall through to next leg
-        except Exception as e:
-            _diag(f"ONVIF SetNetworkDefaultGateway → exception: {type(e).__name__}: {e}")
-            # gw failure isn't fatal — IP can still be set, we'll just retry gw
+        # --- ONVIF SOAP path (extracted into closure for v4.6 path-ordering) ---
+        def _try_onvif():
+            onvif_ok = False
+            # Gateway has to go in its own SOAP call. Tried merging it into the
+            # SetNetworkInterfaces envelope once — Axis silently ignored it. This
+            # is the supported pattern in the ONVIF Network Configuration spec.
+            gw_soap = (f'<?xml version="1.0"?>'
+                       f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                       f'<SetNetworkDefaultGateway xmlns="http://www.onvif.org/ver10/device/wsdl">'
+                       f'<IPv4Address>{gateway}</IPv4Address>'
+                       f'</SetNetworkDefaultGateway></Body></Envelope>')
+            try:
+                r_gw = _retry(requests.post,
+                    f"http://{ip}/vapix/services", data=gw_soap,
+                    headers={"Content-Type": "application/soap+xml"},
+                    auth=auth, timeout=15)
+                snippet = (r_gw.text or '')[:240].replace('\n', ' ').replace('\r', '')
+                _diag(f"ONVIF SetNetworkDefaultGateway → status={r_gw.status_code} body[:240]={snippet}")
+            except ProtocolCancelled:
+                raise
+            except Exception as e:
+                _diag(f"ONVIF SetNetworkDefaultGateway → exception: {type(e).__name__}: {e}")
 
-        # Now the static IP + DHCP off in one shot. PrefixLength is CIDR notation
-        # (the /24 in 192.168.1.0/24), Axis expects an integer here.
-        ip_soap = (f'<?xml version="1.0"?>'
-                   f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope" '
-                   f'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
-                   f'xmlns:tt="http://www.onvif.org/ver10/schema"><Header/><Body>'
-                   f'<tds:SetNetworkInterfaces>'
-                   f'<tds:InterfaceToken>eth0</tds:InterfaceToken>'
-                   f'<tds:NetworkInterface><tt:Enabled>true</tt:Enabled>'
-                   f'<tt:IPv4><tt:Enabled>true</tt:Enabled>'
-                   f'<tt:Manual><tt:Address>{new_ip}</tt:Address>'
-                   f'<tt:PrefixLength>{cidr}</tt:PrefixLength></tt:Manual>'
-                   f'<tt:DHCP>false</tt:DHCP></tt:IPv4></tds:NetworkInterface>'
-                   f'</tds:SetNetworkInterfaces></Body></Envelope>')
-        try:
-            r = _retry(requests.post,
-                f"http://{ip}/vapix/services", data=ip_soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=auth, timeout=15)  # SetNetworkInterfaces is the slow one
-            snippet = (r.text or '')[:240].replace('\n', ' ').replace('\r', '')
-            has_fault = 'Fault' in (r.text or '')
-            _diag(f"ONVIF SetNetworkInterfaces → status={r.status_code} fault_in_body={has_fault} body[:240]={snippet}")
-            # Axis returns 200 even on a failed config change, so the body has
-            # to be checked for <Fault>. Found this on a P3245 that wouldn't
-            # stick a static IP and was lying about it — a 200 with a Fault
-            # block. Why they don't return 4xx in that case I do not know.
-            if r.status_code == 200 and not has_fault:
-                onvif_ok = True
-        except ProtocolCancelled:
-            raise
-        except Exception as e:
-            _diag(f"ONVIF SetNetworkInterfaces → exception: {type(e).__name__}: {e}")
+            ip_soap = (f'<?xml version="1.0"?>'
+                       f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope" '
+                       f'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
+                       f'xmlns:tt="http://www.onvif.org/ver10/schema"><Header/><Body>'
+                       f'<tds:SetNetworkInterfaces>'
+                       f'<tds:InterfaceToken>eth0</tds:InterfaceToken>'
+                       f'<tds:NetworkInterface><tt:Enabled>true</tt:Enabled>'
+                       f'<tt:IPv4><tt:Enabled>true</tt:Enabled>'
+                       f'<tt:Manual><tt:Address>{new_ip}</tt:Address>'
+                       f'<tt:PrefixLength>{cidr}</tt:PrefixLength></tt:Manual>'
+                       f'<tt:DHCP>false</tt:DHCP></tt:IPv4></tds:NetworkInterface>'
+                       f'</tds:SetNetworkInterfaces></Body></Envelope>')
+            try:
+                r = _retry(requests.post,
+                    f"http://{ip}/vapix/services", data=ip_soap,
+                    headers={"Content-Type": "application/soap+xml"},
+                    auth=auth, timeout=15)
+                snippet = (r.text or '')[:240].replace('\n', ' ').replace('\r', '')
+                has_fault = 'Fault' in (r.text or '')
+                _diag(f"ONVIF SetNetworkInterfaces → status={r.status_code} fault_in_body={has_fault} body[:240]={snippet}")
+                if r.status_code == 200 and not has_fault:
+                    onvif_ok = True
+            except ProtocolCancelled:
+                raise
+            except Exception as e:
+                _diag(f"ONVIF SetNetworkInterfaces → exception: {type(e).__name__}: {e}")
+            return onvif_ok
 
-        if onvif_ok:
-            _diag("ONVIF path SUCCESS")
-            return True
-        _diag("ONVIF path failed — falling back to VAPIX param.cgi")
-
-        # --- VAPIX fallback ---
+        # --- VAPIX param.cgi path (extracted into closure for v4.6 path-ordering) ---
         # Order matters here. If you set IP first then DHCP, the camera goes
         # offline mid-config and you can't finish. DHCP off first, gateway,
         # subnet, IP last — that order has been bulletproof since at least
         # the M-series firmware in 2012.
-        try:
-            r1 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.IPv4.DHCP": "no"},
-                auth=auth, timeout=10)
-            _diag(f"VAPIX DHCP=no → status={r1.status_code} body[:160]={(r1.text or '')[:160]!r}")
-            r2 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.DefaultRouter": gateway},
-                auth=auth, timeout=10)
-            _diag(f"VAPIX DefaultRouter={gateway} → status={r2.status_code} body[:160]={(r2.text or '')[:160]!r}")
-            r3 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.SubnetMask": subnet},
-                auth=auth, timeout=10)
-            _diag(f"VAPIX SubnetMask={subnet} → status={r3.status_code} body[:160]={(r3.text or '')[:160]!r}")
-            # Setting IPAddress is the call that yanks the rug — the response
-            # may never come back because the kernel has switched interfaces
-            # by the time it tries to ack. Hence the ConnectionError below
-            # being treated as success. Don't retry this one — connection drop
-            # IS the success signal.
-            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.IPAddress": new_ip},
-                auth=auth, timeout=10)
-            _diag(f"VAPIX IPAddress={new_ip} → status={r.status_code} body[:160]={(r.text or '')[:160]!r}")
-            ok = r.status_code == 200
-            _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200)'}")
-            return ok
-        except ProtocolCancelled:
-            raise
-        except requests.exceptions.ConnectionError:
-            _diag("VAPIX path → ConnectionError on final IPAddress write — treating as SUCCESS (kernel swapped iface mid-response)")
-            # Connection died mid-call — that's actually GOOD on this one,
-            # means the IP change took effect. Return True; verification step
-            # higher up will confirm the camera is reachable on the new IP.
-            return True
-        except Exception as e:
-            _diag(f"VAPIX path → exception: {type(e).__name__}: {e}")
+        def _try_vapix():
+            try:
+                r1 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
+                    params={"action": "update", "root.Network.IPv4.DHCP": "no"},
+                    auth=auth, timeout=10)
+                _diag(f"VAPIX DHCP=no → status={r1.status_code} body[:160]={(r1.text or '')[:160]!r}")
+                r2 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
+                    params={"action": "update", "root.Network.DefaultRouter": gateway},
+                    auth=auth, timeout=10)
+                _diag(f"VAPIX DefaultRouter={gateway} → status={r2.status_code} body[:160]={(r2.text or '')[:160]!r}")
+                r3 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
+                    params={"action": "update", "root.Network.SubnetMask": subnet},
+                    auth=auth, timeout=10)
+                _diag(f"VAPIX SubnetMask={subnet} → status={r3.status_code} body[:160]={(r3.text or '')[:160]!r}")
+                # Setting IPAddress is the call that yanks the rug — the response
+                # may never come back because the kernel has switched interfaces
+                # by the time it tries to ack. Hence the ConnectionError below
+                # being treated as success. Don't retry this one — connection drop
+                # IS the success signal.
+                r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                    params={"action": "update", "root.Network.IPAddress": new_ip},
+                    auth=auth, timeout=10)
+                _diag(f"VAPIX IPAddress={new_ip} → status={r.status_code} body[:160]={(r.text or '')[:160]!r}")
+                ok = r.status_code == 200
+                _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200)'}")
+                return ok
+            except ProtocolCancelled:
+                raise
+            except requests.exceptions.ConnectionError:
+                _diag("VAPIX path → ConnectionError on final IPAddress write — treating as SUCCESS (kernel swapped iface mid-response)")
+                return True
+            except Exception as e:
+                _diag(f"VAPIX path → exception: {type(e).__name__}: {e}")
+                return False
+
+        # --- v4.6.0 — orchestrate based on firmware version ---
+        # FW < 12 (e.g. 10.12.x): VAPIX is ~5s, ONVIF SOAP is ~90s on the
+        # SetNetworkDefaultGateway call. Browser/web-UI uses VAPIX exclusively
+        # and that's why opening the camera in a browser is fast on the same
+        # camera that takes 90s for the toolkit's ONVIF path.
+        # FW >= 12: ONVIF is ~1s, atomic, safer if the link drops mid-write.
+        # If the preferred path returns False (not raised), fall back to the
+        # other path as a safety net.
+        if prefer_vapix:
+            _diag(f"firmware {firmware or 'unknown'} prefers VAPIX path (FW < 12 ONVIF SOAP is slow)")
+            if _try_vapix():
+                _diag("VAPIX path SUCCESS")
+                return True
+            _diag("VAPIX path failed — falling back to ONVIF SOAP")
+            if _try_onvif():
+                _diag("ONVIF path SUCCESS (after VAPIX fallback)")
+                return True
             return False
+        else:
+            if _try_onvif():
+                _diag("ONVIF path SUCCESS")
+                return True
+            _diag("ONVIF path failed — falling back to VAPIX param.cgi")
+            return _try_vapix()
 
     def set_hostname(self, ip, password, hostname):
         # 63-char DNS limit, anything not alphanum or dash gets sanitized to a dash.
@@ -2504,11 +2568,15 @@ class AxisProtocol(CameraProtocol):
         # 3rd-tier change-password fallback can fire if open + new-pwd both 401.
         existing_root_pwd = options.get('existing_root_pwd') if options else None
 
+        # v4.6.0 — pass firmware version into set_network so it can pick the
+        # fast path without probing. Wizard learned the firmware in the
+        # discovery phase and stored it on the cam dict.
+        cam_firmware = cam.get('firmware', '')
         steps = [
             ("Creating system user + ONVIF user",
              lambda: self.create_initial_user(ip, password, existing_pwd=existing_root_pwd)),
             ("Setting gateway + IP + disabling DHCP",
-             lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
+             lambda: self.set_network(ip, password, static_ip, subnet, gateway, firmware=cam_firmware)),
         ]
         if set_hostname:
             # Hostname format I've used for a decade: <position>-<brand>-<serial>.
@@ -11473,6 +11541,16 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "4.6.0": (
+            "What's new in v4.6.0",
+            [
+                "• HEADLINE: FW 10.x cameras program in ~5 seconds instead of ~90. The set_network step now picks its path based on the camera's firmware — older firmware (anything before AXIS OS 12) skips the slow ONVIF SOAP route and uses VAPIX param.cgi directly, which is the same path the camera's own web UI uses and is dramatically faster on those cameras.",
+                "• Why it was slow before: on FW 10.12.x, the camera's ONVIF SetNetworkDefaultGateway handler takes 60-90 seconds to commit network config to flash. The toolkit's 15-second read timeout fired three times during that one commit, retried, stacked ghost requests behind the in-flight one, and then SetNetworkInterfaces sat behind the queue. Net effect: ~90s of wait time per FW 10.x camera. FW 12 wasn't affected because its ONVIF service was rewritten to commit in ~1s.",
+                "• Why VAPIX is fast on FW 10.x: the camera's web UI uses /axis-cgi/network_settings.cgi (and friends) which calls a different camera-side handler that writes the running config directly without the slow ONVIF validate-commit-restart pipeline. Browser opens to a freshly-defaulted FW 10.x camera in seconds. Now the toolkit gets the same speed.",
+                "• Safety: VAPIX is 4 separate calls (DHCP=no, gateway, subnet, IP) instead of ONVIF's single atomic SOAP envelope. If the link drops between calls the camera could end up partially configured. On FW 10.x this is a fair trade for going from 90s to 5s — and ONVIF still runs as a fallback if VAPIX fails. FW 12 keeps the ONVIF-first path (fast and atomic, no trade-off).",
+                "• If the wizard didn't capture the firmware version during discovery, set_network does a quick no-auth basicdeviceinfo.cgi probe (~50ms) to figure it out before picking the path.",
+            ],
+        ),
         "4.5.3": (
             "What's new in v4.5.3",
             [
