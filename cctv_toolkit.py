@@ -6303,7 +6303,18 @@ class LldpDiscoveryDialog(tk.Toplevel):
 class CCTVToolkitApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"CCTV IP Toolkit v{APP_VERSION} - Brian Preston")
+        # v4.5.3 — visible build identifier in title. CI injects APP_VERSION
+        # at build time (e.g. "4.5.3b6.f5178c4" for beta, "4.5.3" for stable)
+        # so this shows the running build's identifier without the operator
+        # having to open Help → About. Beta / dev / rc builds get a "⚠ BETA"
+        # suffix that's hard to miss at a glance.
+        title_v = APP_VERSION
+        # Stable = strictly major.minor.patch (e.g. "4.5.3"). Anything else
+        # has been injected by CI for a beta/dev/rc/manual build.
+        is_stable_format = bool(re.match(r'^\d+\.\d+\.\d+$', title_v))
+        if not is_stable_format:
+            title_v = f"{title_v} ⚠ BETA"
+        self.root.title(f"CCTV IP Toolkit v{title_v} - Brian Preston")
         self.root.geometry("1200x800")
         self.root.minsize(1000, 700)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -6333,22 +6344,25 @@ class CCTVToolkitApp:
             if not os.path.exists(icon_path):
                 self.log(f"Icon file not found at {icon_path} — using Tk default")
             else:
-                icon_loaded = False
+                icon_loaded_via = None
                 # Preferred: PIL/ImageTk handles PNG-in-ICO natively
                 try:
                     from PIL import Image, ImageTk
                     img = Image.open(icon_path)
                     self._app_icon_photo = ImageTk.PhotoImage(img)  # GC anchor on self
                     self.root.iconphoto(True, self._app_icon_photo)
-                    icon_loaded = True
+                    icon_loaded_via = 'iconphoto via PIL'
                 except Exception as e_pil:
-                    self.log(f"iconphoto via PIL failed: {e_pil} — falling back to iconbitmap")
+                    self.log(f"[icon] iconphoto via PIL failed: {e_pil} — falling back to iconbitmap")
                 # Fallback: native iconbitmap (works on BMP-encoded ICO entries)
-                if not icon_loaded:
+                if not icon_loaded_via:
                     try:
                         self.root.iconbitmap(default=icon_path)
+                        icon_loaded_via = 'iconbitmap (fallback)'
                     except Exception as e_ib:
-                        self.log(f"iconbitmap also failed: {e_ib} — Tk default feather will show")
+                        self.log(f"[icon] iconbitmap also failed: {e_ib} — Tk default feather will show")
+                if icon_loaded_via:
+                    self.log(f"[icon] loaded {icon_path} via {icon_loaded_via}")
         except Exception as e:
             self.log(f"Icon setup error: {e}")
         
@@ -6405,6 +6419,29 @@ class CCTVToolkitApp:
         # Create UI
         self.create_menu()
         self.create_main_ui()
+
+        # v4.5.3 — startup banner so the operator can confirm at a glance
+        # which build is running, and where exports are landing. Goes to the
+        # 📊 Log & Results tab.
+        self.log(f"=== CCTV IP Toolkit v{APP_VERSION} starting ===")
+        self.log(f"  CONFIG_DIR  : {CONFIG_DIR}")
+        self.log(f"  EXPORT_DIR  : {EXPORT_DIR}")
+        # Surface migration marker state so 'why didn't migration run?' has a
+        # visible answer instead of a silent no-op.
+        marker = CONFIG_DIR / '.migrated_export_dir_to_redirected'
+        legacy = Path.home() / 'Documents' / 'CCTV Toolkit'
+        if marker.exists():
+            try:
+                self.log(f"  migration   : ran previously — marker says: "
+                         + marker.read_text().strip().replace('\n', ' | '))
+            except Exception as e:
+                self.log(f"  migration   : marker exists but unreadable: {e}")
+        elif legacy.is_dir() and legacy != EXPORT_DIR:
+            self.log(f"  migration   : DID NOT RUN. Legacy folder still has data at {legacy}")
+            self.log(f"                 New EXPORT_DIR is {EXPORT_DIR}. "
+                     f"Use Help → Re-run Documents migration to copy old data over.")
+        else:
+            self.log("  migration   : not needed (no legacy folder, or already on the redirected path)")
 
         # One-time notice for any startup data migrations
         for note in _MIGRATION_NOTE:
@@ -6521,8 +6558,72 @@ class CCTVToolkitApp:
         help_menu.add_command(label="Check for Updates...", command=lambda: self.check_for_update(silent=False))
         help_menu.add_command(label="About", command=self.show_about)
         help_menu.add_separator()
+        help_menu.add_command(label="Re-run Documents migration...",
+                              command=self.rerun_documents_migration)
+        help_menu.add_separator()
         help_menu.add_command(label="Buy Me A Coffee ☕", command=lambda: __import__('webbrowser').open('https://buymeacoffee.com/thelostping'))
         help_menu.add_command(label="Report Issues", command=lambda: __import__('webbrowser').open('mailto:axisprogrammer@thelostping.net'))
+
+    def rerun_documents_migration(self):
+        """Manual trigger for _migrate_export_dir_to_redirected. Wipes the
+        marker file and re-runs, then surfaces the result. Useful when the
+        automatic startup migration didn't fire (operator was on an older
+        build) or when the legacy folder gained new content after the first
+        migration ran."""
+        if not messagebox.askyesno(
+            "Re-run Documents migration?",
+            f"This will copy any items from your legacy Documents folder\n"
+            f"into the redirected one:\n\n"
+            f"  Legacy:     {Path.home() / 'Documents' / 'CCTV Toolkit'}\n"
+            f"  Redirected: {EXPORT_DIR}\n\n"
+            "Existing files in the redirected folder are NOT overwritten —\n"
+            "only new items get copied. Originals stay put as a backup.\n\n"
+            "Continue?",
+            parent=self.root):
+            return
+        marker = CONFIG_DIR / '.migrated_export_dir_to_redirected'
+        try:
+            if marker.exists():
+                marker.unlink()
+        except Exception as e:
+            self.log(f"Couldn't clear migration marker: {e}")
+        # Reset the global note buffer so we don't dialog twice
+        try:
+            _MIGRATION_NOTE.clear()
+        except Exception:
+            pass
+        try:
+            _migrate_export_dir_to_redirected()
+        except Exception as e:
+            messagebox.showerror("Migration failed", f"{type(e).__name__}: {e}",
+                                 parent=self.root)
+            return
+        # Surface the result
+        if _MIGRATION_NOTE:
+            note = _MIGRATION_NOTE[0]
+            if note and note[0] == 'export_dir_redirected':
+                _, lg, np, copied = note
+                messagebox.showinfo(
+                    "Migration complete",
+                    f"Copied {len(copied)} item(s) from\n  {lg}\nto\n  {np}\n\n"
+                    "Originals kept as a backup.",
+                    parent=self.root)
+            elif note and note[0] == 'export_dir_skipped':
+                _, lg, np, _ = note
+                messagebox.showinfo(
+                    "Migration skipped",
+                    f"Both folders have data; not auto-merging:\n\n"
+                    f"  Legacy:     {lg}\n"
+                    f"  Redirected: {np}\n\n"
+                    "Manually copy whatever you want from the legacy folder.",
+                    parent=self.root)
+        else:
+            legacy = Path.home() / 'Documents' / 'CCTV Toolkit'
+            messagebox.showinfo(
+                "Nothing to migrate",
+                f"No legacy folder at {legacy}, or it's the same as the\n"
+                f"redirected path ({EXPORT_DIR}). Nothing to do.",
+                parent=self.root)
     
     def create_main_ui(self):
         # Session networking bar — interface + DHCP server (v4.3, top of window)
