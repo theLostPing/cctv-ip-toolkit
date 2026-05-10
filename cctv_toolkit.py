@@ -1584,6 +1584,12 @@ class LockoutError(Exception):
 from abc import ABC, abstractmethod
 
 
+class ProtocolCancelled(Exception):
+    """Raised inside protocol methods when the wizard's cancel_flag fires
+    while the call is in flight (during a retry sleep, between attempts).
+    Caller should treat this as a clean abort, not a transient failure."""
+
+
 class CameraProtocol(ABC):
     """Abstract base class for brand-specific camera operations.
     Each brand implements this interface so all operations can be
@@ -1596,6 +1602,41 @@ class CameraProtocol(ABC):
     DEFAULT_PASSWORD = ''
     FACTORY_IP = ''
     MAC_OUIS = []
+
+    # v4.5.3 — cancel-aware machinery so set_network etc. respond to the
+    # wizard's Cancel button within ~100ms instead of letting a 15s ReadTimeout
+    # play out. App wires `protocol.cancel_check = lambda: self.cancel_flag`
+    # next to log_callback at protocol-construction sites.
+    cancel_check = None
+
+    def _is_cancelled(self):
+        """True if the wizard has set cancel_flag. Safe to call when the
+        attribute isn't wired (returns False)."""
+        cb = getattr(self, 'cancel_check', None)
+        try:
+            return bool(cb and cb())
+        except Exception:
+            return False
+
+    def _cancellable_sleep(self, seconds, tick=0.1):
+        """Sleep up to `seconds`, polling cancel_check every `tick` seconds.
+        Raises ProtocolCancelled if cancelled mid-sleep. Use this in retry
+        backoffs and settling delays so Cancel is responsive."""
+        end = time.time() + seconds
+        while True:
+            if self._is_cancelled():
+                raise ProtocolCancelled('cancelled during sleep')
+            remaining = end - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(tick, remaining))
+
+    def _check_cancel(self):
+        """Raise ProtocolCancelled if the wizard has cancelled. Call before
+        each retry attempt and before each protocol leg so we don't fire
+        more requests after the user has asked to stop."""
+        if self._is_cancelled():
+            raise ProtocolCancelled('cancelled')
 
     @abstractmethod
     def create_initial_user(self, ip, password, existing_pwd=None):
@@ -1941,17 +1982,32 @@ class AxisProtocol(CameraProtocol):
         # creation. Brian 2026-05-05 KBO-012: 1s between admin user created
         # and set_network → 503 storm. Give the camera time to flush its
         # config service before hammering it with network changes.
-        time.sleep(5)
+        # v4.5.3: cancellable so a click on Cancel exits within ~100ms.
+        try:
+            self._cancellable_sleep(5)
+        except ProtocolCancelled:
+            _diag("cancelled during settling delay")
+            return False
 
         # v4.5.1-beta2 — retry helper. Transient 503 / ReadTimeout /
         # ConnectionError on the network-config endpoints means the camera
         # is busy, not broken. Three attempts with 4s back-off. Returns the
         # last response object (or None on total exception). Distinct from
         # the raw try-blocks below because each leg needs its own diag log.
+        # v4.5.3: cancellable — checks cancel_flag before each attempt and
+        # during the back-off sleep, so Cancel takes effect within ~100ms
+        # instead of waiting for the full 15s ReadTimeout + 4s retry sleep
+        # to play out (worst case was previously 53s of "sticking around"
+        # after a click; now it's bounded by the ONE in-flight request).
+        proto_self = self
         def _retry(method, url, *, attempts=3, delay=4, **kwargs):
             last_exc = None
             last_resp = None
             for i in range(attempts):
+                # Don't fire another request if the user has asked to stop.
+                if proto_self._is_cancelled():
+                    _diag(f"  cancelled before attempt {i+1}/{attempts}")
+                    raise ProtocolCancelled('cancelled before retry attempt')
                 try:
                     r = method(url, **kwargs)
                     last_resp = r
@@ -1959,7 +2015,11 @@ class AxisProtocol(CameraProtocol):
                     if r.status_code == 503 and not (r.text or '').strip():
                         if i + 1 < attempts:
                             _diag(f"  503-busy on attempt {i+1}/{attempts}; retrying in {delay}s")
-                            time.sleep(delay)
+                            try:
+                                proto_self._cancellable_sleep(delay)
+                            except ProtocolCancelled:
+                                _diag(f"  cancelled during 503-busy back-off (attempt {i+1})")
+                                raise
                             continue
                     return r
                 except (requests.exceptions.ReadTimeout,
@@ -1967,7 +2027,11 @@ class AxisProtocol(CameraProtocol):
                     last_exc = e
                     if i + 1 < attempts:
                         _diag(f"  {type(e).__name__} on attempt {i+1}/{attempts}; retrying in {delay}s")
-                        time.sleep(delay)
+                        try:
+                            proto_self._cancellable_sleep(delay)
+                        except ProtocolCancelled:
+                            _diag(f"  cancelled during {type(e).__name__} back-off (attempt {i+1})")
+                            raise
                         continue
                     raise
             if last_resp is not None:
@@ -1993,6 +2057,8 @@ class AxisProtocol(CameraProtocol):
                 auth=auth, timeout=15)  # bumped from TIMEOUT (5s) — SetNetworkDefaultGateway can sit on the camera 5-10s before responding
             snippet = (r_gw.text or '')[:240].replace('\n', ' ').replace('\r', '')
             _diag(f"ONVIF SetNetworkDefaultGateway → status={r_gw.status_code} body[:240]={snippet}")
+        except ProtocolCancelled:
+            raise  # let cancel propagate — don't fall through to next leg
         except Exception as e:
             _diag(f"ONVIF SetNetworkDefaultGateway → exception: {type(e).__name__}: {e}")
             # gw failure isn't fatal — IP can still be set, we'll just retry gw
@@ -2025,6 +2091,8 @@ class AxisProtocol(CameraProtocol):
             # block. Why they don't return 4xx in that case I do not know.
             if r.status_code == 200 and not has_fault:
                 onvif_ok = True
+        except ProtocolCancelled:
+            raise
         except Exception as e:
             _diag(f"ONVIF SetNetworkInterfaces → exception: {type(e).__name__}: {e}")
 
@@ -2063,6 +2131,8 @@ class AxisProtocol(CameraProtocol):
             ok = r.status_code == 200
             _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200)'}")
             return ok
+        except ProtocolCancelled:
+            raise
         except requests.exceptions.ConnectionError:
             _diag("VAPIX path → ConnectionError on final IPAddress write — treating as SUCCESS (kernel swapped iface mid-response)")
             # Connection died mid-call — that's actually GOOD on this one,
@@ -6295,6 +6365,10 @@ class CCTVToolkitApp:
         self.protocol = PROTOCOLS[saved_brand]()
         # v4.4.8-beta6 — wire diagnostic logging so set_network etc can write to the wizard log
         self.protocol.log_callback = self.log
+        # v4.5.3 — wire cancel-check so protocol-level retry sleeps and
+        # between-attempt checks honor the wizard's Cancel button within
+        # ~100ms instead of letting full timeouts play out.
+        self.protocol.cancel_check = lambda: self.cancel_flag
 
         # v4.5.0 — atexit cleanup so app close (not just wizard end) tears down
         # any temp NIC aliases. Combined with the existing wizard-end cleanup and
@@ -6389,6 +6463,7 @@ class CCTVToolkitApp:
             if dialog.result:
                 self.protocol = PROTOCOLS[dialog.result]()
                 self.protocol.log_callback = self.log
+                self.protocol.cancel_check = lambda: self.cancel_flag
                 self.brand_var.set(dialog.result)
                 self.settings.set('general', 'brand', dialog.result)
                 self.factory_ip_label.config(
@@ -6546,6 +6621,7 @@ class CCTVToolkitApp:
             return
         self.protocol = PROTOCOLS[new_brand]()
         self.protocol.log_callback = self.log
+        self.protocol.cancel_check = lambda: self.cancel_flag
         self.settings.set('general', 'brand', new_brand)
         self.factory_ip_label.config(
             text=f"Factory IP: {self.protocol.FACTORY_IP}  |  User: {self.protocol.DEFAULT_USER}")
@@ -13339,7 +13415,15 @@ https://buymeacoffee.com/thelostping""")
                 for desc, step_fn in auth_steps:
                     if self.cancel_flag: break
                     self.status_log(f"  {desc}")
-                    if step_fn():
+                    try:
+                        step_result = step_fn()
+                    except ProtocolCancelled:
+                        # Cancel button hit while a retry was in-flight or
+                        # a back-off was sleeping. Clean abort, no crash.
+                        self.status_log("    ⚠ Cancelled mid-step — bailing.")
+                        self.cancel_flag = True
+                        break
+                    if step_result:
                         self.status_log("    ✓ Done.")
                     else:
                         # v4.5.1 rescue: if the failing step is create_initial_user
@@ -13509,7 +13593,18 @@ https://buymeacoffee.com/thelostping""")
                         self.status_log("  ⚠ Cancelled mid-network-change — camera may be in partial state.")
                         break
                     self.status_log(f"  {desc}")
-                    if step_fn():
+                    try:
+                        step_result = step_fn()
+                    except ProtocolCancelled:
+                        # Cancel hit during in-flight ONVIF retry or sleep.
+                        # Camera may be in a partial state — same warning the
+                        # cancel-flag check above prints, but caught here so
+                        # the wizard exits cleanly instead of throwing.
+                        self.status_log("  ⚠ Cancelled mid-network-change — camera may be in partial state.")
+                        self.cancel_flag = True
+                        net_ok = False
+                        break
+                    if step_result:
                         self.status_log("    ✓ Done.")
                     else:
                         self.status_log(f"    ✗ {desc} failed")
