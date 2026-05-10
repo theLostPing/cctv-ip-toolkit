@@ -2166,48 +2166,49 @@ class AxisProtocol(CameraProtocol):
             return not t.startswith('# Error:')
 
         def _try_vapix():
+            # v4.6.0b3 — atomic single-call update. Previous b2 sent 4 separate
+            # param.cgi calls (BootProto=none, then gateway, subnet, IP). On a
+            # camera holding a bundled-DHCP lease, the BootProto=none arrived
+            # FIRST, the camera immediately released the lease before the
+            # static-IP write could land, and fell back to factory IP 192.168.
+            # 0.90 — leaving the toolkit still talking to the now-dead lease IP
+            # and never reaching step 9. Confirmed in 4.6nevercompleted.pcap:
+            # camera at .50 → BootProto=none + DefaultRouter sent → camera ARPs
+            # for gateway from .90 ten seconds later.
+            #
+            # Fix: pack all 4 params into a single GET. param.cgi supports
+            # multiple ?root.X=Y query pairs and applies them atomically. The
+            # camera switches to the new static IP on the same write, so the
+            # connection drops mid-response (handled below as success). No
+            # window where DHCP is off and static isn't set yet.
             try:
-                r1 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                    params={"action": "update", "root.Network.BootProto": "none"},
-                    auth=auth, timeout=10)
-                body1 = (r1.text or '')[:160]
-                _diag(f"VAPIX BootProto=none → status={r1.status_code} body[:160]={body1!r}")
-                if r1.status_code != 200 or not _vapix_ok(r1.text):
-                    _diag("VAPIX BootProto=none REJECTED — DHCP would stay on, aborting VAPIX path")
-                    return False
-                r2 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                    params={"action": "update", "root.Network.DefaultRouter": gateway},
-                    auth=auth, timeout=10)
-                body2 = (r2.text or '')[:160]
-                _diag(f"VAPIX DefaultRouter={gateway} → status={r2.status_code} body[:160]={body2!r}")
-                if r2.status_code != 200 or not _vapix_ok(r2.text):
-                    _diag("VAPIX DefaultRouter REJECTED")
-                    return False
-                r3 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                    params={"action": "update", "root.Network.SubnetMask": subnet},
-                    auth=auth, timeout=10)
-                body3 = (r3.text or '')[:160]
-                _diag(f"VAPIX SubnetMask={subnet} → status={r3.status_code} body[:160]={body3!r}")
-                if r3.status_code != 200 or not _vapix_ok(r3.text):
-                    _diag("VAPIX SubnetMask REJECTED")
-                    return False
-                # Setting IPAddress is the call that yanks the rug — the response
-                # may never come back because the kernel has switched interfaces
-                # by the time it tries to ack. Hence the ConnectionError below
-                # being treated as success. Don't retry this one — connection drop
-                # IS the success signal.
                 r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                    params={"action": "update", "root.Network.IPAddress": new_ip},
+                    params={
+                        "action": "update",
+                        "root.Network.BootProto": "none",
+                        "root.Network.IPAddress": new_ip,
+                        "root.Network.SubnetMask": subnet,
+                        "root.Network.DefaultRouter": gateway,
+                    },
                     auth=auth, timeout=10)
-                body4 = (r.text or '')[:160]
-                _diag(f"VAPIX IPAddress={new_ip} → status={r.status_code} body[:160]={body4!r}")
+                body = (r.text or '')[:240]
+                _diag(f"VAPIX atomic update (BootProto=none, IP={new_ip}, mask={subnet}, gw={gateway}) → status={r.status_code} body[:240]={body!r}")
                 ok = r.status_code == 200 and _vapix_ok(r.text)
-                _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200 or # Error body)'}")
+                _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (status not 200 or # Error body)'}")
                 return ok
             except ProtocolCancelled:
                 raise
             except requests.exceptions.ConnectionError:
-                _diag("VAPIX path → ConnectionError on final IPAddress write — treating as SUCCESS (kernel swapped iface mid-response)")
+                # Camera switched to the new IP mid-response and dropped the
+                # TCP connection — kernel swapped interfaces before ack. This
+                # is the EXPECTED success signal for an atomic IP-change call.
+                _diag("VAPIX atomic update → ConnectionError on response — treating as SUCCESS (camera swapped to new IP mid-response)")
+                return True
+            except requests.exceptions.ReadTimeout:
+                # Same idea — camera processed the update, switched IPs, and
+                # the response never came back because we can't reach the old
+                # IP anymore. Treat as success; verification step confirms.
+                _diag("VAPIX atomic update → ReadTimeout on response — treating as SUCCESS (camera swapped to new IP mid-response)")
                 return True
             except Exception as e:
                 _diag(f"VAPIX path → exception: {type(e).__name__}: {e}")
