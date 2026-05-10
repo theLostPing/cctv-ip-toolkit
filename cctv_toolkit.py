@@ -11268,29 +11268,26 @@ Email: axisprogrammer@thelostping.net
           '4.2'                          -> (4, 2)
           'v4.2.1'                       -> (4, 2, 1)
           '4.5.3-beta1'                  -> (4, 5, 3)
-          'beta-v4.5.3-beta.8e1f789'     -> (4, 5, 3)   ← CI prerelease tag
+          'beta-v4.5.3-beta.8e1f789'     -> (4, 5, 3)   ← old CI prerelease tag
+          'beta-v4.5.3b1.cf6583d'        -> (4, 5, 3)   ← new CI prerelease tag
 
-        The CI's prerelease tag format `beta-v<base>-beta.<sha>` was tripping
-        the old parser: it lstripped only 'v', so the leading 'beta' word
-        passed through and the digits from 'v4', '5', '3', then '8' (from
-        '8e1f789') landed as (5, 3, 8), making the running app think the
-        published beta of its own version was newer. Loop.
-        Stop at the first non-numeric chunk after the prefix is stripped so
-        a hex SHA suffix can't bleed into the version comparison."""
+        v4.5.3b? regression: the prior split-on-[.\\-+] approach broke on the
+        new `<base>b<N>.<sha>` format because '3b1' has no delimiter between
+        the patch digit and the 'b'. Result was (4, 5) instead of (4, 5, 3),
+        which made the running 4.5.3 think it was AHEAD of any 4.5.3bN beta
+        and report "up to date" without prompting. Fix: anchor at start and
+        regex-extract the leading numeric major[.minor[.patch]] only — what
+        comes after (b1 / -beta.sha / -rc1 / dev123 / ...) is build metadata,
+        not version, and gets ignored at the tuple level. The string-equality
+        check in check_for_update() distinguishes same-tuple-different-build
+        cases."""
         s = (v or '').strip()
-        # Strip common prerelease tag prefixes
         s = re.sub(r'^(beta-|rc-|alpha-|preview-)', '', s, flags=re.I)
-        # Strip leading v / V
         s = s.lstrip('vV')
-        parts = []
-        for chunk in re.split(r"[.\-+]", s):
-            m = re.match(r"^(\d+)$", chunk)
-            if m:
-                parts.append(int(m.group(1)))
-            else:
-                # Hit a non-numeric chunk (e.g. 'beta' or a hex SHA) — stop.
-                break
-        return tuple(parts) or (0,)
+        m = re.match(r'^(\d+)(?:\.(\d+))?(?:\.(\d+))?', s)
+        if not m:
+            return (0,)
+        return tuple(int(g) for g in m.groups() if g is not None)
 
     def check_for_update(self, silent=False):
         """Hit GitHub's latest-release API, compare tags. If newer available, show
