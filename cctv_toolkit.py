@@ -8989,6 +8989,22 @@ class CCTVToolkitApp:
         for sn in DEFAULT_FIND_ANYWHERE_SUBNETS:
             if getattr(self, 'cancel_flag', False):
                 break
+            # v4.6.0b11 — bail mid-sweep when bundled DHCP gets an active
+            # camera lease. The b10 entry-check missed this case: pre-flight
+            # had already started before the camera grabbed its lease.
+            # Without this in-loop check, the dumb sweep churns through 5-6
+            # subnets looking for cameras while the answer arrived 13s in.
+            # Brian's 4.6b10 trace 2026-05-10: lease ACK at 18:53:00, dumb
+            # sweep didn't finish until 18:53:21 = 21 wasted seconds.
+            try:
+                _srv = getattr(self, 'session_dhcp_server', None)
+                if _srv and getattr(_srv, 'lease_active', False) and getattr(_srv, 'last_client_mac', ''):
+                    _lease_mac = _srv.last_client_mac
+                    if self._lease_holder_is_camera(_lease_mac):
+                        self.log(f"Pre-flight (sweep): bundled DHCP picked up camera {_lease_mac} at lease IP mid-sweep — aborting remaining subnet scans.")
+                        break
+            except Exception:
+                pass
             already = _have_route_to(f"{sn}.1")
             alias_ip = None
             if already and already.get('iface_index') == iface_idx:
