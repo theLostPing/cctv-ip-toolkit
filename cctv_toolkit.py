@@ -10734,6 +10734,15 @@ class CCTVToolkitApp:
     def cancel_operation(self):
         self.cancel_flag = True
         self.log("Cancelling operation...")
+        # v4.5.3 — fire multi-home cleanup immediately on cancel so the user
+        # sees added per-subnet host IPs disappear from the NIC right away
+        # instead of "only successful wizards remove them." _cleanup_multihome
+        # is idempotent and threadsafe-enough; if the run thread later reaches
+        # its own cleanup at end-of-run, it's a no-op (empty state).
+        try:
+            self._cleanup_multihome()
+        except Exception as e:
+            self.log(f"  (cleanup-on-cancel raised: {e})")
     
     def get_password(self, title="Password", prompt="Enter password:"):
         return PasswordDialog(self.root, title, prompt).result
@@ -10921,12 +10930,34 @@ Email: axisprogrammer@thelostping.net
 
     @staticmethod
     def _version_tuple(v):
-        """'4.2' -> (4, 2). Handles 4.2.1, v4.2-beta1, etc. gracefully."""
+        """Parse a release tag into a comparable tuple.
+
+        Handles all of:
+          '4.2'                          -> (4, 2)
+          'v4.2.1'                       -> (4, 2, 1)
+          '4.5.3-beta1'                  -> (4, 5, 3)
+          'beta-v4.5.3-beta.8e1f789'     -> (4, 5, 3)   ← CI prerelease tag
+
+        The CI's prerelease tag format `beta-v<base>-beta.<sha>` was tripping
+        the old parser: it lstripped only 'v', so the leading 'beta' word
+        passed through and the digits from 'v4', '5', '3', then '8' (from
+        '8e1f789') landed as (5, 3, 8), making the running app think the
+        published beta of its own version was newer. Loop.
+        Stop at the first non-numeric chunk after the prefix is stripped so
+        a hex SHA suffix can't bleed into the version comparison."""
+        s = (v or '').strip()
+        # Strip common prerelease tag prefixes
+        s = re.sub(r'^(beta-|rc-|alpha-|preview-)', '', s, flags=re.I)
+        # Strip leading v / V
+        s = s.lstrip('vV')
         parts = []
-        for chunk in re.split(r"[.\-+]", (v or "").lstrip("vV")):
-            m = re.match(r"^(\d+)", chunk)
+        for chunk in re.split(r"[.\-+]", s):
+            m = re.match(r"^(\d+)$", chunk)
             if m:
                 parts.append(int(m.group(1)))
+            else:
+                # Hit a non-numeric chunk (e.g. 'beta' or a hex SHA) — stop.
+                break
         return tuple(parts) or (0,)
 
     def check_for_update(self, silent=False):
@@ -11096,6 +11127,9 @@ Email: axisprogrammer@thelostping.net
                 "• NEW: Wait-loop now verifies the MAC of whatever holds the lease IP before declaring 'Camera found.' Stops the 'try to factory-reset a network switch' false-positive cold.",
                 "• Wizard refuses to start with Auto multi-home enabled but no specific interface picked in the top bar. Previously it would silently 'skip multi-home' and the post-program verify would time out — now you get a clear modal at toggle-time AND at run-start so the run isn't doomed before it begins.",
                 "• Bundled DHCP no longer fails with cryptic 'WinError 10049' when the dropdown's stored IP is stale. The toolkit now re-resolves the interface's current IPv4 by InterfaceIndex at server-start time, and surfaces a friendly message if the NIC has no IPv4 (instead of the raw Windows socket error).",
+                "• FIX: Cancelling a wizard mid-run now removes auto-multihome IP addresses from the NIC immediately. Previously only successful runs cleaned up; cancelled runs left orphan IPs on the NIC until the toolkit was restarted.",
+                "• FIX: Beta-channel update prompt false-positive. The version parser was misreading CI prerelease tags like 'beta-v4.5.3-beta.8e1f789' as '(5,3,8)' instead of '(4,5,3)', making the running build think a newer beta of its own version was available — loop. Now correctly stops at the first non-numeric chunk.",
+                "• FIX: Taskbar icon now matches the file/EXE icon (both lens-style branding). app.ico had drifted to an older tray-with-camera asset while logo.ico was updated to the lens; runtime taskbar icon was loading the stale one.",
                 "• Misleading 'bailing this slot' log line softened to 'skipping this attempt and continuing to wait' — the wait-loop already had a 30s pause + retry under the hood, but the message made it sound permanent.",
             ],
         ),
