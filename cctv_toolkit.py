@@ -2004,11 +2004,12 @@ class AxisProtocol(CameraProtocol):
         # the no-auth basicdeviceinfo endpoint so we don't blow away the
         # speed advantage we're trying to gain.
         prefer_vapix = False
+        fw_resolved = ''  # what we actually decided based on (caller's value or our probe)
         try:
-            fw = firmware or self._probe_firmware_quick(ip)
-            if fw:
+            fw_resolved = firmware or self._probe_firmware_quick(ip)
+            if fw_resolved:
                 # Match a leading major.minor — anything < 12 prefers VAPIX
-                m = re.match(r'^(\d+)', str(fw))
+                m = re.match(r'^(\d+)', str(fw_resolved))
                 if m and int(m.group(1)) < 12:
                     prefer_vapix = True
         except Exception:
@@ -2147,20 +2148,49 @@ class AxisProtocol(CameraProtocol):
         # offline mid-config and you can't finish. DHCP off first, gateway,
         # subnet, IP last — that order has been bulletproof since at least
         # the M-series firmware in 2012.
+        # v4.6.0b2 — DHCP-off param fix. The previous `root.Network.IPv4.DHCP=no`
+        # only exists on FW 11+; on FW 10.x the camera returns
+        # `# Error: Error setting 'root.Network.IPv4.DHCP' to 'no'!` with HTTP
+        # 200 (param.cgi error-via-200-with-error-body pattern) and the toolkit
+        # missed it. Result: static IP got set but BootProto stayed `dhcp`,
+        # leaving the camera in a half-configured state — confirmed live on
+        # 192.168.0.100 by reading params after a v4.6.0b1 program. The right
+        # param on FW 10.x is `root.Network.BootProto=none` (verified: returns
+        # plain `OK` and BootProto value flips to `none` immediately). It also
+        # works on FW 11+, so use it unconditionally on the VAPIX path.
+        def _vapix_ok(resp_text):
+            """param.cgi returns HTTP 200 even on errors. Real success bodies
+            are short (`OK`, `OK\\r\\n`, or echoed value). Real failure bodies
+            start with `# Error:`. Treat any `# Error:` prefix as failure."""
+            t = (resp_text or '').strip()
+            return not t.startswith('# Error:')
+
         def _try_vapix():
             try:
                 r1 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                    params={"action": "update", "root.Network.IPv4.DHCP": "no"},
+                    params={"action": "update", "root.Network.BootProto": "none"},
                     auth=auth, timeout=10)
-                _diag(f"VAPIX DHCP=no → status={r1.status_code} body[:160]={(r1.text or '')[:160]!r}")
+                body1 = (r1.text or '')[:160]
+                _diag(f"VAPIX BootProto=none → status={r1.status_code} body[:160]={body1!r}")
+                if r1.status_code != 200 or not _vapix_ok(r1.text):
+                    _diag("VAPIX BootProto=none REJECTED — DHCP would stay on, aborting VAPIX path")
+                    return False
                 r2 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
                     params={"action": "update", "root.Network.DefaultRouter": gateway},
                     auth=auth, timeout=10)
-                _diag(f"VAPIX DefaultRouter={gateway} → status={r2.status_code} body[:160]={(r2.text or '')[:160]!r}")
+                body2 = (r2.text or '')[:160]
+                _diag(f"VAPIX DefaultRouter={gateway} → status={r2.status_code} body[:160]={body2!r}")
+                if r2.status_code != 200 or not _vapix_ok(r2.text):
+                    _diag("VAPIX DefaultRouter REJECTED")
+                    return False
                 r3 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
                     params={"action": "update", "root.Network.SubnetMask": subnet},
                     auth=auth, timeout=10)
-                _diag(f"VAPIX SubnetMask={subnet} → status={r3.status_code} body[:160]={(r3.text or '')[:160]!r}")
+                body3 = (r3.text or '')[:160]
+                _diag(f"VAPIX SubnetMask={subnet} → status={r3.status_code} body[:160]={body3!r}")
+                if r3.status_code != 200 or not _vapix_ok(r3.text):
+                    _diag("VAPIX SubnetMask REJECTED")
+                    return False
                 # Setting IPAddress is the call that yanks the rug — the response
                 # may never come back because the kernel has switched interfaces
                 # by the time it tries to ack. Hence the ConnectionError below
@@ -2169,9 +2199,10 @@ class AxisProtocol(CameraProtocol):
                 r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
                     params={"action": "update", "root.Network.IPAddress": new_ip},
                     auth=auth, timeout=10)
-                _diag(f"VAPIX IPAddress={new_ip} → status={r.status_code} body[:160]={(r.text or '')[:160]!r}")
-                ok = r.status_code == 200
-                _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200)'}")
+                body4 = (r.text or '')[:160]
+                _diag(f"VAPIX IPAddress={new_ip} → status={r.status_code} body[:160]={body4!r}")
+                ok = r.status_code == 200 and _vapix_ok(r.text)
+                _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200 or # Error body)'}")
                 return ok
             except ProtocolCancelled:
                 raise
@@ -2191,7 +2222,7 @@ class AxisProtocol(CameraProtocol):
         # If the preferred path returns False (not raised), fall back to the
         # other path as a safety net.
         if prefer_vapix:
-            _diag(f"firmware {firmware or 'unknown'} prefers VAPIX path (FW < 12 ONVIF SOAP is slow)")
+            _diag(f"firmware {fw_resolved or 'unknown'} prefers VAPIX path (FW < 12 ONVIF SOAP is slow)")
             if _try_vapix():
                 _diag("VAPIX path SUCCESS")
                 return True
