@@ -11002,7 +11002,27 @@ Email: axisprogrammer@thelostping.net
         latest_tup = self._version_tuple(latest_tag)
         current_tup = self._version_tuple(APP_VERSION)
 
-        if latest_tup <= current_tup:
+        # Normalize tags for exact-string comparison. CI injects the resolved
+        # version into APP_VERSION at build time so a beta built from SHA
+        # f84a9aa has APP_VERSION = "4.5.3-beta.f84a9aa" rather than "4.5.3".
+        # That lets us distinguish two betas of the same base version: same
+        # tuple, different SHA suffix → still "newer build available."
+        def _norm_tag(s):
+            s = (s or '').strip()
+            s = re.sub(r'^(beta-|rc-|alpha-|preview-)', '', s, flags=re.I)
+            return s.lstrip('vV')
+        latest_norm = _norm_tag(latest_tag)
+        current_norm = _norm_tag(APP_VERSION)
+
+        # "Up to date" if EITHER:
+        #   - latest tuple is strictly less than current (older release on the
+        #     channel), OR
+        #   - tuples equal AND normalized tags are identical (same exact
+        #     build — most common after a successful update).
+        # Any other case (different SHA suffix, different base version, etc.)
+        # is treated as "newer available" so users on the beta channel see
+        # incremental SHAs without false-positive loops.
+        if latest_tup < current_tup or (latest_tup == current_tup and latest_norm == current_norm):
             if not silent:
                 ch = (self.settings.get('general', 'update_channel') or 'stable').strip().lower()
                 ch_label = 'beta' if ch == 'beta' else 'stable'

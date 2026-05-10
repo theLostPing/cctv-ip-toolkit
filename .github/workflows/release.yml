@@ -69,6 +69,34 @@ jobs:
           "is_prerelease=$is_prerelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "release_kind=$release_kind"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      - name: Inject full build version into APP_VERSION (beta/dev only)
+        # For stable releases the tag IS the version, so APP_VERSION already matches.
+        # For beta/dev builds the source-level APP_VERSION is just the base (e.g. "4.5.3"),
+        # which makes the in-app updater unable to distinguish two betas of the same
+        # base version. Inject the resolved version (e.g. "4.5.3-beta.<sha>") so the
+        # running build knows its own SHA and the updater can detect newer betas.
+        if: steps.vers.outputs.release_kind != 'stable'
+        shell: pwsh
+        run: |
+          $base = "${{ steps.vers.outputs.base }}"
+          $version = "${{ steps.vers.outputs.version }}"
+          if ($base -eq $version) {
+            Write-Host "Base equals resolved version - no injection needed"
+            exit 0
+          }
+          Write-Host "Injecting APP_VERSION: $base -> $version"
+          $pattern = '^APP_VERSION\s*=\s*"' + [regex]::Escape($base) + '"'
+          $replacement = 'APP_VERSION = "' + $version + '"'
+          $content = Get-Content cctv_toolkit.py -Raw
+          $new = [regex]::Replace($content, $pattern, $replacement, [System.Text.RegularExpressions.RegexOptions]::Multiline)
+          if ($new -eq $content) {
+            throw "APP_VERSION injection produced no change - pattern didn't match. Aborting build to prevent shipping a build with mismatched version metadata."
+          }
+          Set-Content -Path cctv_toolkit.py -Value $new -NoNewline
+          # Verify it took
+          $check = Select-String -Path cctv_toolkit.py -Pattern '^APP_VERSION\s*=' | Select-Object -First 1
+          Write-Host "Verified: $($check.Line)"
+
       - name: Build PyInstaller exe
         shell: pwsh
         run: |
