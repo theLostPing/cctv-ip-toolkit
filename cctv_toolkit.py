@@ -8339,11 +8339,65 @@ class CCTVToolkitApp:
             wrapper, "Users & Passwords",
             "Password list for batch testing  +  additional user accounts to create on each camera")
 
-        # Top/bottom split: passwords on top, additional users on bottom
+        # v5.0 b8 — Brian: 'move users above the password list stuff'. Flipped
+        # so Additional Users is the TOP pane (was being crushed at the
+        # bottom). Password List takes the bottom and gets more vertical
+        # space proportionally since its scrollable listbox can absorb it.
         outer_split = ttk.PanedWindow(self.passwords_tab, orient=tk.VERTICAL)
         outer_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        # ---- TOP: Password List ----
+        # ---- TOP: Additional Users ----
+        users_frame = ttk.LabelFrame(outer_split, text="Additional Users  •  Created on each camera during programming",
+                                     padding="10")
+        outer_split.add(users_frame, weight=2)
+
+        # Controls FIRST (pack side=BOTTOM so the Add User row is always
+        # anchored to the bottom of the pane even when the tree grows).
+        users_controls = ttk.Frame(users_frame)
+        users_controls.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+
+        ttk.Label(users_controls, text="Username:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_name_var = tk.StringVar()
+        ttk.Entry(users_controls, textvariable=self.new_user_name_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(users_controls, text="Password:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_pwd_var = tk.StringVar()
+        ttk.Entry(users_controls, textvariable=self.new_user_pwd_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(users_controls, text="Role:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_role_var = tk.StringVar(value='Operator')
+        role_combo = ttk.Combobox(users_controls, textvariable=self.new_user_role_var,
+                                  values=AdditionalUsersDataManager.ROLES, state='readonly', width=12)
+        role_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(users_controls, text="Add User", command=self.add_additional_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(users_controls, text="Delete Selected", command=self.delete_additional_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(users_controls, text="Clear All", command=self.clear_additional_users).pack(side=tk.LEFT, padx=3)
+
+        self.additional_users_status = tk.StringVar(value="0 additional users")
+        ttk.Label(users_controls, textvariable=self.additional_users_status,
+                 font=('Helvetica', 9), foreground='gray').pack(side=tk.RIGHT)
+
+        # Treeview fills above the controls
+        users_top = ttk.Frame(users_frame)
+        users_top.pack(fill=tk.BOTH, expand=True)
+
+        cols = ('username', 'password', 'role')
+        self.users_tree = ttk.Treeview(users_top, columns=cols, show='headings', height=4)
+        self.users_tree.heading('username', text='Username')
+        self.users_tree.heading('password', text='Password')
+        self.users_tree.heading('role', text='Role')
+        self.users_tree.column('username', width=150, anchor='center')
+        self.users_tree.column('password', width=150, anchor='center')
+        self.users_tree.column('role', width=120, anchor='center')
+        users_scroll = ttk.Scrollbar(users_top, orient=tk.VERTICAL, command=self.users_tree.yview)
+        self.users_tree.configure(yscrollcommand=users_scroll.set)
+        self.users_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        users_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.refresh_additional_users_list()
+
+        # ---- BOTTOM: Password List ----
         frame = ttk.Frame(outer_split)
         outer_split.add(frame, weight=3)
 
@@ -8391,35 +8445,17 @@ class CCTVToolkitApp:
         pwd_entry.bind('<Return>', lambda e: self.add_password())
         
         ttk.Button(right_frame, text="➕ Add Password", command=self.add_password).pack()
-        
-        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=15)
-        
-        # Mass entry
-        ttk.Label(right_frame, text="Bulk add (one per line):", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W)
-        self.mass_password_text = scrolledtext.ScrolledText(right_frame, font=('Courier', 10), height=6, width=25)
-        self.mass_password_text.pack(fill=tk.X, pady=(5, 5))
-        
-        # Right-click menu for mass entry
-        mass_menu = tk.Menu(self.mass_password_text, tearoff=0)
-        mass_menu.add_command(label="Paste", command=lambda: self.mass_password_text.event_generate('<<Paste>>'))
-        mass_menu.add_command(label="Clear", command=lambda: self.mass_password_text.delete('1.0', tk.END))
-        self.mass_password_text.bind("<Button-3>", lambda e: mass_menu.tk_popup(e.x_root, e.y_root))
-        
-        ttk.Button(right_frame, text="➕ Add All", command=self.mass_add_passwords).pack(pady=(0, 10))
 
-        # Import from file (compact — single button, no extra labels, keeps the
-        # Additional Users section visible without scrolling)
-        ttk.Button(right_frame, text="📂 Import from file…  (.txt / .csv / .md)",
-                   command=self.import_passwords_from_file).pack(pady=(2, 10), fill=tk.X)
+        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=10)
 
-        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=8)
-        
-        # Common defaults — v5.0 b4: was a vertical stack of 7 buttons that ran
-        # off the bottom of the visible area; brought into a 2-column grid so
-        # everything fits without clipping the Additional Users panel below.
+        # v5.0 b8 — Common Defaults promoted ABOVE Bulk Add. Brian flagged
+        # b7 layout: bulk-add textbox at height=6 plus Import button pushed
+        # the defaults grid off the visible area when the tab header above
+        # ate vertical space. Quick-defaults are higher-frequency than bulk
+        # imports, so they belong nearer the top of the column.
         ttk.Label(right_frame, text="Common defaults:", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W, pady=(0, 4))
         defaults_grid = ttk.Frame(right_frame)
-        defaults_grid.pack(fill=tk.X, pady=(0, 4))
+        defaults_grid.pack(fill=tk.X, pady=(0, 8))
         common = ["pass", "admin", "root", "password", "123456", "camera", "axis"]
         for i, pwd in enumerate(common):
             r, c = divmod(i, 2)
@@ -8428,65 +8464,33 @@ class CCTVToolkitApp:
             btn.grid(row=r, column=c, padx=2, pady=2, sticky='ew')
         defaults_grid.columnconfigure(0, weight=1)
         defaults_grid.columnconfigure(1, weight=1)
+
+        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+
+        # Mass entry — moved BELOW defaults so it can be shorter without
+        # eating the quick-add grid. height=4 (was 6) keeps the whole column
+        # compact enough to fit alongside the v5.0 b5 tab header.
+        ttk.Label(right_frame, text="Bulk add (one per line):", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W)
+        self.mass_password_text = scrolledtext.ScrolledText(right_frame, font=('Courier', 10), height=4, width=25)
+        self.mass_password_text.pack(fill=tk.X, pady=(5, 5))
+
+        # Right-click menu for mass entry
+        mass_menu = tk.Menu(self.mass_password_text, tearoff=0)
+        mass_menu.add_command(label="Paste", command=lambda: self.mass_password_text.event_generate('<<Paste>>'))
+        mass_menu.add_command(label="Clear", command=lambda: self.mass_password_text.delete('1.0', tk.END))
+        self.mass_password_text.bind("<Button-3>", lambda e: mass_menu.tk_popup(e.x_root, e.y_root))
+
+        ttk.Button(right_frame, text="➕ Add All", command=self.mass_add_passwords).pack(pady=(0, 6))
+
+        # Import from file (compact — single button, no extra labels)
+        ttk.Button(right_frame, text="📂 Import from file…  (.txt / .csv / .md)",
+                   command=self.import_passwords_from_file).pack(pady=(2, 0), fill=tk.X)
         
         # Status
         self.password_status = tk.StringVar(value="0 passwords")
         ttk.Label(left_frame, textvariable=self.password_status, font=('Helvetica', 10)).pack(anchor=tk.W, pady=(5, 0))
         
         self.refresh_password_list()
-
-        # ---- BOTTOM: Additional Users ----
-        users_frame = ttk.LabelFrame(outer_split, text="Additional Users  •  Created on each camera during programming",
-                                     padding="10")
-        outer_split.add(users_frame, weight=2)
-
-        # Users treeview
-        users_top = ttk.Frame(users_frame)
-        users_top.pack(fill=tk.BOTH, expand=True)
-
-        cols = ('username', 'password', 'role')
-        self.users_tree = ttk.Treeview(users_top, columns=cols, show='headings', height=5)
-        self.users_tree.heading('username', text='Username')
-        self.users_tree.heading('password', text='Password')
-        self.users_tree.heading('role', text='Role')
-        # anchor='center' on data columns matches the default-centered headings
-        # — without this, headers center but data left-aligns (Brian flagged
-        # 2026-05-02: visual mismatch, alignment bug)
-        self.users_tree.column('username', width=150, anchor='center')
-        self.users_tree.column('password', width=150, anchor='center')
-        self.users_tree.column('role', width=120, anchor='center')
-        users_scroll = ttk.Scrollbar(users_top, orient=tk.VERTICAL, command=self.users_tree.yview)
-        self.users_tree.configure(yscrollcommand=users_scroll.set)
-        self.users_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        users_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Add/remove controls
-        users_controls = ttk.Frame(users_frame)
-        users_controls.pack(fill=tk.X, pady=(8, 0))
-
-        ttk.Label(users_controls, text="Username:").pack(side=tk.LEFT, padx=(0, 3))
-        self.new_user_name_var = tk.StringVar()
-        ttk.Entry(users_controls, textvariable=self.new_user_name_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Label(users_controls, text="Password:").pack(side=tk.LEFT, padx=(0, 3))
-        self.new_user_pwd_var = tk.StringVar()
-        ttk.Entry(users_controls, textvariable=self.new_user_pwd_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Label(users_controls, text="Role:").pack(side=tk.LEFT, padx=(0, 3))
-        self.new_user_role_var = tk.StringVar(value='Operator')
-        role_combo = ttk.Combobox(users_controls, textvariable=self.new_user_role_var,
-                                  values=AdditionalUsersDataManager.ROLES, state='readonly', width=12)
-        role_combo.pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Button(users_controls, text="Add User", command=self.add_additional_user).pack(side=tk.LEFT, padx=3)
-        ttk.Button(users_controls, text="Delete Selected", command=self.delete_additional_user).pack(side=tk.LEFT, padx=3)
-        ttk.Button(users_controls, text="Clear All", command=self.clear_additional_users).pack(side=tk.LEFT, padx=3)
-
-        self.additional_users_status = tk.StringVar(value="0 additional users")
-        ttk.Label(users_controls, textvariable=self.additional_users_status,
-                 font=('Helvetica', 9), foreground='gray').pack(side=tk.RIGHT)
-
-        self.refresh_additional_users_list()
 
     def create_operations_tab(self):
         """Operations tab with big buttons and wizards"""
