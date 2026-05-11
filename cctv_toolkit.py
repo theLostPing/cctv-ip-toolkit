@@ -7889,27 +7889,34 @@ class CCTVToolkitApp:
         ttk.Button(btns, text="Save", command=_save).pack(side=tk.RIGHT, padx=4)
         _center_on_parent(dlg, self.root, 0, 0)
 
-    def create_cameras_tab(self):
-        """Camera list editor tab"""
-        self.cameras_frame = ttk.Frame(self.cameras_tab, padding="10")
-        self.cameras_frame.pack(fill=tk.BOTH, expand=True)
-        frame = self.cameras_frame
-        
-        # Header with instructions
-        header = ttk.Frame(frame)
+    def _build_tab_header(self, parent, title, subtitle=None, title_size=16):
+        """v5.0 b5 — standardized top-of-tab header. Top-left is always a green
+        '← Back to wizard' button so every tab has the same exit affordance
+        Brian asked for, followed by the screen title and an optional subtitle.
+        Used by Camera List / Users & Passwords / Discovered / Operations."""
+        header = ttk.Frame(parent)
         header.pack(fill=tk.X, pady=(0, 10))
-        # v5.0 b3 — explicit Back-to-wizard button (Brian's ask). The global
-        # "Back to wizard" in the top header bar is good, but a contextual
-        # one inside the screen itself is what the operator instinctively
-        # looks for when finishing camera-list edits.
         tk.Button(header, text="← Back to wizard",
                   font=('Helvetica', 10, 'bold'),
                   bg='#4CAF50', fg='white', relief=tk.RAISED, padx=14, pady=4,
                   cursor='hand2',
                   command=lambda: self.notebook.select(self.setup_tab)).pack(side=tk.LEFT)
-        ttk.Label(header, text="  Camera List", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Label(header, text="  •  Add cameras here for programming, pinging, and other operations",
-                 font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(header, text=f"  {title}",
+                  font=('Helvetica', title_size, 'bold')).pack(side=tk.LEFT, padx=(12, 0))
+        if subtitle:
+            ttk.Label(header, text=f"  •  {subtitle}",
+                      font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
+        return header
+
+    def create_cameras_tab(self):
+        """Camera list editor tab"""
+        self.cameras_frame = ttk.Frame(self.cameras_tab, padding="10")
+        self.cameras_frame.pack(fill=tk.BOTH, expand=True)
+        frame = self.cameras_frame
+
+        self._build_tab_header(
+            frame, "Camera List",
+            "Add cameras here for programming, pinging, and other operations")
         
         # Toolbar
         toolbar = ttk.Frame(frame)
@@ -7979,13 +7986,10 @@ class CCTVToolkitApp:
         """Discovered cameras tab - shows what's on the network"""
         frame = ttk.Frame(self.discovered_tab, padding="10")
         frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Header
-        header = ttk.Frame(frame)
-        header.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(header, text="Discovered Cameras", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT)
-        ttk.Label(header, text="  •  Cameras found on the network (not your programming list)", 
-                 font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
+
+        self._build_tab_header(
+            frame, "Discovered Cameras",
+            "Cameras found on the network (not your programming list)")
         
         # Buttons
         btn_frame = ttk.Frame(frame)
@@ -8324,18 +8328,27 @@ class CCTVToolkitApp:
 
     def create_passwords_tab(self):
         """Password list editor tab + additional users section"""
+        # v5.0 b5 — Back-to-wizard at top, ABOVE the vertical split, so the
+        # standardized exit button is always visible regardless of how the
+        # operator drags the inner panes.
+        wrapper = ttk.Frame(self.passwords_tab, padding=(10, 10, 10, 0))
+        wrapper.pack(fill=tk.X)
+        self._build_tab_header(
+            wrapper, "Users & Passwords",
+            "Password list for batch testing  +  additional user accounts to create on each camera")
+
         # Top/bottom split: passwords on top, additional users on bottom
         outer_split = ttk.PanedWindow(self.passwords_tab, orient=tk.VERTICAL)
-        outer_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        outer_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
         # ---- TOP: Password List ----
         frame = ttk.Frame(outer_split)
         outer_split.add(frame, weight=3)
 
-        # Header
+        # Section header (no Back button here — moved to tab-level header above)
         header = ttk.Frame(frame)
         header.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(header, text="Password List", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT)
+        ttk.Label(header, text="Password List", font=('Helvetica', 13, 'bold')).pack(side=tk.LEFT)
         ttk.Label(header, text="  •  Used for batch password testing to find unknown camera passwords",
                  font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
 
@@ -8477,9 +8490,13 @@ class CCTVToolkitApp:
         """Operations tab with big buttons and wizards"""
         frame = ttk.Frame(self.operations_tab, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Header
-        ttk.Label(frame, text="Operations", font=('Helvetica', 20, 'bold')).pack(pady=(0, 20))
+
+        self._build_tab_header(
+            frame, "Operations",
+            "Pick what to do with the loaded camera list",
+            title_size=20)
+        # Spacer below the header
+        ttk.Frame(frame, height=10).pack()
         
         # Grid of operation buttons
         btn_frame = ttk.Frame(frame)
