@@ -7310,8 +7310,8 @@ class CCTVToolkitApp:
             ]),
             ('Programming', [
                 ("🟢  Program New Cameras",
-                 "Full wizard: set password + IP + hostname on each camera. Confirms admin user, password, and 'extra users?' before starting.",
-                 getattr(self, 'start_program_wizard', None)),
+                 "Confirms admin user + password + extra users, then runs the step-by-step programming wizard against your camera list.",
+                 getattr(self, 'start_program_wizard_with_confirm', None) or getattr(self, 'start_program_wizard', None)),
                 ("🔄  Update / Change Settings",
                  "Push IP / hostname / DHCP-toggle changes to cameras that are ALREADY programmed.",
                  getattr(self, 'start_update_wizard', None)),
@@ -7846,8 +7846,17 @@ class CCTVToolkitApp:
         # Header with instructions
         header = ttk.Frame(frame)
         header.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(header, text="Camera List", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT)
-        ttk.Label(header, text="  •  Add cameras here for programming, pinging, and other operations", 
+        # v5.0 b3 — explicit Back-to-wizard button (Brian's ask). The global
+        # "Back to wizard" in the top header bar is good, but a contextual
+        # one inside the screen itself is what the operator instinctively
+        # looks for when finishing camera-list edits.
+        tk.Button(header, text="← Back to wizard",
+                  font=('Helvetica', 10, 'bold'),
+                  bg='#4CAF50', fg='white', relief=tk.RAISED, padx=14, pady=4,
+                  cursor='hand2',
+                  command=lambda: self.notebook.select(self.setup_tab)).pack(side=tk.LEFT)
+        ttk.Label(header, text="  Camera List", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(header, text="  •  Add cameras here for programming, pinging, and other operations",
                  font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
         
         # Toolbar
@@ -13500,6 +13509,138 @@ https://buymeacoffee.com/thelostping""")
     # ========================================================================
     # NEW PROGRAMMING FLOW (step-by-step wizard + live status view)
     # ========================================================================
+    def start_program_wizard_with_confirm(self):
+        """v5.0 b3 — pre-flight confirm dialog before launching the
+        step-by-step programming wizard. Brian's ask: 'Program new cameras
+        should confirm the admin user, then the confirmed programming
+        password. Extra users? Yes/No.' This is the operator's last chance
+        to verify the three highest-stakes inputs before programming starts.
+        After confirm, calls into start_program_wizard which has the full
+        step-by-step flow."""
+        # Re-entry guard FIRST so the confirm dialog doesn't sit open while
+        # an old run is still alive in another thread.
+        if getattr(self, '_wizard_running', False):
+            messagebox.showwarning(
+                "A programming run is already active",
+                "Click Cancel on the active run first, or wait for it to finish.",
+                parent=self.root)
+            return
+        cameras = self.validate_cameras_for_programming()
+        if not cameras:
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Confirm before programming")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        _center_on_parent(dlg, self.root, 540, 360)
+
+        body = ttk.Frame(dlg, padding=20)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text=f"Program {len(cameras)} {self.protocol.BRAND_NAME} camera(s)",
+                  font=('Helvetica', 13, 'bold')).pack(anchor='w', pady=(0, 4))
+        ttk.Label(body,
+                  text="Confirm the three high-stakes inputs before the wizard fires.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(0, 14))
+
+        # Admin user
+        user_row = ttk.Frame(body); user_row.pack(fill=tk.X, pady=4)
+        ttk.Label(user_row, text="Admin user:", width=18,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        user_var = tk.StringVar(value=self.protocol.DEFAULT_USER or 'root')
+        ttk.Entry(user_row, textvariable=user_var, width=20,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        ttk.Label(user_row, text=f"(brand default: {self.protocol.DEFAULT_USER})",
+                  foreground='gray', font=('Helvetica', 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+        # Password + confirm
+        pwd1_row = ttk.Frame(body); pwd1_row.pack(fill=tk.X, pady=4)
+        ttk.Label(pwd1_row, text="Programming password:", width=18,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        pwd1_var = tk.StringVar(value='')
+        pwd1_entry = ttk.Entry(pwd1_row, textvariable=pwd1_var, width=24, show='•',
+                               font=('Helvetica', 10))
+        pwd1_entry.pack(side=tk.LEFT)
+
+        pwd2_row = ttk.Frame(body); pwd2_row.pack(fill=tk.X, pady=4)
+        ttk.Label(pwd2_row, text="Confirm password:", width=18,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        pwd2_var = tk.StringVar(value='')
+        ttk.Entry(pwd2_row, textvariable=pwd2_var, width=24, show='•',
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+
+        # Extra users yes/no
+        extras_count = 0
+        try:
+            extras_count = len(self.additional_users_data.get_all())
+        except Exception:
+            pass
+        extras_row = ttk.Frame(body); extras_row.pack(fill=tk.X, pady=(12, 4))
+        ttk.Label(extras_row, text="Add extra users?", width=18,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        extras_var = tk.BooleanVar(value=False)
+        if extras_count > 0:
+            ttk.Radiobutton(extras_row, text=f"Yes ({extras_count} configured)",
+                            variable=extras_var, value=True).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Radiobutton(extras_row, text="No",
+                            variable=extras_var, value=False).pack(side=tk.LEFT)
+        else:
+            ttk.Label(extras_row,
+                      text="(no extra users configured — use Users & Passwords to add)",
+                      foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT)
+
+        # Buttons
+        btns = ttk.Frame(body); btns.pack(fill=tk.X, pady=(20, 0))
+        result = {'ok': False, 'user': '', 'pwd': '', 'extras': False}
+        def _ok():
+            u = user_var.get().strip()
+            p1 = pwd1_var.get()
+            p2 = pwd2_var.get()
+            if not u:
+                messagebox.showwarning("Required", "Admin user is required.", parent=dlg)
+                return
+            if not p1:
+                messagebox.showwarning("Required", "Programming password is required.", parent=dlg)
+                return
+            if p1 != p2:
+                messagebox.showerror("Mismatch", "The two password fields don't match.", parent=dlg)
+                pwd1_entry.focus_set()
+                return
+            result['ok'] = True
+            result['user'] = u
+            result['pwd'] = p1
+            result['extras'] = bool(extras_var.get())
+            dlg.destroy()
+        def _cancel():
+            dlg.destroy()
+        ttk.Button(btns, text="Cancel", command=_cancel).pack(side=tk.RIGHT, padx=(8, 0))
+        ok_btn = tk.Button(btns, text="✓ Start Programming",
+                           bg='#4CAF50', fg='white', font=('Helvetica', 10, 'bold'),
+                           padx=14, pady=6, relief=tk.RAISED, cursor='hand2',
+                           command=_ok)
+        ok_btn.pack(side=tk.RIGHT)
+        dlg.bind('<Return>', lambda e: _ok())
+        dlg.bind('<Escape>', lambda e: _cancel())
+        pwd1_entry.focus_set()
+        dlg.wait_window(dlg)
+
+        if not result['ok']:
+            return
+
+        # Stash the confirmed values into the protocol's defaults so the
+        # subsequent ProgramWizardDialog inside start_program_wizard picks
+        # them up. Then hand off to the real wizard.
+        try:
+            self.protocol.DEFAULT_USER = result['user']
+        except Exception:
+            pass
+        # Pre-seed the wizard dialog's password and extra-users by stashing
+        # on the app for the wizard to read at construction time.
+        self._preconfirmed_password = result['pwd']
+        self._preconfirmed_add_extra_users = result['extras']
+        self.start_program_wizard()
+
     def start_program_wizard(self):
         """Step-by-step programming flow with live checklist UI."""
         # v4.6.0b6 — re-entry guard. Without this, clicking Program a second
