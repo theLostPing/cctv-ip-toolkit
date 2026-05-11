@@ -6054,25 +6054,28 @@ class CameraEditorDialog(tk.Toplevel):
                    command=lambda: set_subnet('255.0.0.0')).pack(side=tk.LEFT, padx=2)
         row += 1
 
-        # MAC Address — editable with Clear button. v4.6.0b7: re-test workflow
-        # ask from 2026-05-10 — the toolkit stamps the discovered MAC onto a
-        # camera-list entry after programming. When re-using the same physical
-        # camera to test repeatedly, the bound MAC made the camera look "already
-        # programmed" to subsequent runs even after a factory default. Clear
-        # button wipes the field so the camera looks fresh on the next run.
-        ttk.Label(frame, text="MAC Address:").grid(row=row, column=0, sticky='w', pady=3)
+        # Brand check (first 6 of MAC = OUI). v5.0 b2 rethink: the field
+        # isn't a per-camera binding anymore — it's a brand-validation hint.
+        # Just the first 6 hex chars (the OUI) tells the toolkit "this slot
+        # is an Axis camera" (or Bosch, or Hanwha) so it can refuse to
+        # program the wrong brand. Empty = no brand-check, accept whatever
+        # plugs in. Pre-discovered MAC gets truncated to its OUI for display.
+        ttk.Label(frame, text="Brand check (MAC OUI):").grid(row=row, column=0, sticky='w', pady=3)
         mac_frame = ttk.Frame(frame)
         mac_frame.grid(row=row, column=1, sticky='ew', pady=3, padx=(10, 0))
-        mac_entry = ttk.Entry(mac_frame, width=22)
+        mac_entry = ttk.Entry(mac_frame, width=14)
         mac_entry.pack(side=tk.LEFT)
-        if camera and camera.get('mac'):
-            mac_entry.insert(0, camera['mac'])
+        # Pre-populate with OUI (first 6 hex) of any existing MAC binding.
+        existing_mac = (camera or {}).get('mac', '') or ''
+        oui_existing = ''.join(c for c in existing_mac if c not in ':-. ')[:6].upper()
+        if oui_existing:
+            mac_entry.insert(0, oui_existing)
         self.entries['mac'] = mac_entry
         def _clear_mac():
             mac_entry.delete(0, tk.END)
         ttk.Button(mac_frame, text="Clear", width=7,
                    command=_clear_mac).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(frame, text="(clear to detach the previously-discovered camera so re-tests look fresh)",
+        ttk.Label(frame, text="(first 6 hex chars of MAC — used to confirm the brand. Empty = accept any brand.)",
                   foreground='gray', font=('Helvetica', 8)).grid(
             row=row + 1, column=1, sticky='w', padx=(10, 0))
         row += 2
@@ -6182,9 +6185,11 @@ class CameraEditorDialog(tk.Toplevel):
             'new_ip': self.entries['new_ip'].get().strip(),
             'dhcp': 'Yes' if self.dhcp_var.get() else 'No',
             'serial': self.camera.get('serial', '') if self.camera else '',
-            # v4.6.0b7: MAC is now an editable field. Empty value clears the
-            # binding so the same physical camera looks fresh on next run.
-            'mac': self.entries['mac'].get().strip(),
+            # v5.0 b2: MAC field is the 6-hex OUI for brand validation, not a
+            # per-camera binding. Strip non-hex, uppercase, cap at 6 chars.
+            # Empty stays empty = no brand check.
+            'mac': ''.join(c for c in self.entries['mac'].get().strip()
+                           if c in '0123456789abcdefABCDEF').upper()[:6],
             'brand': self.camera.get('brand', 'axis') if self.camera else 'axis',
             'pending': pending,
             'processed': False
@@ -6915,7 +6920,10 @@ class CCTVToolkitApp:
         def _go_setup():
             try: self.notebook.select(self.setup_tab)
             except Exception: pass
-        tk.Button(header, text="🏠 Home", bg='#37474F', fg='white',
+        # v5.0 b2 — was '🏠 Home' but 'home' implies a separate home screen
+        # which doesn't exist; Setup IS the home. 'Back to wizard' reads
+        # correctly per Brian's feedback.
+        tk.Button(header, text="← Back to wizard", bg='#37474F', fg='white',
                   font=('Helvetica', 9, 'bold'), relief=tk.FLAT, padx=12, cursor='hand2',
                   command=_go_setup).pack(side=tk.RIGHT, padx=(0, 10), pady=6)
 
@@ -7078,10 +7086,13 @@ class CCTVToolkitApp:
           6. Status (shows the live programming screen)
         """
         self._setup_step = 0
+        # v5.0 b2 — Brand moved to Step 1. Brand drives everything downstream
+        # (factory IP, default user, protocol) so the operator should pick it
+        # before the others.
         self._setup_steps_meta = [
-            ('1', 'Interface',     'Pick the programming NIC'),
-            ('2', 'DHCP server',   'Turn the bundled DHCP server on or off'),
-            ('3', 'Brand',         'Axis, Bosch, or Hanwha'),
+            ('1', 'Brand',         'Axis, Bosch, or Hanwha'),
+            ('2', 'Interface',     'Pick the programming NIC'),
+            ('3', 'DHCP server',   'Turn the bundled DHCP server on or off'),
             ('4', 'Camera list',   'Paste or load the CSV of cameras to program'),
             ('5', 'Operations',    'What to do with these cameras'),
             ('6', 'Status',        'Live programming progress'),
@@ -7141,6 +7152,39 @@ class CCTVToolkitApp:
 
         self._setup_goto(0)
 
+        # v5.0 b2 — Enter = Next throughout the Setup flow. Brian's ask:
+        # 'on next run, please make sure Enter is the approved next/yes/
+        # auto-select all the way through the program.' Smart handler:
+        # in a multi-line Text widget Enter inserts newline (normal); in a
+        # Combobox / Entry / Button it advances the Setup step (or invokes
+        # the focused button). Idempotent — repeat-binding is fine.
+        def _enter_advances(event=None):
+            try:
+                w = self.root.focus_get()
+                # Multi-line text input: let Enter do its normal thing
+                if isinstance(w, tk.Text):
+                    return None
+                # Focused button: invoke it directly
+                if isinstance(w, (tk.Button, ttk.Button)):
+                    try:
+                        w.invoke()
+                        return 'break'
+                    except Exception:
+                        pass
+                # Only advance if we're currently on a Setup step (i.e. the
+                # Setup tab is selected). Otherwise leave default behavior.
+                if self.notebook.select() == str(self.setup_tab):
+                    self._setup_goto(self._setup_step + 1)
+                    return 'break'
+            except Exception:
+                pass
+            return None
+        try:
+            self.root.bind('<Return>', _enter_advances)
+            self.root.bind('<KP_Enter>', _enter_advances)
+        except Exception:
+            pass
+
     def _setup_goto(self, idx):
         if idx < 0 or idx >= len(self._setup_steps_meta):
             return
@@ -7169,10 +7213,11 @@ class CCTVToolkitApp:
         # Render body
         for w in self._setup_body.winfo_children():
             w.destroy()
+        # v5.0 b2 — Brand first per Brian's reorder
         renderer = [
+            self._setup_render_brand,
             self._setup_render_interface,
             self._setup_render_dhcp,
-            self._setup_render_brand,
             self._setup_render_camera_list,
             self._setup_render_operations,
             self._setup_render_status,
@@ -7250,31 +7295,68 @@ class CCTVToolkitApp:
         ttk.Label(body, text="What do you want to do with these cameras?",
                   font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
         ttk.Label(body,
-            text="The most common is Program New Cameras (the step-by-step wizard). The other operations target a camera list that's already programmed.",
-            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
-        ops = [
-            ("🟢 Program New Cameras (wizard)",
-             "Set password + IP + hostname on each camera from the list. Step-by-step UI shows live progress.",
-             getattr(self, 'start_program_wizard', None)),
-            ("🔄 Update / Change Settings",
-             "Push IP / hostname / DHCP-toggle changes to cameras already programmed.",
-             getattr(self, 'start_program_wizard_classic', None)),
-            ("📡 Test / Ping cameras",
-             "Verify all cameras in the list are reachable at their assigned IPs.",
-             getattr(self, 'ping_all_cameras', None)),
+            text="Pick the operation. Each one runs against the camera list you loaded in Step 4. Configure passwords first if you need to (top button).",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 10))
+
+        # v5.0 b2 — full ops grid wired to the REAL wizard methods. Each
+        # button now resolves to the proper handler (e.g. update_wizard
+        # not the classic programmer). Disabled state ONLY when the
+        # underlying method genuinely doesn't exist on the app.
+        ops_grouped = [
+            ('Prep', [
+                ("🔑  Users & Passwords",
+                 "Make sure your password list is loaded (and any extra user accounts are configured) before programming.",
+                 lambda: self.notebook.select(self.passwords_tab)),
+            ]),
+            ('Programming', [
+                ("🟢  Program New Cameras",
+                 "Full wizard: set password + IP + hostname on each camera. Confirms admin user, password, and 'extra users?' before starting.",
+                 getattr(self, 'start_program_wizard', None)),
+                ("🔄  Update / Change Settings",
+                 "Push IP / hostname / DHCP-toggle changes to cameras that are ALREADY programmed.",
+                 getattr(self, 'start_update_wizard', None)),
+                ("🔐  Change Password",
+                 "Rotate the root password on already-programmed cameras.",
+                 getattr(self, 'start_change_password_wizard', None)),
+            ]),
+            ('Verify', [
+                ("✅  Confirm Programming",
+                 "Walk the camera list, verify each is at its assigned IP with correct hostname / users / network config.",
+                 getattr(self, 'start_confirm_wizard', None)),
+                ("📡  Test / Ping",
+                 "Quick reachability check — ping every camera at its assigned IP.",
+                 getattr(self, 'start_ping_wizard', None)),
+                ("🧪  Batch Test",
+                 "Comprehensive deep-test of every camera (HTTP, ONVIF, image capture).",
+                 getattr(self, 'start_batch_test_wizard', None)),
+            ]),
+            ('Capture / Reset', [
+                ("📷  Grab Snapshots",
+                 "Capture and save a still image from each camera. Used for install documentation.",
+                 getattr(self, 'start_capture_wizard', None)),
+                ("⚠   Factory Default",
+                 "Wipe one or more cameras back to factory state.",
+                 getattr(self, 'start_factory_default_wizard', None)),
+            ]),
         ]
-        for label, desc, cmd in ops:
-            row = ttk.Frame(body)
-            row.pack(fill=tk.X, pady=4)
-            btn = tk.Button(row, text=label, anchor='w',
-                            font=('Helvetica', 11, 'bold'), bg='#E8F5E9', fg='#1B5E20',
-                            relief=tk.RAISED, padx=10, pady=8, cursor='hand2',
-                            command=cmd if cmd else (lambda: None))
-            btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            if not cmd:
-                btn.configure(state='disabled', bg='#EEE', fg='#999')
-            ttk.Label(row, text=desc, foreground='gray', font=('Helvetica', 9),
-                      wraplength=400, justify=tk.LEFT).pack(side=tk.LEFT, padx=(12, 0))
+        for group_name, group_ops in ops_grouped:
+            ttk.Label(body, text=group_name, font=('Helvetica', 10, 'bold'),
+                      foreground='#555').pack(anchor='w', pady=(10, 4))
+            for label, desc, cmd in group_ops:
+                row = ttk.Frame(body)
+                row.pack(fill=tk.X, pady=2)
+                enabled = bool(cmd)
+                bg = '#E8F5E9' if enabled else '#EEEEEE'
+                fg = '#1B5E20' if enabled else '#999999'
+                btn = tk.Button(row, text=label, anchor='w', width=28,
+                                font=('Helvetica', 10, 'bold'), bg=bg, fg=fg,
+                                relief=tk.RAISED, padx=10, pady=6, cursor='hand2',
+                                command=cmd if enabled else (lambda: None))
+                btn.pack(side=tk.LEFT)
+                if not enabled:
+                    btn.configure(state='disabled')
+                ttk.Label(row, text=desc, foreground='gray', font=('Helvetica', 9),
+                          wraplength=520, justify=tk.LEFT).pack(side=tk.LEFT, padx=(12, 0))
 
     def _setup_render_status(self, body):
         ttk.Label(body, text="Live programming progress",
