@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.6.0"
+APP_VERSION = "5.0.0"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -6895,10 +6895,67 @@ class CCTVToolkitApp:
                 parent=self.root)
     
     def create_main_ui(self):
-        # Session networking bar — interface + DHCP server (v4.3, top of window)
-        # Declares "all things on this NIC" up-front so every wizard inherits it.
+        # v5.0 — App header: thin top bar with version + Home + Tools menu.
+        # Replaces the v4.x session+brand bars (interface, DHCP, brand are
+        # now inside the linear Setup flow). Power-user / one-off screens
+        # (Users & Passwords, Discovered, Log, Find Anywhere) accessible
+        # via the Tools menu so they don't clutter the primary path.
+        header = tk.Frame(self.root, bg='#263238', height=42)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(header, text="  CCTV Toolkit", bg='#263238', fg='white',
+                 font=('Helvetica', 13, 'bold')).pack(side=tk.LEFT, padx=(8, 0), pady=8)
+        version_tag = f"v{APP_VERSION}"
+        is_beta = not re.match(r'^\d+\.\d+\.\d+$', APP_VERSION)
+        if is_beta:
+            version_tag += "  ⚠ BETA"
+        tk.Label(header, text=version_tag, bg='#263238', fg='#90A4AE',
+                 font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(8, 0), pady=8)
+
+        def _go_setup():
+            try: self.notebook.select(self.setup_tab)
+            except Exception: pass
+        tk.Button(header, text="🏠 Home", bg='#37474F', fg='white',
+                  font=('Helvetica', 9, 'bold'), relief=tk.FLAT, padx=12, cursor='hand2',
+                  command=_go_setup).pack(side=tk.RIGHT, padx=(0, 10), pady=6)
+
+        # Tools menubutton — secondary screens
+        tools_mb = tk.Menubutton(header, text='Tools ▾', bg='#37474F', fg='white',
+                                 font=('Helvetica', 9), relief=tk.FLAT, cursor='hand2', padx=10)
+        tools_menu = tk.Menu(tools_mb, tearoff=0)
+        tools_mb['menu'] = tools_menu
+        def _select_tab(t):
+            try: self.notebook.select(t)
+            except Exception: pass
+        tools_menu.add_command(label="📋 Camera List",
+                               command=lambda: _select_tab(self.cameras_tab))
+        tools_menu.add_command(label="📡 Discovered",
+                               command=lambda: _select_tab(self.discovered_tab))
+        tools_menu.add_command(label="🔑 Users & Passwords",
+                               command=lambda: _select_tab(self.passwords_tab))
+        tools_menu.add_command(label="⚡ Operations",
+                               command=lambda: _select_tab(self.operations_tab))
+        tools_menu.add_command(label="🟢 Programming Status",
+                               command=lambda: _select_tab(self.status_tab))
+        tools_menu.add_separator()
+        tools_menu.add_command(label="📊 Log & Results",
+                               command=lambda: _select_tab(self.log_tab))
+        tools_mb.pack(side=tk.RIGHT, padx=0, pady=6)
+
+        # Hide ttk.Notebook tab strip — the user never sees tabs in v5.0.
+        # Navigation is via the Setup stepper and the Home/Tools header.
+        try:
+            ttk.Style().layout('TNotebook.Tab', [])
+        except Exception:
+            pass
+
+        # The session bar and brand bar widgets are CREATED below for
+        # backwards-compat (other code may reference self.session_iface_var,
+        # self.brand_var, self.session_dhcp_status, etc.) but NOT packed —
+        # so they're invisible in v5.0. The Setup flow re-renders these
+        # controls inline within their respective steps.
         self.session_bar = ttk.Frame(self.root, padding=(10, 6, 10, 6))
-        self.session_bar.pack(fill=tk.X)
+        # NOTE: not packed in v5.0 (was: self.session_bar.pack(fill=tk.X))
         self.session_bar.configure(style='Session.TFrame')
         try:
             ttk.Style().configure('Session.TFrame', background='#ECEFF1')
@@ -6932,8 +6989,11 @@ class CCTVToolkitApp:
         self.session_dhcp_status.pack(side=tk.LEFT, padx=(10, 0))
 
         # Brand selection bar
+        # v5.0 — created for backwards-compat (brand_var, factory_ip_label
+        # are referenced elsewhere) but NOT packed. Setup Step 3 renders
+        # the brand picker inline.
         self.brand_bar = ttk.Frame(self.root)
-        self.brand_bar.pack(fill=tk.X, padx=10, pady=(5, 0))
+        # NOTE: not packed in v5.0 (was: self.brand_bar.pack(...))
 
         ttk.Label(self.brand_bar, text="BRAND:", font=('Helvetica', 10, 'bold')).pack(side=tk.LEFT)
 
@@ -6953,36 +7013,277 @@ class CCTVToolkitApp:
         # Main container with notebook (tabs)
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Tab 0: Camera List
+
+        # v5.0 — NEW DEFAULT TAB: linear guided Setup flow.
+        # Brian's UX rethink 2026-05-11: tabs invite the user to wander
+        # ("do I need Discovered? what's Passwords for?"). A real job is
+        # linear: pick interface → DHCP on/off → pick brand → load camera
+        # list → choose operation → watch programming status. The Setup tab
+        # lays that out as numbered steps so the operator follows the job
+        # instead of decoding the toolkit's information architecture.
+        # Other tabs remain accessible for power-user / one-off tasks.
+        self.setup_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.setup_tab, text="🚀 Setup")
+        self.create_setup_tab()
+
+        # Tab: Camera List
         self.cameras_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.cameras_tab, text="📋 Camera List")
         self.create_cameras_tab()
-        
-        # Tab 1: Discovered Cameras
+
+        # Tab: Discovered Cameras
         self.discovered_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.discovered_tab, text="📡 Discovered")
         self.create_discovered_tab()
-        
-        # Tab 2: Password List
+
+        # Tab: Users & Passwords (renamed from "Passwords" in v5.0 to reflect
+        # that this tab manages both the system-user accounts created during
+        # programming AND the saved password list used for auth attempts).
         self.passwords_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.passwords_tab, text="🔑 Passwords")
+        self.notebook.add(self.passwords_tab, text="🔑 Users & Passwords")
         self.create_passwords_tab()
-        
-        # Tab 3: Operations
+
+        # Tab: Operations
         self.operations_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.operations_tab, text="⚡ Operations")
         self.create_operations_tab()
-        
-        # Tab 4: Programming Status (live checklist for new wizard)
+
+        # Tab: Programming Status (live checklist for new wizard)
         self.status_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.status_tab, text="🟢 Programming Status")
         self.create_status_tab()
 
-        # Tab 5: Log/Results
+        # Tab: Log/Results
         self.log_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.log_tab, text="📊 Log & Results")
         self.create_log_tab()
+
+        # v5.0 — Setup is the default landing tab. The intent: new operators
+        # see the linear flow, not the tab grid.
+        self.notebook.select(self.setup_tab)
+
+    # ========================================================================
+    # v5.0 — Setup tab: linear guided flow
+    # ========================================================================
+    def create_setup_tab(self):
+        """Linear setup-then-go flow. Each step is one decision; Next moves on.
+        The underlying state (interface, DHCP, brand, camera list) is shared
+        with the rest of the app, so jumping to a 'classic' tab and back is
+        non-destructive. Steps:
+          1. Interface
+          2. DHCP server (on/off + config)
+          3. Camera brand
+          4. Camera list (paste / load)
+          5. Operations (what to do with these cameras)
+          6. Status (shows the live programming screen)
+        """
+        self._setup_step = 0
+        self._setup_steps_meta = [
+            ('1', 'Interface',     'Pick the programming NIC'),
+            ('2', 'DHCP server',   'Turn the bundled DHCP server on or off'),
+            ('3', 'Brand',         'Axis, Bosch, or Hanwha'),
+            ('4', 'Camera list',   'Paste or load the CSV of cameras to program'),
+            ('5', 'Operations',    'What to do with these cameras'),
+            ('6', 'Status',        'Live programming progress'),
+        ]
+
+        outer = ttk.Frame(self.setup_tab, padding=(15, 15, 15, 10))
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # ---- Stepper header ----
+        stepper = ttk.Frame(outer)
+        stepper.pack(fill=tk.X, pady=(0, 14))
+        self._setup_step_chips = []
+        for i, (num, title, _sub) in enumerate(self._setup_steps_meta):
+            chip = tk.Frame(stepper, bg='#E0E0E0', padx=12, pady=8, cursor='hand2')
+            chip.grid(row=0, column=i*2, sticky='nsew')
+            stepper.columnconfigure(i*2, weight=1)
+            num_lbl = tk.Label(chip, text=num, bg='#E0E0E0', fg='#666',
+                               font=('Helvetica', 14, 'bold'))
+            num_lbl.pack(side=tk.LEFT, padx=(0, 8))
+            title_lbl = tk.Label(chip, text=title, bg='#E0E0E0', fg='#333',
+                                 font=('Helvetica', 11))
+            title_lbl.pack(side=tk.LEFT)
+            for w in (chip, num_lbl, title_lbl):
+                w.bind('<Button-1>', lambda e, idx=i: self._setup_goto(idx))
+            self._setup_step_chips.append({'chip': chip, 'num': num_lbl, 'title': title_lbl})
+            # Separator arrow between chips (not after the last one)
+            if i < len(self._setup_steps_meta) - 1:
+                arrow = tk.Label(stepper, text='›', font=('Helvetica', 18, 'bold'),
+                                 fg='#999')
+                arrow.grid(row=0, column=i*2 + 1, padx=4)
+
+        # ---- Subtitle (current step description) ----
+        self._setup_subtitle = tk.Label(outer, text='',
+                                        font=('Helvetica', 10), fg='#666',
+                                        anchor='w', justify=tk.LEFT)
+        self._setup_subtitle.pack(fill=tk.X, pady=(0, 10))
+
+        # ---- Body (current step content fills here) ----
+        self._setup_body = ttk.Frame(outer)
+        self._setup_body.pack(fill=tk.BOTH, expand=True)
+
+        # ---- Nav row ----
+        nav = ttk.Frame(outer)
+        nav.pack(fill=tk.X, pady=(10, 0))
+        self._setup_back_btn = ttk.Button(nav, text='← Back', width=12,
+                                          command=lambda: self._setup_goto(self._setup_step - 1))
+        self._setup_back_btn.pack(side=tk.LEFT)
+        self._setup_next_btn = tk.Button(nav, text='Next →', width=18,
+                                         bg='#4CAF50', fg='white',
+                                         font=('Helvetica', 10, 'bold'),
+                                         relief=tk.RAISED, cursor='hand2',
+                                         command=lambda: self._setup_goto(self._setup_step + 1))
+        self._setup_next_btn.pack(side=tk.RIGHT)
+        self._setup_progress_lbl = ttk.Label(nav, text='',
+                                             font=('Helvetica', 9), foreground='gray')
+        self._setup_progress_lbl.pack(side=tk.RIGHT, padx=(0, 12))
+
+        self._setup_goto(0)
+
+    def _setup_goto(self, idx):
+        if idx < 0 or idx >= len(self._setup_steps_meta):
+            return
+        self._setup_step = idx
+        # Update stepper chip styling
+        for i, chip_set in enumerate(self._setup_step_chips):
+            if i == idx:
+                bg, fg = '#4CAF50', 'white'
+            elif i < idx:
+                bg, fg = '#A5D6A7', '#1B5E20'
+            else:
+                bg, fg = '#E0E0E0', '#666'
+            chip_set['chip'].configure(bg=bg)
+            chip_set['num'].configure(bg=bg, fg=fg)
+            chip_set['title'].configure(bg=bg, fg=fg)
+        # Subtitle
+        num, title, sub = self._setup_steps_meta[idx]
+        self._setup_subtitle.configure(text=f"Step {num} of {len(self._setup_steps_meta)} — {title}: {sub}")
+        self._setup_progress_lbl.configure(text=f"Step {num} of {len(self._setup_steps_meta)}")
+        # Nav state
+        self._setup_back_btn.configure(state='normal' if idx > 0 else 'disabled')
+        if idx == len(self._setup_steps_meta) - 1:
+            self._setup_next_btn.configure(state='disabled', text='— last step —')
+        else:
+            self._setup_next_btn.configure(state='normal', text='Next →')
+        # Render body
+        for w in self._setup_body.winfo_children():
+            w.destroy()
+        renderer = [
+            self._setup_render_interface,
+            self._setup_render_dhcp,
+            self._setup_render_brand,
+            self._setup_render_camera_list,
+            self._setup_render_operations,
+            self._setup_render_status,
+        ][idx]
+        renderer(self._setup_body)
+
+    def _setup_render_interface(self, body):
+        ttk.Label(body, text="Which network interface is the camera switch plugged into?",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body, text="This is the NIC the toolkit will talk to cameras on. Auto-detect picks the first usable one — fine for single-NIC laptops; pick explicitly for multi-NIC.",
+                  foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        ifaces = getattr(self, '_session_interfaces', None) or ProgramOptionsDialog._get_network_interfaces()
+        self._session_interfaces = ifaces
+        labels = ['Auto-detect'] + [i['label'] for i in ifaces]
+        row = ttk.Frame(body)
+        row.pack(anchor='w', pady=(4, 0))
+        ttk.Label(row, text="Interface:", font=('Helvetica', 10, 'bold')).pack(side=tk.LEFT)
+        cb = ttk.Combobox(row, textvariable=self.session_iface_var, values=labels,
+                          state='readonly', width=50, font=('Helvetica', 10))
+        cb.pack(side=tk.LEFT, padx=(10, 0))
+        cb.bind('<<ComboboxSelected>>', self._on_session_iface_change)
+
+    def _setup_render_dhcp(self, body):
+        ttk.Label(body, text="Run the bundled DHCP server?",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="Turn this ON when the programming switch has no DHCP server. The bundled server hands a single fixed lease IP (default 192.168.0.50) to whatever Axis-vendor camera plugs in. The toolkit's MAC filter ignores non-camera devices so a managed PoE switch on the segment can't steal the lease.",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        row = ttk.Frame(body)
+        row.pack(anchor='w', pady=(4, 0))
+        ttk.Checkbutton(row, text="Bundled DHCP server", variable=self.session_dhcp_var,
+                        command=self._on_session_dhcp_toggle).pack(side=tk.LEFT)
+        ttk.Button(row, text="Configure...", command=self.show_dhcp_config_dialog).pack(side=tk.LEFT, padx=(12, 0))
+
+    def _setup_render_brand(self, body):
+        ttk.Label(body, text="What brand of camera are you programming?",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="The toolkit talks the brand's native protocol. Axis = VAPIX + ONVIF. Bosch = RCP+. Hanwha = STW-CGI / Sunapi. The default IP and root username differ per brand.",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        brands = [
+            ('axis', 'Axis', 'VAPIX/ONVIF · factory 192.168.0.90 · user root'),
+            ('bosch', 'Bosch', 'RCP-over-HTTP · factory 192.168.0.1 · user service'),
+            ('hanwha', 'Hanwha / Wisenet', 'STW-CGI/Sunapi · factory 192.168.1.100 · user admin'),
+        ]
+        for key, name, desc in brands:
+            row = ttk.Frame(body)
+            row.pack(anchor='w', pady=4)
+            ttk.Radiobutton(row, text=name, variable=self.brand_var, value=key,
+                            command=self._on_brand_change).pack(side=tk.LEFT)
+            ttk.Label(row, text=desc, foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(12, 0))
+
+    def _setup_render_camera_list(self, body):
+        ttk.Label(body, text="Load the cameras you want to program",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="99% of jobs come with a CSV. Paste the contents into the Smart Import dialog, or open the Camera List tab to add entries manually.",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        btns = ttk.Frame(body)
+        btns.pack(anchor='w', pady=(4, 14))
+        if hasattr(self, 'show_smart_import_dialog'):
+            ttk.Button(btns, text="📋 Smart Import (paste CSV)…", width=32,
+                       command=self.show_smart_import_dialog).pack(side=tk.LEFT)
+        ttk.Button(btns, text="📂 Open Camera List tab", width=24,
+                   command=lambda: self.notebook.select(self.cameras_tab)).pack(side=tk.LEFT, padx=(10, 0))
+        # Live count
+        try:
+            count = len(self.camera_data.get_all())
+        except Exception:
+            count = 0
+        ttk.Label(body, text=f"Current camera list: {count} entries",
+                  font=('Helvetica', 10)).pack(anchor='w')
+
+    def _setup_render_operations(self, body):
+        ttk.Label(body, text="What do you want to do with these cameras?",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="The most common is Program New Cameras (the step-by-step wizard). The other operations target a camera list that's already programmed.",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        ops = [
+            ("🟢 Program New Cameras (wizard)",
+             "Set password + IP + hostname on each camera from the list. Step-by-step UI shows live progress.",
+             getattr(self, 'start_program_wizard', None)),
+            ("🔄 Update / Change Settings",
+             "Push IP / hostname / DHCP-toggle changes to cameras already programmed.",
+             getattr(self, 'start_program_wizard_classic', None)),
+            ("📡 Test / Ping cameras",
+             "Verify all cameras in the list are reachable at their assigned IPs.",
+             getattr(self, 'ping_all_cameras', None)),
+        ]
+        for label, desc, cmd in ops:
+            row = ttk.Frame(body)
+            row.pack(fill=tk.X, pady=4)
+            btn = tk.Button(row, text=label, anchor='w',
+                            font=('Helvetica', 11, 'bold'), bg='#E8F5E9', fg='#1B5E20',
+                            relief=tk.RAISED, padx=10, pady=8, cursor='hand2',
+                            command=cmd if cmd else (lambda: None))
+            btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if not cmd:
+                btn.configure(state='disabled', bg='#EEE', fg='#999')
+            ttk.Label(row, text=desc, foreground='gray', font=('Helvetica', 9),
+                      wraplength=400, justify=tk.LEFT).pack(side=tk.LEFT, padx=(12, 0))
+
+    def _setup_render_status(self, body):
+        ttk.Label(body, text="Live programming progress",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="The Programming Status tab shows the step-by-step checklist while a wizard run is active. Click below to jump there.",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        ttk.Button(body, text="🟢 Open Programming Status tab", width=36,
+                   command=lambda: self.notebook.select(self.status_tab)).pack(anchor='w')
 
     def _on_brand_change(self):
         """Handle brand radio button change."""
@@ -11817,6 +12118,16 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "5.0.0": (
+            "What's new in v5.0.0",
+            [
+                "• MAJOR UX REWRITE: tabs are gone. The toolkit now opens to a linear, numbered Setup flow that walks you through Interface → DHCP → Brand → Camera List → Operations → Status — one decision per screen, the way a real job actually unfolds. No more 'do I need Discovered? what's Passwords for?' wandering.",
+                "• The old session bar (interface + DHCP at the top) and the brand selector are now Setup Steps 1, 2, and 3 — inline where they belong instead of slapped on every screen.",
+                "• 'Passwords' is renamed 'Users & Passwords' to reflect that the tab manages both the system-user accounts created during programming AND the saved password list used for auth attempts.",
+                "• Power-user / one-off screens (Camera List editor, Discovered, Users & Passwords, Operations, Programming Status, Log & Results) are still there — reach them via the 'Tools ▾' menu in the top-right of the new header bar. Home button in the same header returns you to Setup any time.",
+                "• Everything from v4.6 carries forward: the FW-aware set_network path (90s → 5s on FW 10.x), bundled DHCP MAC filter, wizard re-entry guard, ONVIF user CreateUsers/DeleteUsers fixes, instant camera-found via bundled DHCP lease state, MAC editor in the camera list. Two cameras programmed end-to-end in under two minutes in the last v4.6 field test.",
+            ],
+        ),
         "4.6.0": (
             "What's new in v4.6.0",
             [
