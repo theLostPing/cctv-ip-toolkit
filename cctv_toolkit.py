@@ -5390,12 +5390,17 @@ class ProgramWizardDialog(tk.Toplevel):
         self.body = ttk.Frame(outer, padding=20)
         self.body.pack(fill=tk.BOTH, expand=True)
 
-        # Build all step frames (only shown one at a time)
+        # v5.0 b4 — reordered to fold the old pre-flight confirm dialog
+        # into the wizard itself (one wizard, not two). Step labels updated
+        # per Brian's UX rethink: Credentials replaces "Password," Factory
+        # Default becomes its own step (was a checkbox in old Extras),
+        # Extras is slimmed to hostname + building reports.
         self.steps = []
         self._build_step_welcome()
-        self._build_step_password()
+        self._build_step_credentials()   # was _build_step_password — now user+pwd+extras-yes/no
         self._build_step_discovery()
-        self._build_step_extras()
+        self._build_step_factory_default()  # NEW step
+        self._build_step_extras()        # slimmed
         self._build_step_review()
 
         # Nav bar
@@ -5469,26 +5474,62 @@ class ProgramWizardDialog(tk.Toplevel):
         ttk.Label(f, text=msg, justify=tk.LEFT, font=('Helvetica', 10)).pack(
             anchor='w', pady=(10, 0))
 
-    def _build_step_password(self):
-        f = self._new_step("Step 1 of 4 — Set Password",
-                           "This password will be set on every camera you program.")
-        ttk.Label(f, text="Password:", font=('Helvetica', 11, 'bold')).pack(
+    def _build_step_credentials(self):
+        # v5.0 b4 — Credentials step. Was just a password screen; now includes
+        # admin user, double-typed password, AND "extra users? Y/N" — the
+        # three high-stakes inputs the operator used to be asked in a
+        # separate pre-flight confirm dialog. Folded into the wizard so
+        # there's one wizard, not two.
+        f = self._new_step("Step 1 of 5 — Credentials & users",
+                           "Confirm the admin user, set the password, and decide on extra users.")
+
+        # Admin user
+        ttk.Label(f, text="Admin user:", font=('Helvetica', 11, 'bold')).pack(
             anchor='w', pady=(20, 4))
+        if not hasattr(self, 'admin_user_var'):
+            self.admin_user_var = tk.StringVar(value='root')
+        try:
+            # Default to the active brand's DEFAULT_USER (passed in via brand_name)
+            from_brand = {'Axis': 'root', 'Bosch': 'service', 'Hanwha / Wisenet': 'admin'}.get(self.brand_name, 'root')
+            self.admin_user_var.set(from_brand)
+        except Exception:
+            pass
+        user_entry = ttk.Entry(f, textvariable=self.admin_user_var, width=20, font=('Helvetica', 11))
+        user_entry.pack(anchor='w', ipady=4)
+        ttk.Label(f, text=f"Brand default: see Help. Override only if your install uses a non-default admin name.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(2, 0))
+
+        # Password
+        ttk.Label(f, text="Programming password:", font=('Helvetica', 11, 'bold')).pack(
+            anchor='w', pady=(16, 4))
         e1 = ttk.Entry(f, textvariable=self.password_var, show='•', width=40, font=('Helvetica', 11))
         e1.pack(anchor='w', ipady=4)
         self._pwd_entry = e1
 
         ttk.Label(f, text="Confirm password:", font=('Helvetica', 11, 'bold')).pack(
-            anchor='w', pady=(15, 4))
+            anchor='w', pady=(12, 4))
         e2 = ttk.Entry(f, textvariable=self.password_confirm_var, show='•', width=40, font=('Helvetica', 11))
         e2.pack(anchor='w', ipady=4)
 
-        ttk.Label(f,
-                  text="\nTip: Use a strong password — this is the camera's admin login.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(10, 0))
+        # Extra users yes/no — replaces the Step 3 checkbox from v4.x.
+        # Disabled if no additional users are defined (operator must add
+        # them in Users & Passwords before this checkbox does anything).
+        ttk.Label(f, text="Add extra users on every camera?", font=('Helvetica', 11, 'bold')).pack(
+            anchor='w', pady=(20, 4))
+        extras_row = ttk.Frame(f); extras_row.pack(anchor='w', pady=(0, 4))
+        if self.additional_users_count > 0:
+            ttk.Radiobutton(extras_row, text=f"Yes ({self.additional_users_count} configured)",
+                            variable=self.additional_users_var, value=True).pack(side=tk.LEFT, padx=(0, 12))
+            ttk.Radiobutton(extras_row, text="No",
+                            variable=self.additional_users_var, value=False).pack(side=tk.LEFT)
+        else:
+            ttk.Label(extras_row,
+                      text="(none configured — add them in Users & Passwords if you need them)",
+                      foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT)
+            self.additional_users_var.set(False)
 
     def _build_step_discovery(self):
-        f = self._new_step("Step 2 of 4 — How to find cameras",
+        f = self._new_step("Step 2 of 5 — How to find cameras",
                            "Pick how the toolkit should discover the camera when you plug it in.")
 
         # Interface is declared at the top of the main window (session-level).
@@ -5653,15 +5694,56 @@ class ProgramWizardDialog(tk.Toplevel):
         self.wait_window(dlg)
         return result['ok']
 
+    def _build_step_factory_default(self):
+        # v5.0 b4 — NEW step. Was a checkbox buried in the old Step 3 Extras.
+        # Promoted to its own step because it's a major decision (wipes the
+        # camera) and deserves the operator's attention. Y/N first, then the
+        # existing-password field only renders when Yes.
+        f = self._new_step("Step 3 of 5 — Factory default first?",
+                           "If your cameras are coming from a previous install, wipe them before programming.")
+        ttk.Label(f, text="Should the wizard factory-default each camera before programming it?",
+                  font=('Helvetica', 11, 'bold')).pack(anchor='w', pady=(20, 6))
+        ttk.Label(f,
+            text="If YES: the wizard will use the camera's existing root password to issue a factory_reset, wait for the camera to come back to factory state, THEN program it. Use this for cameras you're re-provisioning from a previous site (have an old password and old config).\n\nIf NO: the wizard assumes each camera is already factory-clean (brand-new out of the box, or you've already physically held the paperclip-reset button).",
+            foreground='gray', font=('Helvetica', 9), wraplength=820, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+
+        row = ttk.Frame(f); row.pack(anchor='w', pady=(0, 14))
+        ttk.Radiobutton(row, text="No — cameras are already factory-clean",
+                        variable=self.factory_first_var, value=False,
+                        command=self._update_factory_first_state).pack(anchor='w', pady=2)
+        ttk.Radiobutton(row, text="Yes — wipe them first using their existing password",
+                        variable=self.factory_first_var, value=True,
+                        command=self._update_factory_first_state).pack(anchor='w', pady=2)
+
+        # Existing-password field, only relevant when Yes
+        self._factory_first_pwd_row = ttk.Frame(f)
+        self._factory_first_pwd_row.pack(anchor='w', pady=(8, 0))
+        ttk.Label(self._factory_first_pwd_row, text="Existing root password:",
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        self._factory_first_pwd_entry = ttk.Entry(self._factory_first_pwd_row,
+                                                  textvariable=self.existing_root_pwd_var,
+                                                  show='*', width=24, font=('Helvetica', 10))
+        self._factory_first_pwd_entry.pack(side=tk.LEFT, padx=(8, 0))
+        self._update_factory_first_state()
+
+    def _update_factory_first_state(self):
+        """Show the existing-password field only when Yes is selected."""
+        try:
+            yes = bool(self.factory_first_var.get())
+            self._factory_first_pwd_entry.configure(state='normal' if yes else 'disabled')
+        except Exception:
+            pass
+
     def _build_step_extras(self):
-        # 2026-05-03 — Step 3 grew to ~6 options × 3-4 lines of help text each
-        # in the v4.3-pre work. Fixed-pixel sizing breaks on laptops + DPI
-        # scaling (Brian's beta-run on Windows 11 with display zoom clipped
-        # the bottom 2 checkboxes). Wrap the content in a scrollable Canvas
-        # so any window size handles all options. Mousewheel binding scoped
-        # to this canvas only — global bind would conflict with other tabs.
-        outer = self._new_step("Step 3 of 4 — Extras",
-                               "Optional things to do during programming.")
+        # v5.0 b4 — RADICALLY slimmed. Per Brian: "extras become: Building
+        # reports, hostname (with rewording), and I think ONVIF goes to the
+        # users tab." Auto multi-home is removed from the UI (handled
+        # automatically when a cross-subnet target is detected). Factory
+        # default got promoted to its own step. Additional users yes/no
+        # moved to the Credentials step. ONVIF user controls moved to the
+        # Users & Passwords tab. What's left:
+        outer = self._new_step("Step 4 of 5 — Extras",
+                               "Two optional polish items.")
         canvas = tk.Canvas(outer, highlightthickness=0)
         vbar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
         canvas.configure(yscrollcommand=vbar.set)
@@ -5682,35 +5764,18 @@ class ProgramWizardDialog(tk.Toplevel):
         canvas.bind('<Enter>', lambda e: canvas.bind_all('<MouseWheel>', _on_mw))
         canvas.bind('<Leave>', lambda e: canvas.unbind_all('<MouseWheel>'))
 
+        # Hostname (with reworded help per Brian's ask)
         ttk.Checkbutton(f, text="Set network hostname automatically",
                         variable=self.hostname_var).pack(anchor='w', pady=(20, 2))
-        ttk.Label(f, text="    Sets hostname to <number>-<brand>-<serial> on each camera.",
+        ttk.Label(f, text="    Sets hostname to <number>-<brand>-<serial> on each camera. Useful when\n"
+                          "    your network has hostname support (DNS-resolvable cameras) — your VMS\n"
+                          "    or switch admin can find cameras by name instead of IP. Leave off if\n"
+                          "    your install doesn't route hostnames.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
 
-        ttk.Checkbutton(f, text="Keep ONVIF user after programming (don't delete)",
-                        variable=self.keep_onvif_user_var).pack(anchor='w', pady=(15, 2))
-        ttk.Label(f, text="    Default: ONVIF user is deleted after set_network completes,\n"
-                          "    leaving VAPIX root only. Check this if your customer/VMS\n"
-                          "    requires the ONVIF user to remain.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        # ONVIF custom-creds row — only meaningful if Keep is checked
-        onvif_creds = ttk.Frame(f)
-        onvif_creds.pack(fill=tk.X, pady=(4, 2))
-        ttk.Label(onvif_creds, text="    Custom ONVIF user (optional):",
-                  font=('Helvetica', 9)).pack(side=tk.LEFT)
-        ttk.Entry(onvif_creds, textvariable=self.onvif_username_var, width=14).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Label(onvif_creds, text="Password:", font=('Helvetica', 9)).pack(side=tk.LEFT)
-        ttk.Entry(onvif_creds, textvariable=self.onvif_password_var, width=14).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(f, text="    Both filled → wizard deletes ONVIF root and creates this user "
-                          "after programming.\n"
-                          "    Empty → if Keep is checked, ONVIF root remains as-is. Ignored if "
-                          "Keep is unchecked.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        # Building Reports stickers (v4.3 #13)
+        # Building Reports stickers
         ttk.Checkbutton(f, text="Add Building Reports stickers (sequential 8-digit labels)",
-                        variable=self.add_br_stickers_var).pack(anchor='w', pady=(15, 2))
+                        variable=self.add_br_stickers_var).pack(anchor='w', pady=(20, 2))
         br_row = ttk.Frame(f)
         br_row.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(br_row, text="    First sticker number on roll:",
@@ -5721,52 +5786,11 @@ class ProgramWizardDialog(tk.Toplevel):
                           "    Peel stickers off the spool in order as cameras complete.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
 
-        # Auto NIC multi-home (v4.3 #11)
-        ttk.Checkbutton(f, text="Auto multi-home interface for this run (helps reach cameras on multiple subnets)",
-                        variable=self.auto_multihome_var,
-                        command=self._on_multihome_toggle).pack(anchor='w', pady=(15, 2))
-        ttk.Label(f, text="    REQUIRES a specific INTERFACE in the top bar of the main window —\n"
-                          "    Auto-detect WILL NOT WORK. The run will be aborted if you start it\n"
-                          "    with this on but no interface picked.",
-                  foreground='#B71C1C', font=('Helvetica', 9, 'bold')).pack(anchor='w')
-        ttk.Label(f, text="    Adds host IPs on the selected interface for every camera-list subnet,\n"
-                          "    so the toolkit can talk to cameras on different gateways without\n"
-                          "    manual netsh. Requires admin (toolkit will prompt). Cleanup runs\n"
-                          "    at wizard end + crash-recovery on next launch.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        # Factory-default-before-program (v4.3 — for re-using cameras from prior installs)
-        ttk.Checkbutton(f, text="Factory default before programming (for used cameras)",
-                        variable=self.factory_first_var).pack(anchor='w', pady=(15, 2))
-        fact_row = ttk.Frame(f)
-        fact_row.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(fact_row, text="    Existing root password:",
-                  font=('Helvetica', 9)).pack(side=tk.LEFT)
-        ttk.Entry(fact_row, textvariable=self.existing_root_pwd_var, show='*', width=20).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(f, text="    Wipes the camera (using the existing password) before applying\n"
-                          "    new programming. For cameras you're reprovisioning from a\n"
-                          "    previous site. Also gives you time to physically hold the\n"
-                          "    factory-reset button if needed — programming pauses for the wipe.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        if self.additional_users_count > 0:
-            label = f"Create additional user accounts ({self.additional_users_count} defined)"
-            state = 'normal'
-        else:
-            label = "Create additional user accounts (none defined)"
-            state = 'disabled'
-        cb = ttk.Checkbutton(f, text=label, variable=self.additional_users_var)
-        cb.pack(anchor='w', pady=(15, 2))
-        cb.configure(state=state)
-        ttk.Label(f,
-                  text="    Add users in the Passwords tab before programming if you need this.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        ttk.Label(f, text="\nNo extras needed? Just click  Next →",
+        ttk.Label(f, text="\nNothing needed here? Just click  Next →",
                   foreground='gray', font=('Helvetica', 10)).pack(anchor='w', pady=(20, 0))
 
     def _build_step_review(self):
-        f = self._new_step("Step 4 of 4 — Review",
+        f = self._new_step("Step 5 of 5 — Review",
                            "Last check before you start programming.")
         self._review_text = tk.Text(f, height=14, width=70, font=('Consolas', 10),
                                     relief=tk.SUNKEN, borderwidth=1, wrap=tk.WORD,
@@ -5780,19 +5804,29 @@ class ProgramWizardDialog(tk.Toplevel):
         mode_name = {'both': 'Both DHCP/mDNS + Factory IP',
                      'mdns': 'DHCP/mDNS only',
                      'factory': 'Factory IP only'}.get(mode, mode)
+        admin_user = getattr(self, 'admin_user_var', None)
+        admin_user_str = admin_user.get().strip() if admin_user else 'root'
         lines = [
             f"Brand                : {self.brand_name}",
             f"Cameras to program   : {self.camera_count}",
             "",
+            f"Admin user           : {admin_user_str}",
             f"Password             : {'•' * len(self.password_var.get())}",
+            f"Add extra users      : {'YES' if self.additional_users_var.get() else 'no'}",
+            "",
             f"Network interface    : {iface}",
             f"Discovery method     : {mode_name}",
         ]
         if mode != 'mdns':
             lines.append(f"Factory IP           : {self.factory_ip_var.get()}")
         lines.append("")
+        if self.factory_first_var.get():
+            lines.append(f"Factory default first: YES (existing pwd supplied)")
+        else:
+            lines.append(f"Factory default first: no")
+        lines.append("")
         lines.append(f"Set hostname         : {'YES' if self.hostname_var.get() else 'no'}")
-        lines.append(f"Add extra users      : {'YES' if self.additional_users_var.get() else 'no'}")
+        lines.append(f"Building Reports     : {'YES (start ' + self.br_first_label_var.get() + ')' if self.add_br_stickers_var.get() else 'no'}")
         lines.append("")
         lines.append("Click  Start Programming  to begin.")
         lines.append("You'll be prompted to plug in each camera one at a time.")
@@ -5834,7 +5868,11 @@ class ProgramWizardDialog(tk.Toplevel):
     def go_next(self):
         # Validate current step
         idx = self.current_step
-        if idx == 1:  # password
+        if idx == 1:  # credentials (admin user + password + extras)
+            user = self.admin_user_var.get().strip() if hasattr(self, 'admin_user_var') else ''
+            if not user:
+                messagebox.showwarning("Required", "Admin user is required.", parent=self)
+                return
             pwd = self.password_var.get()
             if not pwd:
                 messagebox.showwarning("Required", "Password is required.", parent=self)
@@ -5847,6 +5885,13 @@ class ProgramWizardDialog(tk.Toplevel):
             if mode != 'mdns' and not self.factory_ip_var.get().strip():
                 messagebox.showwarning("Required",
                                        "Factory IP is required for this mode.", parent=self)
+                return
+        elif idx == 3:  # factory-default first
+            if self.factory_first_var.get() and not self.existing_root_pwd_var.get():
+                messagebox.showwarning(
+                    "Required",
+                    "Existing root password is required to factory-default a used camera.",
+                    parent=self)
                 return
 
         if idx == len(self.steps) - 1:
@@ -5894,7 +5939,14 @@ class ProgramWizardDialog(tk.Toplevel):
                     selected_iface = iface
                     break
         mode = self.discovery_var.get()
+        admin_user = self.admin_user_var.get().strip() if hasattr(self, 'admin_user_var') else ''
+        if admin_user:
+            try:
+                self.protocol.DEFAULT_USER = admin_user
+            except Exception:
+                pass
         self.result = {
+            'admin_user': admin_user,
             'password': self.password_var.get(),
             'factory_ip': self.factory_ip_var.get().strip() if mode != 'mdns' else None,
             'discovery_mode': mode,
@@ -7310,8 +7362,8 @@ class CCTVToolkitApp:
             ]),
             ('Programming', [
                 ("🟢  Program New Cameras",
-                 "Confirms admin user + password + extra users, then runs the step-by-step programming wizard against your camera list.",
-                 getattr(self, 'start_program_wizard_with_confirm', None) or getattr(self, 'start_program_wizard', None)),
+                 "Step-by-step programming wizard with admin/password confirm, optional factory-default-first, and review screen.",
+                 getattr(self, 'start_program_wizard', None)),
                 ("🔄  Update / Change Settings",
                  "Push IP / hostname / DHCP-toggle changes to cameras that are ALREADY programmed.",
                  getattr(self, 'start_update_wizard', None)),
@@ -8347,13 +8399,20 @@ class CCTVToolkitApp:
 
         ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=8)
         
-        # Common defaults
-        ttk.Label(right_frame, text="Common defaults:", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W)
+        # Common defaults — v5.0 b4: was a vertical stack of 7 buttons that ran
+        # off the bottom of the visible area; brought into a 2-column grid so
+        # everything fits without clipping the Additional Users panel below.
+        ttk.Label(right_frame, text="Common defaults:", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W, pady=(0, 4))
+        defaults_grid = ttk.Frame(right_frame)
+        defaults_grid.pack(fill=tk.X, pady=(0, 4))
         common = ["pass", "admin", "root", "password", "123456", "camera", "axis"]
-        for pwd in common:
-            btn = ttk.Button(right_frame, text=f"Add '{pwd}'", 
-                           command=lambda p=pwd: self.add_password_quick(p))
-            btn.pack(anchor=tk.W, pady=2)
+        for i, pwd in enumerate(common):
+            r, c = divmod(i, 2)
+            btn = ttk.Button(defaults_grid, text=f"+ '{pwd}'",
+                             command=lambda p=pwd: self.add_password_quick(p))
+            btn.grid(row=r, column=c, padx=2, pady=2, sticky='ew')
+        defaults_grid.columnconfigure(0, weight=1)
+        defaults_grid.columnconfigure(1, weight=1)
         
         # Status
         self.password_status = tk.StringVar(value="0 passwords")
@@ -13510,6 +13569,14 @@ https://buymeacoffee.com/thelostping""")
     # NEW PROGRAMMING FLOW (step-by-step wizard + live status view)
     # ========================================================================
     def start_program_wizard_with_confirm(self):
+        """v5.0 b4 — folded into the main wizard. The pre-flight confirm
+        is now Step 2 (Credentials) of the programming wizard itself, so
+        operators see one flow instead of two. Kept as a thin shim that
+        forwards to start_program_wizard for any older bindings."""
+        self.start_program_wizard()
+        return
+
+    def _start_program_wizard_with_confirm_DEPRECATED(self):
         """v5.0 b3 — pre-flight confirm dialog before launching the
         step-by-step programming wizard. Brian's ask: 'Program new cameras
         should confirm the admin user, then the confirmed programming
