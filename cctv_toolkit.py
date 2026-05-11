@@ -5456,7 +5456,7 @@ class ProgramWizardDialog(tk.Toplevel):
         return f
 
     def _build_step_welcome(self):
-        f = self._new_step("Welcome",
+        f = self._new_step("Step 1 of 6 — Welcome",
                            f"You're about to program {self.camera_count} {self.brand_name} camera(s).")
         msg = (
             "This wizard walks you through programming brand-new cameras one at a time.\n\n"
@@ -5480,7 +5480,7 @@ class ProgramWizardDialog(tk.Toplevel):
         # three high-stakes inputs the operator used to be asked in a
         # separate pre-flight confirm dialog. Folded into the wizard so
         # there's one wizard, not two.
-        f = self._new_step("Step 1 of 5 — Credentials & users",
+        f = self._new_step("Step 2 of 6 — Credentials & users",
                            "Confirm the admin user, set the password, and decide on extra users.")
 
         # Admin user
@@ -5529,7 +5529,7 @@ class ProgramWizardDialog(tk.Toplevel):
             self.additional_users_var.set(False)
 
     def _build_step_discovery(self):
-        f = self._new_step("Step 2 of 5 — How to find cameras",
+        f = self._new_step("Step 3 of 6 — How to find cameras",
                            "Pick how the toolkit should discover the camera when you plug it in.")
 
         # Interface is declared at the top of the main window (session-level).
@@ -5699,7 +5699,7 @@ class ProgramWizardDialog(tk.Toplevel):
         # Promoted to its own step because it's a major decision (wipes the
         # camera) and deserves the operator's attention. Y/N first, then the
         # existing-password field only renders when Yes.
-        f = self._new_step("Step 3 of 5 — Factory default first?",
+        f = self._new_step("Step 4 of 6 — Factory default first?",
                            "If your cameras are coming from a previous install, wipe them before programming.")
         ttk.Label(f, text="Should the wizard factory-default each camera before programming it?",
                   font=('Helvetica', 11, 'bold')).pack(anchor='w', pady=(20, 6))
@@ -5742,7 +5742,7 @@ class ProgramWizardDialog(tk.Toplevel):
         # default got promoted to its own step. Additional users yes/no
         # moved to the Credentials step. ONVIF user controls moved to the
         # Users & Passwords tab. What's left:
-        outer = self._new_step("Step 4 of 5 — Extras",
+        outer = self._new_step("Step 5 of 6 — Extras",
                                "Two optional polish items.")
         canvas = tk.Canvas(outer, highlightthickness=0)
         vbar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
@@ -5790,7 +5790,7 @@ class ProgramWizardDialog(tk.Toplevel):
                   foreground='gray', font=('Helvetica', 10)).pack(anchor='w', pady=(20, 0))
 
     def _build_step_review(self):
-        f = self._new_step("Step 5 of 5 — Review",
+        f = self._new_step("Step 6 of 6 — Review",
                            "Last check before you start programming.")
         self._review_text = tk.Text(f, height=14, width=70, font=('Consolas', 10),
                                     relief=tk.SUNKEN, borderwidth=1, wrap=tk.WORD,
@@ -5847,14 +5847,9 @@ class ProgramWizardDialog(tk.Toplevel):
         step['frame'].pack(fill=tk.BOTH, expand=True)
         self.header_title.config(text=step['title'])
         self.header_subtitle.config(text=step['subtitle'])
-        # v5.0 b6 — count Welcome as "Welcome" not "Step 1 of 6". Real numbered
-        # steps start at 1 from the SECOND screen onwards so the top-banner
-        # label matches the "Step X of 5" wording in each step's title.
-        total_real = max(len(self.steps) - 1, 1)
-        if idx == 0:
-            self.step_label.config(text="Welcome")
-        else:
-            self.step_label.config(text=f"Step {idx} of {total_real}")
+        # v5.0 b7 — Welcome counts as Step 1, so all 6 screens are numbered
+        # 1..6 of 6 in both the top banner AND each step's own title text.
+        self.step_label.config(text=f"Step {idx + 1} of {len(self.steps)}")
         self.back_btn.config(state='normal' if idx > 0 else 'disabled')
         if idx == len(self.steps) - 1:
             self.next_btn.config(text='✓ Start Programming')
