@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "4.5.3"
+APP_VERSION = "5.0.0"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -1802,23 +1802,82 @@ class AxisProtocol(CameraProtocol):
         # SOAP. After programming, the wizard calls delete_onvif_user(static_ip)
         # to remove it (unless the operator opted to keep it). Net effect:
         # camera ends with VAPIX root only, no leftover ONVIF account.
+        # v4.6.0b5 — proper logging + settling delay + retry. Was: bare except
+        # silently swallowed every error, leaving FW 10.x cameras with no
+        # ONVIF user (live verified: GetUsers returned empty body on a
+        # toolkit-programmed FW 10.12.240). VMS clients (Milestone, Genetec)
+        # using ONVIF auth would then fail to connect. Live test with the
+        # same SOAP payload + 45s timeout against the same camera, but a few
+        # minutes after programming, completed in 106ms. Conclusion: the
+        # ONVIF auth state on the camera hadn't propagated the just-created
+        # VAPIX root password by the time CreateUsers fired immediately
+        # after pwdgrp.cgi action=add. Fix: small settling delay + retry on
+        # auth-related failures, with proper diagnostic logging instead of
+        # silent swallow.
+        cb = getattr(self, 'log_callback', None)
+        def _diag(msg):
+            if callable(cb):
+                try: cb(f"      [create_initial_user] {msg}")
+                except Exception: pass
+        # Settle: give the ONVIF service a beat to pick up the new VAPIX
+        # auth state. Empirical: 2s avoids the 401 race on FW 10.x.
         try:
-            soap = (f'<?xml version="1.0"?>'
-                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
-                    f'<CreateUsers xmlns="http://www.onvif.org/ver10/device/wsdl" '
-                    f'xmlns:tt="http://www.onvif.org/ver10/schema">'
-                    f'<User><tt:Username>root</tt:Username>'
-                    f'<tt:Password>{password}</tt:Password>'
-                    f'<tt:UserLevel>Administrator</tt:UserLevel>'
-                    f'</User></CreateUsers></Body></Envelope>')
-            requests.post(f"http://{ip}/vapix/services", data=soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-        except:
-            # Don't fail the whole programming step if this one barfs — older
-            # firmware (pre 6.50) sometimes 500s on this call but the user
-            # still ends up created. Web UI confirms it. Just move on.
+            time.sleep(2)
+        except Exception:
             pass
+        soap = (f'<?xml version="1.0"?>'
+                f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                f'<CreateUsers xmlns="http://www.onvif.org/ver10/device/wsdl" '
+                f'xmlns:tt="http://www.onvif.org/ver10/schema">'
+                f'<User><tt:Username>root</tt:Username>'
+                f'<tt:Password>{password}</tt:Password>'
+                f'<tt:UserLevel>Administrator</tt:UserLevel>'
+                f'</User></CreateUsers></Body></Envelope>')
+        for attempt in range(3):
+            try:
+                r = requests.post(f"http://{ip}/vapix/services", data=soap,
+                    headers={"Content-Type": "application/soap+xml"},
+                    auth=HTTPDigestAuth("root", password), timeout=15)
+                # Success body: <CreateUsersResponse/> (empty self-closing).
+                # Already-exists: SOAP fault with 'UsernameClash'/'username already exists'.
+                body = (r.text or '')
+                if r.status_code in (200, 204):
+                    if 'CreateUsersResponse' in body and 'Fault' not in body:
+                        _diag(f"ONVIF CreateUsers root → success (attempt {attempt+1})")
+                        return True
+                    if 'UsernameClash' in body or 'already exist' in body.lower():
+                        _diag(f"ONVIF CreateUsers root → already exists (attempt {attempt+1}) — fine")
+                        return True
+                    # 200 with unexpected body — log it and treat as success
+                    # since the user might have been created anyway
+                    _diag(f"ONVIF CreateUsers root → status=200 unexpected body[:200]={body[:200]!r}")
+                    return True
+                if r.status_code == 401 and attempt < 2:
+                    _diag(f"ONVIF CreateUsers root → 401 on attempt {attempt+1}, retrying in 3s (auth state may still be propagating)")
+                    try:
+                        time.sleep(3)
+                    except Exception:
+                        pass
+                    continue
+                _diag(f"ONVIF CreateUsers root → status={r.status_code} body[:200]={body[:200]!r}")
+                # Non-fatal: VAPIX user already created above, programming proceeds.
+                # ONVIF clients won't auth until this is rerun or the user is
+                # added some other way.
+                return True
+            except (requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                if attempt < 2:
+                    _diag(f"ONVIF CreateUsers root → {type(e).__name__} on attempt {attempt+1}, retrying in 3s")
+                    try:
+                        time.sleep(3)
+                    except Exception:
+                        pass
+                    continue
+                _diag(f"ONVIF CreateUsers root → exhausted retries: {type(e).__name__}: {e}")
+                return True  # don't fail the whole step
+            except Exception as e:
+                _diag(f"ONVIF CreateUsers root → unexpected: {type(e).__name__}: {e}")
+                return True  # don't fail the whole step
         return True
 
     def add_onvif_user(self, ip, password, new_username, new_password, level='Operator'):
@@ -1913,55 +1972,157 @@ class AxisProtocol(CameraProtocol):
         """v4.3 #10 — security cleanup after programming completes. The ONVIF
         user that create_initial_user added is a transient TOOL needed for
         set_network's ONVIF SOAP call; once set_network is done it's just a
-        leftover account. Delete via ONVIF DeleteUsers SOAP. Idempotent —
-        if the user is already gone, returns True (no-op).
-        Returns True on success or already-absent, False on a real failure
-        (auth fail, network unreachable, SOAP fault). Non-fatal at the wizard
-        level — wizard logs a warning if False but keeps going.
-        v4.5.1: 3 attempts with 4s back-off — same pattern as set_network.
-        FW 10.x cameras frequently 401 the first DeleteUsers right after the
-        IP swap because they're still reconfiguring auth state. The retry
-        catches the case where it succeeds on the second or third try."""
-        soap = (f'<?xml version="1.0"?>'
-                f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
-                f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
-                f'<Username>{username}</Username>'
-                f'</DeleteUsers></Body></Envelope>')
-        last_status = None
+        leftover account. Delete via ONVIF DeleteUsers SOAP.
+
+        v4.6.0b4: pre-flight GetUsers first. On FW 10.x the CreateUsers call
+        in create_initial_user fails silently (bare except) because the
+        ONVIF service is finicky there — so the camera has no ONVIF user in
+        the first place, and the previous "delete failed → leftover account"
+        warning was a false alarm (there was nothing to leave behind). Now
+        we check the user table first and only attempt the delete if the
+        target user actually exists. Returns:
+          True  -> no user present (nothing to delete) OR delete succeeded
+          False -> user exists and delete genuinely failed
+        Non-fatal at the wizard level either way."""
+        # Pre-flight: does the user actually exist?
+        get_soap = ('<?xml version="1.0"?>'
+                    '<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                    '<GetUsers xmlns="http://www.onvif.org/ver10/device/wsdl"/>'
+                    '</Body></Envelope>')
+        try:
+            r_get = requests.post(f"http://{ip}/vapix/services", data=get_soap,
+                headers={"Content-Type": "application/soap+xml"},
+                auth=HTTPDigestAuth("root", password), timeout=10)
+            if r_get.status_code == 200:
+                body = r_get.text or ''
+                # User present iff the response contains a <tt:Username>NAME</tt:Username>
+                # for our target. An empty <GetUsersResponse/> means no ONVIF users.
+                if f'<tt:Username>{username}</tt:Username>' not in body:
+                    cb = getattr(self, 'log_callback', None)
+                    if callable(cb):
+                        try:
+                            cb(f"      [delete_onvif_user] no ONVIF '{username}' present — nothing to delete (CreateUsers likely silently failed during programming, common on FW 10.x).")
+                        except Exception:
+                            pass
+                    return True
+        except Exception:
+            # GetUsers itself failed; fall through to attempting the delete.
+            # Better to try than skip and report a false-positive "kept user".
+            pass
+
+        # User does exist (or GetUsers itself failed) — attempt the delete.
+        # v4.6.0b6 — settling delay before the SOAP write, same fix pattern
+        # that made CreateUsers stop silently failing in b5. The camera just
+        # swapped IPs in set_network; ONVIF auth state propagation lags the
+        # IP change, so an immediate DeleteUsers hits 401 retries that each
+        # eat the 30s timeout (~80s sit on '⚠ ONVIF user delete failed' that
+        # Brian flagged in the b5 test run).
+        try:
+            time.sleep(2)
+        except Exception:
+            pass
+        cb = getattr(self, 'log_callback', None)
+        def _diag(msg):
+            if callable(cb):
+                try: cb(f"      [delete_onvif_user] {msg}")
+                except Exception: pass
+        del_soap = (f'<?xml version="1.0"?>'
+                    f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                    f'<DeleteUsers xmlns="http://www.onvif.org/ver10/device/wsdl">'
+                    f'<Username>{username}</Username>'
+                    f'</DeleteUsers></Body></Envelope>')
         for attempt in range(3):
             try:
-                r = requests.post(f"http://{ip}/vapix/services", data=soap,
+                r = requests.post(f"http://{ip}/vapix/services", data=del_soap,
                     headers={"Content-Type": "application/soap+xml"},
-                    auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
-                last_status = r.status_code
+                    auth=HTTPDigestAuth("root", password), timeout=30)
                 if r.status_code in (200, 204):
+                    _diag(f"DeleteUsers '{username}' → success (attempt {attempt+1})")
                     return True
                 # 4xx with "user not found" SOAP fault = already deleted; treat as ok
                 if 'NoSuchUser' in r.text or 'not found' in r.text.lower():
+                    _diag(f"DeleteUsers '{username}' → already absent (attempt {attempt+1})")
                     return True
-                # Transient 401 / 500 / 503 — retry
+                # Transient 401 / 500 / 503 — retry with auth-propagation back-off
                 if r.status_code in (401, 500, 503) and attempt < 2:
-                    time.sleep(4)
+                    _diag(f"DeleteUsers '{username}' → {r.status_code} (attempt {attempt+1}), retrying in 3s")
+                    time.sleep(3)
                     continue
+                _diag(f"DeleteUsers '{username}' → status={r.status_code} body[:200]={(r.text or '')[:200]!r}")
                 return False
             except (requests.exceptions.ReadTimeout,
-                    requests.exceptions.ConnectionError):
+                    requests.exceptions.ConnectionError) as e:
                 if attempt < 2:
-                    time.sleep(4)
+                    _diag(f"DeleteUsers '{username}' → {type(e).__name__} (attempt {attempt+1}), retrying in 3s")
+                    time.sleep(3)
                     continue
+                _diag(f"DeleteUsers '{username}' → exhausted retries: {type(e).__name__}: {e}")
                 return False
-            except Exception:
+            except Exception as e:
+                _diag(f"DeleteUsers '{username}' → unexpected: {type(e).__name__}: {e}")
                 return False
         return False
 
-    def set_network(self, ip, password, new_ip, subnet, gateway):
-        # Two paths: ONVIF SOAP first because it's atomic — gateway/IP/DHCP
-        # all flip together so the camera doesn't end up in a half-configured
-        # state if the connection drops. VAPIX param.cgi is the fallback for
-        # older firmware (anything before like 7.10 or so) where the ONVIF
-        # SetNetworkInterfaces call returns a Fault.
+    def _probe_firmware_quick(self, ip, timeout=2):
+        """Cheap no-auth firmware probe via basicdeviceinfo.cgi. Returns the
+        Version string (e.g. '10.12.240' or '12.10.68') or '' on failure.
+        Used by set_network when the caller didn't supply firmware so we can
+        choose the right path-ordering without an extra DHCP-roundtrip's worth
+        of latency.
+
+        Axis OS 10.x and 11.x both respond no-auth to this endpoint with the
+        unrestricted properties; OS 12 also responds. ~50ms on a healthy LAN."""
+        try:
+            r = requests.post(
+                f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
+                json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
+                timeout=timeout)
+            if r.status_code == 200:
+                data = r.json()
+                return ((data.get('data') or {}).get('propertyList') or {}).get('Version', '') or ''
+        except Exception:
+            pass
+        return ''
+
+    def set_network(self, ip, password, new_ip, subnet, gateway, firmware=None):
+        # Two paths: ONVIF SOAP and VAPIX param.cgi. Which goes first depends
+        # on firmware (v4.6.0 — the big perf win):
+        #
+        # FW 12.0+ : ONVIF SOAP is FAST (~1s commit). It's atomic — gateway/
+        #   IP/DHCP flip together so the camera can't end up half-configured
+        #   if the connection drops mid-write. Original design choice.
+        # FW < 12  : ONVIF SetNetworkDefaultGateway takes 60-90 seconds to
+        #   commit on FW 10.12.x (camera ACKs the request, holds the TCP
+        #   connection open, eventually responds 200/500 a minute later).
+        #   The toolkit's 15s read timeout × 3 retries fires before the
+        #   camera finishes, and the retries stack up behind the in-flight
+        #   write (each one takes a full 60s to drain). Browser/web-UI is
+        #   fast on the same camera because the web UI uses VAPIX
+        #   /axis-cgi/network_settings.cgi, NOT ONVIF SOAP — different
+        #   handler, different commit pipeline, ~5s end-to-end.
+        #   So on FW < 12 we skip ONVIF entirely and use VAPIX first.
+        #   Trade-off: VAPIX is 4 separate param.cgi calls (DHCP=no, gateway,
+        #   subnet, IP) — if the link drops between calls the camera ends
+        #   up in a partial state. On FW 10.x that's a fair price for going
+        #   from ~90s to ~5s per camera.
         auth = HTTPDigestAuth("root", password)
         cidr = sum(bin(int(x)).count('1') for x in subnet.split('.')) if subnet else 24
+
+        # Resolve firmware version. If caller passed it (wizard already knows
+        # it from probe_unrestricted), use that. Otherwise probe quickly via
+        # the no-auth basicdeviceinfo endpoint so we don't blow away the
+        # speed advantage we're trying to gain.
+        prefer_vapix = False
+        fw_resolved = ''  # what we actually decided based on (caller's value or our probe)
+        try:
+            fw_resolved = firmware or self._probe_firmware_quick(ip)
+            if fw_resolved:
+                # Match a leading major.minor — anything < 12 prefers VAPIX
+                m = re.match(r'^(\d+)', str(fw_resolved))
+                if m and int(m.group(1)) < 12:
+                    prefer_vapix = True
+        except Exception:
+            prefer_vapix = False  # safe default: try ONVIF first (current behavior)
 
         # v4.4.8-beta6 — diagnostic capture. Each leg appends one line; on
         # overall failure the wizard logger gets the full breakdown so we can
@@ -1977,17 +2138,14 @@ class AxisProtocol(CameraProtocol):
 
         _diag(f"target ip={new_ip}/{cidr} gw={gateway} via current_ip={ip} as user=root")
 
-        # v4.5.1-beta2 — settling delay. P3267-LV / FW 10.12.240 returns 503
-        # with empty body and ONVIF ReadTimeout for ~5s after fresh user
-        # creation. Brian 2026-05-05 KBO-012: 1s between admin user created
-        # and set_network → 503 storm. Give the camera time to flush its
-        # config service before hammering it with network changes.
-        # v4.5.3: cancellable so a click on Cancel exits within ~100ms.
-        try:
-            self._cancellable_sleep(5)
-        except ProtocolCancelled:
-            _diag("cancelled during settling delay")
-            return False
+        # v4.6.0b7 — settling delay DROPPED. The 5s blind sleep used to be
+        # needed because FW 10.12.240 returned 503 with empty body for ~5s
+        # after fresh user creation, and the toolkit had no retry handling.
+        # b6 added 503-busy retry on the VAPIX atomic update + on _retry()
+        # for ONVIF SOAP, so a first-attempt 503 is now handled gracefully.
+        # The 5s blind sleep was duplicate insurance — drop it, let the retry
+        # logic do the work. Save: ~5s per camera. (Cancel still responsive
+        # because the retry sleeps are cancellable.)
 
         # v4.5.1-beta2 — retry helper. Transient 503 / ReadTimeout /
         # ConnectionError on the network-config endpoints means the camera
@@ -2040,108 +2198,180 @@ class AxisProtocol(CameraProtocol):
                 raise last_exc
             return None
 
-        # --- ONVIF path ---
-        onvif_ok = False
-        # Gateway has to go in its own SOAP call. Tried merging it into the
-        # SetNetworkInterfaces envelope once — Axis silently ignored it. This
-        # is the supported pattern in the ONVIF Network Configuration spec.
-        gw_soap = (f'<?xml version="1.0"?>'
-                   f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
-                   f'<SetNetworkDefaultGateway xmlns="http://www.onvif.org/ver10/device/wsdl">'
-                   f'<IPv4Address>{gateway}</IPv4Address>'
-                   f'</SetNetworkDefaultGateway></Body></Envelope>')
-        try:
-            r_gw = _retry(requests.post,
-                f"http://{ip}/vapix/services", data=gw_soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=auth, timeout=15)  # bumped from TIMEOUT (5s) — SetNetworkDefaultGateway can sit on the camera 5-10s before responding
-            snippet = (r_gw.text or '')[:240].replace('\n', ' ').replace('\r', '')
-            _diag(f"ONVIF SetNetworkDefaultGateway → status={r_gw.status_code} body[:240]={snippet}")
-        except ProtocolCancelled:
-            raise  # let cancel propagate — don't fall through to next leg
-        except Exception as e:
-            _diag(f"ONVIF SetNetworkDefaultGateway → exception: {type(e).__name__}: {e}")
-            # gw failure isn't fatal — IP can still be set, we'll just retry gw
+        # --- ONVIF SOAP path (extracted into closure for v4.6 path-ordering) ---
+        def _try_onvif():
+            onvif_ok = False
+            # Gateway has to go in its own SOAP call. Tried merging it into the
+            # SetNetworkInterfaces envelope once — Axis silently ignored it. This
+            # is the supported pattern in the ONVIF Network Configuration spec.
+            gw_soap = (f'<?xml version="1.0"?>'
+                       f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope"><Header/><Body>'
+                       f'<SetNetworkDefaultGateway xmlns="http://www.onvif.org/ver10/device/wsdl">'
+                       f'<IPv4Address>{gateway}</IPv4Address>'
+                       f'</SetNetworkDefaultGateway></Body></Envelope>')
+            try:
+                r_gw = _retry(requests.post,
+                    f"http://{ip}/vapix/services", data=gw_soap,
+                    headers={"Content-Type": "application/soap+xml"},
+                    auth=auth, timeout=15)
+                snippet = (r_gw.text or '')[:240].replace('\n', ' ').replace('\r', '')
+                _diag(f"ONVIF SetNetworkDefaultGateway → status={r_gw.status_code} body[:240]={snippet}")
+            except ProtocolCancelled:
+                raise
+            except Exception as e:
+                _diag(f"ONVIF SetNetworkDefaultGateway → exception: {type(e).__name__}: {e}")
 
-        # Now the static IP + DHCP off in one shot. PrefixLength is CIDR notation
-        # (the /24 in 192.168.1.0/24), Axis expects an integer here.
-        ip_soap = (f'<?xml version="1.0"?>'
-                   f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope" '
-                   f'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
-                   f'xmlns:tt="http://www.onvif.org/ver10/schema"><Header/><Body>'
-                   f'<tds:SetNetworkInterfaces>'
-                   f'<tds:InterfaceToken>eth0</tds:InterfaceToken>'
-                   f'<tds:NetworkInterface><tt:Enabled>true</tt:Enabled>'
-                   f'<tt:IPv4><tt:Enabled>true</tt:Enabled>'
-                   f'<tt:Manual><tt:Address>{new_ip}</tt:Address>'
-                   f'<tt:PrefixLength>{cidr}</tt:PrefixLength></tt:Manual>'
-                   f'<tt:DHCP>false</tt:DHCP></tt:IPv4></tds:NetworkInterface>'
-                   f'</tds:SetNetworkInterfaces></Body></Envelope>')
-        try:
-            r = _retry(requests.post,
-                f"http://{ip}/vapix/services", data=ip_soap,
-                headers={"Content-Type": "application/soap+xml"},
-                auth=auth, timeout=15)  # SetNetworkInterfaces is the slow one
-            snippet = (r.text or '')[:240].replace('\n', ' ').replace('\r', '')
-            has_fault = 'Fault' in (r.text or '')
-            _diag(f"ONVIF SetNetworkInterfaces → status={r.status_code} fault_in_body={has_fault} body[:240]={snippet}")
-            # Axis returns 200 even on a failed config change, so the body has
-            # to be checked for <Fault>. Found this on a P3245 that wouldn't
-            # stick a static IP and was lying about it — a 200 with a Fault
-            # block. Why they don't return 4xx in that case I do not know.
-            if r.status_code == 200 and not has_fault:
-                onvif_ok = True
-        except ProtocolCancelled:
-            raise
-        except Exception as e:
-            _diag(f"ONVIF SetNetworkInterfaces → exception: {type(e).__name__}: {e}")
+            ip_soap = (f'<?xml version="1.0"?>'
+                       f'<Envelope xmlns="http://www.w3.org/2003/05/soap-envelope" '
+                       f'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" '
+                       f'xmlns:tt="http://www.onvif.org/ver10/schema"><Header/><Body>'
+                       f'<tds:SetNetworkInterfaces>'
+                       f'<tds:InterfaceToken>eth0</tds:InterfaceToken>'
+                       f'<tds:NetworkInterface><tt:Enabled>true</tt:Enabled>'
+                       f'<tt:IPv4><tt:Enabled>true</tt:Enabled>'
+                       f'<tt:Manual><tt:Address>{new_ip}</tt:Address>'
+                       f'<tt:PrefixLength>{cidr}</tt:PrefixLength></tt:Manual>'
+                       f'<tt:DHCP>false</tt:DHCP></tt:IPv4></tds:NetworkInterface>'
+                       f'</tds:SetNetworkInterfaces></Body></Envelope>')
+            try:
+                r = _retry(requests.post,
+                    f"http://{ip}/vapix/services", data=ip_soap,
+                    headers={"Content-Type": "application/soap+xml"},
+                    auth=auth, timeout=15)
+                snippet = (r.text or '')[:240].replace('\n', ' ').replace('\r', '')
+                has_fault = 'Fault' in (r.text or '')
+                _diag(f"ONVIF SetNetworkInterfaces → status={r.status_code} fault_in_body={has_fault} body[:240]={snippet}")
+                if r.status_code == 200 and not has_fault:
+                    onvif_ok = True
+            except ProtocolCancelled:
+                raise
+            except Exception as e:
+                _diag(f"ONVIF SetNetworkInterfaces → exception: {type(e).__name__}: {e}")
+            return onvif_ok
 
-        if onvif_ok:
-            _diag("ONVIF path SUCCESS")
-            return True
-        _diag("ONVIF path failed — falling back to VAPIX param.cgi")
-
-        # --- VAPIX fallback ---
+        # --- VAPIX param.cgi path (extracted into closure for v4.6 path-ordering) ---
         # Order matters here. If you set IP first then DHCP, the camera goes
         # offline mid-config and you can't finish. DHCP off first, gateway,
         # subnet, IP last — that order has been bulletproof since at least
         # the M-series firmware in 2012.
-        try:
-            r1 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.IPv4.DHCP": "no"},
-                auth=auth, timeout=10)
-            _diag(f"VAPIX DHCP=no → status={r1.status_code} body[:160]={(r1.text or '')[:160]!r}")
-            r2 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.DefaultRouter": gateway},
-                auth=auth, timeout=10)
-            _diag(f"VAPIX DefaultRouter={gateway} → status={r2.status_code} body[:160]={(r2.text or '')[:160]!r}")
-            r3 = _retry(requests.get, f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.SubnetMask": subnet},
-                auth=auth, timeout=10)
-            _diag(f"VAPIX SubnetMask={subnet} → status={r3.status_code} body[:160]={(r3.text or '')[:160]!r}")
-            # Setting IPAddress is the call that yanks the rug — the response
-            # may never come back because the kernel has switched interfaces
-            # by the time it tries to ack. Hence the ConnectionError below
-            # being treated as success. Don't retry this one — connection drop
-            # IS the success signal.
-            r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                params={"action": "update", "root.Network.IPAddress": new_ip},
-                auth=auth, timeout=10)
-            _diag(f"VAPIX IPAddress={new_ip} → status={r.status_code} body[:160]={(r.text or '')[:160]!r}")
-            ok = r.status_code == 200
-            _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (final status not 200)'}")
-            return ok
-        except ProtocolCancelled:
-            raise
-        except requests.exceptions.ConnectionError:
-            _diag("VAPIX path → ConnectionError on final IPAddress write — treating as SUCCESS (kernel swapped iface mid-response)")
-            # Connection died mid-call — that's actually GOOD on this one,
-            # means the IP change took effect. Return True; verification step
-            # higher up will confirm the camera is reachable on the new IP.
-            return True
-        except Exception as e:
-            _diag(f"VAPIX path → exception: {type(e).__name__}: {e}")
+        # v4.6.0b2 — DHCP-off param fix. The previous `root.Network.IPv4.DHCP=no`
+        # only exists on FW 11+; on FW 10.x the camera returns
+        # `# Error: Error setting 'root.Network.IPv4.DHCP' to 'no'!` with HTTP
+        # 200 (param.cgi error-via-200-with-error-body pattern) and the toolkit
+        # missed it. Result: static IP got set but BootProto stayed `dhcp`,
+        # leaving the camera in a half-configured state — confirmed live on
+        # 192.168.0.100 by reading params after a v4.6.0b1 program. The right
+        # param on FW 10.x is `root.Network.BootProto=none` (verified: returns
+        # plain `OK` and BootProto value flips to `none` immediately). It also
+        # works on FW 11+, so use it unconditionally on the VAPIX path.
+        def _vapix_ok(resp_text):
+            """param.cgi returns HTTP 200 even on errors. Real success bodies
+            are short (`OK`, `OK\\r\\n`, or echoed value). Real failure bodies
+            start with `# Error:`. Treat any `# Error:` prefix as failure."""
+            t = (resp_text or '').strip()
+            return not t.startswith('# Error:')
+
+        def _try_vapix():
+            # v4.6.0b3 — atomic single-call update. Previous b2 sent 4 separate
+            # param.cgi calls (BootProto=none, then gateway, subnet, IP). On a
+            # camera holding a bundled-DHCP lease, the BootProto=none arrived
+            # FIRST, the camera immediately released the lease before the
+            # static-IP write could land, and fell back to factory IP 192.168.
+            # 0.90 — leaving the toolkit still talking to the now-dead lease IP
+            # and never reaching step 9. Confirmed in 4.6nevercompleted.pcap:
+            # camera at .50 → BootProto=none + DefaultRouter sent → camera ARPs
+            # for gateway from .90 ten seconds later.
+            #
+            # Fix: pack all 4 params into a single GET. param.cgi supports
+            # multiple ?root.X=Y query pairs and applies them atomically. The
+            # camera switches to the new static IP on the same write, so the
+            # connection drops mid-response (handled below as success). No
+            # window where DHCP is off and static isn't set yet.
+            # v4.6.0b6 — 503-busy retry. Brian's 4.6b1slow log showed the
+            # camera returning HTTP 503 with empty body on the first atomic
+            # update (Axis "service busy, retry me" pattern). Without retry
+            # the path falls through to ONVIF SOAP fallback, which is fast
+            # by accident but skips the perf win on FW 10.x. One 4s back-off
+            # retry catches the 503-busy case cleanly.
+            r = None
+            for vapix_attempt in range(3):
+                try:
+                    r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
+                        params={
+                            "action": "update",
+                            "root.Network.BootProto": "none",
+                            "root.Network.IPAddress": new_ip,
+                            "root.Network.SubnetMask": subnet,
+                            "root.Network.DefaultRouter": gateway,
+                        },
+                        auth=auth, timeout=10)
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.ReadTimeout):
+                    # Camera swapped IPs mid-response — the standard success
+                    # signal. Bubble out and let the outer handler treat it
+                    # as success.
+                    raise
+                if r.status_code == 503 and not (r.text or '').strip():
+                    if vapix_attempt < 2:
+                        # v4.6.0b7 — back-off tightened from 4s to 2s. Camera
+                        # busy-window after user-create is typically <2s on
+                        # FW 10.x; 4s was overkill. Save ~4s on the common
+                        # case of 1-2 busy retries before success.
+                        _diag(f"VAPIX atomic update → 503-busy (attempt {vapix_attempt+1}/3), retrying in 2s")
+                        try:
+                            proto_self._cancellable_sleep(2)
+                        except ProtocolCancelled:
+                            raise
+                        continue
+                break
+            try:
+                body = (r.text or '')[:240]
+                _diag(f"VAPIX atomic update (BootProto=none, IP={new_ip}, mask={subnet}, gw={gateway}) → status={r.status_code} body[:240]={body!r}")
+                ok = r.status_code == 200 and _vapix_ok(r.text)
+                _diag(f"VAPIX path → {'SUCCESS' if ok else 'FAILED (status not 200 or # Error body)'}")
+                return ok
+            except ProtocolCancelled:
+                raise
+            except requests.exceptions.ConnectionError:
+                # Camera switched to the new IP mid-response and dropped the
+                # TCP connection — kernel swapped interfaces before ack. This
+                # is the EXPECTED success signal for an atomic IP-change call.
+                _diag("VAPIX atomic update → ConnectionError on response — treating as SUCCESS (camera swapped to new IP mid-response)")
+                return True
+            except requests.exceptions.ReadTimeout:
+                # Same idea — camera processed the update, switched IPs, and
+                # the response never came back because we can't reach the old
+                # IP anymore. Treat as success; verification step confirms.
+                _diag("VAPIX atomic update → ReadTimeout on response — treating as SUCCESS (camera swapped to new IP mid-response)")
+                return True
+            except Exception as e:
+                _diag(f"VAPIX path → exception: {type(e).__name__}: {e}")
+                return False
+
+        # --- v4.6.0 — orchestrate based on firmware version ---
+        # FW < 12 (e.g. 10.12.x): VAPIX is ~5s, ONVIF SOAP is ~90s on the
+        # SetNetworkDefaultGateway call. Browser/web-UI uses VAPIX exclusively
+        # and that's why opening the camera in a browser is fast on the same
+        # camera that takes 90s for the toolkit's ONVIF path.
+        # FW >= 12: ONVIF is ~1s, atomic, safer if the link drops mid-write.
+        # If the preferred path returns False (not raised), fall back to the
+        # other path as a safety net.
+        if prefer_vapix:
+            _diag(f"firmware {fw_resolved or 'unknown'} prefers VAPIX path (FW < 12 ONVIF SOAP is slow)")
+            if _try_vapix():
+                _diag("VAPIX path SUCCESS")
+                return True
+            _diag("VAPIX path failed — falling back to ONVIF SOAP")
+            if _try_onvif():
+                _diag("ONVIF path SUCCESS (after VAPIX fallback)")
+                return True
             return False
+        else:
+            if _try_onvif():
+                _diag("ONVIF path SUCCESS")
+                return True
+            _diag("ONVIF path failed — falling back to VAPIX param.cgi")
+            return _try_vapix()
 
     def set_hostname(self, ip, password, hostname):
         # 63-char DNS limit, anything not alphanum or dash gets sanitized to a dash.
@@ -2504,11 +2734,15 @@ class AxisProtocol(CameraProtocol):
         # 3rd-tier change-password fallback can fire if open + new-pwd both 401.
         existing_root_pwd = options.get('existing_root_pwd') if options else None
 
+        # v4.6.0 — pass firmware version into set_network so it can pick the
+        # fast path without probing. Wizard learned the firmware in the
+        # discovery phase and stored it on the cam dict.
+        cam_firmware = cam.get('firmware', '')
         steps = [
             ("Creating system user + ONVIF user",
              lambda: self.create_initial_user(ip, password, existing_pwd=existing_root_pwd)),
             ("Setting gateway + IP + disabling DHCP",
-             lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
+             lambda: self.set_network(ip, password, static_ip, subnet, gateway, firmware=cam_firmware)),
         ]
         if set_hostname:
             # Hostname format I've used for a decade: <position>-<brand>-<serial>.
@@ -5156,12 +5390,17 @@ class ProgramWizardDialog(tk.Toplevel):
         self.body = ttk.Frame(outer, padding=20)
         self.body.pack(fill=tk.BOTH, expand=True)
 
-        # Build all step frames (only shown one at a time)
+        # v5.0 b4 — reordered to fold the old pre-flight confirm dialog
+        # into the wizard itself (one wizard, not two). Step labels updated
+        # per Brian's UX rethink: Credentials replaces "Password," Factory
+        # Default becomes its own step (was a checkbox in old Extras),
+        # Extras is slimmed to hostname + building reports.
         self.steps = []
         self._build_step_welcome()
-        self._build_step_password()
+        self._build_step_credentials()   # was _build_step_password — now user+pwd+extras-yes/no
         self._build_step_discovery()
-        self._build_step_extras()
+        self._build_step_factory_default()  # NEW step
+        self._build_step_extras()        # slimmed
         self._build_step_review()
 
         # Nav bar
@@ -5217,7 +5456,7 @@ class ProgramWizardDialog(tk.Toplevel):
         return f
 
     def _build_step_welcome(self):
-        f = self._new_step("Welcome",
+        f = self._new_step("Step 1 of 6 — Welcome",
                            f"You're about to program {self.camera_count} {self.brand_name} camera(s).")
         msg = (
             "This wizard walks you through programming brand-new cameras one at a time.\n\n"
@@ -5235,26 +5474,62 @@ class ProgramWizardDialog(tk.Toplevel):
         ttk.Label(f, text=msg, justify=tk.LEFT, font=('Helvetica', 10)).pack(
             anchor='w', pady=(10, 0))
 
-    def _build_step_password(self):
-        f = self._new_step("Step 1 of 4 — Set Password",
-                           "This password will be set on every camera you program.")
-        ttk.Label(f, text="Password:", font=('Helvetica', 11, 'bold')).pack(
+    def _build_step_credentials(self):
+        # v5.0 b4 — Credentials step. Was just a password screen; now includes
+        # admin user, double-typed password, AND "extra users? Y/N" — the
+        # three high-stakes inputs the operator used to be asked in a
+        # separate pre-flight confirm dialog. Folded into the wizard so
+        # there's one wizard, not two.
+        f = self._new_step("Step 2 of 6 — Credentials & users",
+                           "Confirm the admin user, set the password, and decide on extra users.")
+
+        # Admin user
+        ttk.Label(f, text="Admin user:", font=('Helvetica', 11, 'bold')).pack(
             anchor='w', pady=(20, 4))
+        if not hasattr(self, 'admin_user_var'):
+            self.admin_user_var = tk.StringVar(value='root')
+        try:
+            # Default to the active brand's DEFAULT_USER (passed in via brand_name)
+            from_brand = {'Axis': 'root', 'Bosch': 'service', 'Hanwha / Wisenet': 'admin'}.get(self.brand_name, 'root')
+            self.admin_user_var.set(from_brand)
+        except Exception:
+            pass
+        user_entry = ttk.Entry(f, textvariable=self.admin_user_var, width=20, font=('Helvetica', 11))
+        user_entry.pack(anchor='w', ipady=4)
+        ttk.Label(f, text=f"Brand default: see Help. Override only if your install uses a non-default admin name.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(2, 0))
+
+        # Password
+        ttk.Label(f, text="Programming password:", font=('Helvetica', 11, 'bold')).pack(
+            anchor='w', pady=(16, 4))
         e1 = ttk.Entry(f, textvariable=self.password_var, show='•', width=40, font=('Helvetica', 11))
         e1.pack(anchor='w', ipady=4)
         self._pwd_entry = e1
 
         ttk.Label(f, text="Confirm password:", font=('Helvetica', 11, 'bold')).pack(
-            anchor='w', pady=(15, 4))
+            anchor='w', pady=(12, 4))
         e2 = ttk.Entry(f, textvariable=self.password_confirm_var, show='•', width=40, font=('Helvetica', 11))
         e2.pack(anchor='w', ipady=4)
 
-        ttk.Label(f,
-                  text="\nTip: Use a strong password — this is the camera's admin login.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(10, 0))
+        # Extra users yes/no — replaces the Step 3 checkbox from v4.x.
+        # Disabled if no additional users are defined (operator must add
+        # them in Users & Passwords before this checkbox does anything).
+        ttk.Label(f, text="Add extra users on every camera?", font=('Helvetica', 11, 'bold')).pack(
+            anchor='w', pady=(20, 4))
+        extras_row = ttk.Frame(f); extras_row.pack(anchor='w', pady=(0, 4))
+        if self.additional_users_count > 0:
+            ttk.Radiobutton(extras_row, text=f"Yes ({self.additional_users_count} configured)",
+                            variable=self.additional_users_var, value=True).pack(side=tk.LEFT, padx=(0, 12))
+            ttk.Radiobutton(extras_row, text="No",
+                            variable=self.additional_users_var, value=False).pack(side=tk.LEFT)
+        else:
+            ttk.Label(extras_row,
+                      text="(none configured — add them in Users & Passwords if you need them)",
+                      foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT)
+            self.additional_users_var.set(False)
 
     def _build_step_discovery(self):
-        f = self._new_step("Step 2 of 4 — How to find cameras",
+        f = self._new_step("Step 3 of 6 — How to find cameras",
                            "Pick how the toolkit should discover the camera when you plug it in.")
 
         # Interface is declared at the top of the main window (session-level).
@@ -5419,15 +5694,56 @@ class ProgramWizardDialog(tk.Toplevel):
         self.wait_window(dlg)
         return result['ok']
 
+    def _build_step_factory_default(self):
+        # v5.0 b4 — NEW step. Was a checkbox buried in the old Step 3 Extras.
+        # Promoted to its own step because it's a major decision (wipes the
+        # camera) and deserves the operator's attention. Y/N first, then the
+        # existing-password field only renders when Yes.
+        f = self._new_step("Step 4 of 6 — Factory default first?",
+                           "If your cameras are coming from a previous install, wipe them before programming.")
+        ttk.Label(f, text="Should the wizard factory-default each camera before programming it?",
+                  font=('Helvetica', 11, 'bold')).pack(anchor='w', pady=(20, 6))
+        ttk.Label(f,
+            text="If YES: the wizard will use the camera's existing root password to issue a factory_reset, wait for the camera to come back to factory state, THEN program it. Use this for cameras you're re-provisioning from a previous site (have an old password and old config).\n\nIf NO: the wizard assumes each camera is already factory-clean (brand-new out of the box, or you've already physically held the paperclip-reset button).",
+            foreground='gray', font=('Helvetica', 9), wraplength=820, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+
+        row = ttk.Frame(f); row.pack(anchor='w', pady=(0, 14))
+        ttk.Radiobutton(row, text="No — cameras are already factory-clean",
+                        variable=self.factory_first_var, value=False,
+                        command=self._update_factory_first_state).pack(anchor='w', pady=2)
+        ttk.Radiobutton(row, text="Yes — wipe them first using their existing password",
+                        variable=self.factory_first_var, value=True,
+                        command=self._update_factory_first_state).pack(anchor='w', pady=2)
+
+        # Existing-password field, only relevant when Yes
+        self._factory_first_pwd_row = ttk.Frame(f)
+        self._factory_first_pwd_row.pack(anchor='w', pady=(8, 0))
+        ttk.Label(self._factory_first_pwd_row, text="Existing root password:",
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        self._factory_first_pwd_entry = ttk.Entry(self._factory_first_pwd_row,
+                                                  textvariable=self.existing_root_pwd_var,
+                                                  show='*', width=24, font=('Helvetica', 10))
+        self._factory_first_pwd_entry.pack(side=tk.LEFT, padx=(8, 0))
+        self._update_factory_first_state()
+
+    def _update_factory_first_state(self):
+        """Show the existing-password field only when Yes is selected."""
+        try:
+            yes = bool(self.factory_first_var.get())
+            self._factory_first_pwd_entry.configure(state='normal' if yes else 'disabled')
+        except Exception:
+            pass
+
     def _build_step_extras(self):
-        # 2026-05-03 — Step 3 grew to ~6 options × 3-4 lines of help text each
-        # in the v4.3-pre work. Fixed-pixel sizing breaks on laptops + DPI
-        # scaling (Brian's beta-run on Windows 11 with display zoom clipped
-        # the bottom 2 checkboxes). Wrap the content in a scrollable Canvas
-        # so any window size handles all options. Mousewheel binding scoped
-        # to this canvas only — global bind would conflict with other tabs.
-        outer = self._new_step("Step 3 of 4 — Extras",
-                               "Optional things to do during programming.")
+        # v5.0 b4 — RADICALLY slimmed. Per Brian: "extras become: Building
+        # reports, hostname (with rewording), and I think ONVIF goes to the
+        # users tab." Auto multi-home is removed from the UI (handled
+        # automatically when a cross-subnet target is detected). Factory
+        # default got promoted to its own step. Additional users yes/no
+        # moved to the Credentials step. ONVIF user controls moved to the
+        # Users & Passwords tab. What's left:
+        outer = self._new_step("Step 5 of 6 — Extras",
+                               "Two optional polish items.")
         canvas = tk.Canvas(outer, highlightthickness=0)
         vbar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
         canvas.configure(yscrollcommand=vbar.set)
@@ -5448,35 +5764,18 @@ class ProgramWizardDialog(tk.Toplevel):
         canvas.bind('<Enter>', lambda e: canvas.bind_all('<MouseWheel>', _on_mw))
         canvas.bind('<Leave>', lambda e: canvas.unbind_all('<MouseWheel>'))
 
+        # Hostname (with reworded help per Brian's ask)
         ttk.Checkbutton(f, text="Set network hostname automatically",
                         variable=self.hostname_var).pack(anchor='w', pady=(20, 2))
-        ttk.Label(f, text="    Sets hostname to <number>-<brand>-<serial> on each camera.",
+        ttk.Label(f, text="    Sets hostname to <number>-<brand>-<serial> on each camera. Useful when\n"
+                          "    your network has hostname support (DNS-resolvable cameras) — your VMS\n"
+                          "    or switch admin can find cameras by name instead of IP. Leave off if\n"
+                          "    your install doesn't route hostnames.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
 
-        ttk.Checkbutton(f, text="Keep ONVIF user after programming (don't delete)",
-                        variable=self.keep_onvif_user_var).pack(anchor='w', pady=(15, 2))
-        ttk.Label(f, text="    Default: ONVIF user is deleted after set_network completes,\n"
-                          "    leaving VAPIX root only. Check this if your customer/VMS\n"
-                          "    requires the ONVIF user to remain.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        # ONVIF custom-creds row — only meaningful if Keep is checked
-        onvif_creds = ttk.Frame(f)
-        onvif_creds.pack(fill=tk.X, pady=(4, 2))
-        ttk.Label(onvif_creds, text="    Custom ONVIF user (optional):",
-                  font=('Helvetica', 9)).pack(side=tk.LEFT)
-        ttk.Entry(onvif_creds, textvariable=self.onvif_username_var, width=14).pack(side=tk.LEFT, padx=(4, 8))
-        ttk.Label(onvif_creds, text="Password:", font=('Helvetica', 9)).pack(side=tk.LEFT)
-        ttk.Entry(onvif_creds, textvariable=self.onvif_password_var, width=14).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(f, text="    Both filled → wizard deletes ONVIF root and creates this user "
-                          "after programming.\n"
-                          "    Empty → if Keep is checked, ONVIF root remains as-is. Ignored if "
-                          "Keep is unchecked.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        # Building Reports stickers (v4.3 #13)
+        # Building Reports stickers
         ttk.Checkbutton(f, text="Add Building Reports stickers (sequential 8-digit labels)",
-                        variable=self.add_br_stickers_var).pack(anchor='w', pady=(15, 2))
+                        variable=self.add_br_stickers_var).pack(anchor='w', pady=(20, 2))
         br_row = ttk.Frame(f)
         br_row.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(br_row, text="    First sticker number on roll:",
@@ -5487,52 +5786,11 @@ class ProgramWizardDialog(tk.Toplevel):
                           "    Peel stickers off the spool in order as cameras complete.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
 
-        # Auto NIC multi-home (v4.3 #11)
-        ttk.Checkbutton(f, text="Auto multi-home interface for this run (helps reach cameras on multiple subnets)",
-                        variable=self.auto_multihome_var,
-                        command=self._on_multihome_toggle).pack(anchor='w', pady=(15, 2))
-        ttk.Label(f, text="    REQUIRES a specific INTERFACE in the top bar of the main window —\n"
-                          "    Auto-detect WILL NOT WORK. The run will be aborted if you start it\n"
-                          "    with this on but no interface picked.",
-                  foreground='#B71C1C', font=('Helvetica', 9, 'bold')).pack(anchor='w')
-        ttk.Label(f, text="    Adds host IPs on the selected interface for every camera-list subnet,\n"
-                          "    so the toolkit can talk to cameras on different gateways without\n"
-                          "    manual netsh. Requires admin (toolkit will prompt). Cleanup runs\n"
-                          "    at wizard end + crash-recovery on next launch.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        # Factory-default-before-program (v4.3 — for re-using cameras from prior installs)
-        ttk.Checkbutton(f, text="Factory default before programming (for used cameras)",
-                        variable=self.factory_first_var).pack(anchor='w', pady=(15, 2))
-        fact_row = ttk.Frame(f)
-        fact_row.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(fact_row, text="    Existing root password:",
-                  font=('Helvetica', 9)).pack(side=tk.LEFT)
-        ttk.Entry(fact_row, textvariable=self.existing_root_pwd_var, show='*', width=20).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(f, text="    Wipes the camera (using the existing password) before applying\n"
-                          "    new programming. For cameras you're reprovisioning from a\n"
-                          "    previous site. Also gives you time to physically hold the\n"
-                          "    factory-reset button if needed — programming pauses for the wipe.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        if self.additional_users_count > 0:
-            label = f"Create additional user accounts ({self.additional_users_count} defined)"
-            state = 'normal'
-        else:
-            label = "Create additional user accounts (none defined)"
-            state = 'disabled'
-        cb = ttk.Checkbutton(f, text=label, variable=self.additional_users_var)
-        cb.pack(anchor='w', pady=(15, 2))
-        cb.configure(state=state)
-        ttk.Label(f,
-                  text="    Add users in the Passwords tab before programming if you need this.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w')
-
-        ttk.Label(f, text="\nNo extras needed? Just click  Next →",
+        ttk.Label(f, text="\nNothing needed here? Just click  Next →",
                   foreground='gray', font=('Helvetica', 10)).pack(anchor='w', pady=(20, 0))
 
     def _build_step_review(self):
-        f = self._new_step("Step 4 of 4 — Review",
+        f = self._new_step("Step 6 of 6 — Review",
                            "Last check before you start programming.")
         self._review_text = tk.Text(f, height=14, width=70, font=('Consolas', 10),
                                     relief=tk.SUNKEN, borderwidth=1, wrap=tk.WORD,
@@ -5546,19 +5804,29 @@ class ProgramWizardDialog(tk.Toplevel):
         mode_name = {'both': 'Both DHCP/mDNS + Factory IP',
                      'mdns': 'DHCP/mDNS only',
                      'factory': 'Factory IP only'}.get(mode, mode)
+        admin_user = getattr(self, 'admin_user_var', None)
+        admin_user_str = admin_user.get().strip() if admin_user else 'root'
         lines = [
             f"Brand                : {self.brand_name}",
             f"Cameras to program   : {self.camera_count}",
             "",
+            f"Admin user           : {admin_user_str}",
             f"Password             : {'•' * len(self.password_var.get())}",
+            f"Add extra users      : {'YES' if self.additional_users_var.get() else 'no'}",
+            "",
             f"Network interface    : {iface}",
             f"Discovery method     : {mode_name}",
         ]
         if mode != 'mdns':
             lines.append(f"Factory IP           : {self.factory_ip_var.get()}")
         lines.append("")
+        if self.factory_first_var.get():
+            lines.append(f"Factory default first: YES (existing pwd supplied)")
+        else:
+            lines.append(f"Factory default first: no")
+        lines.append("")
         lines.append(f"Set hostname         : {'YES' if self.hostname_var.get() else 'no'}")
-        lines.append(f"Add extra users      : {'YES' if self.additional_users_var.get() else 'no'}")
+        lines.append(f"Building Reports     : {'YES (start ' + self.br_first_label_var.get() + ')' if self.add_br_stickers_var.get() else 'no'}")
         lines.append("")
         lines.append("Click  Start Programming  to begin.")
         lines.append("You'll be prompted to plug in each camera one at a time.")
@@ -5579,6 +5847,8 @@ class ProgramWizardDialog(tk.Toplevel):
         step['frame'].pack(fill=tk.BOTH, expand=True)
         self.header_title.config(text=step['title'])
         self.header_subtitle.config(text=step['subtitle'])
+        # v5.0 b7 — Welcome counts as Step 1, so all 6 screens are numbered
+        # 1..6 of 6 in both the top banner AND each step's own title text.
         self.step_label.config(text=f"Step {idx + 1} of {len(self.steps)}")
         self.back_btn.config(state='normal' if idx > 0 else 'disabled')
         if idx == len(self.steps) - 1:
@@ -5600,7 +5870,11 @@ class ProgramWizardDialog(tk.Toplevel):
     def go_next(self):
         # Validate current step
         idx = self.current_step
-        if idx == 1:  # password
+        if idx == 1:  # credentials (admin user + password + extras)
+            user = self.admin_user_var.get().strip() if hasattr(self, 'admin_user_var') else ''
+            if not user:
+                messagebox.showwarning("Required", "Admin user is required.", parent=self)
+                return
             pwd = self.password_var.get()
             if not pwd:
                 messagebox.showwarning("Required", "Password is required.", parent=self)
@@ -5613,6 +5887,13 @@ class ProgramWizardDialog(tk.Toplevel):
             if mode != 'mdns' and not self.factory_ip_var.get().strip():
                 messagebox.showwarning("Required",
                                        "Factory IP is required for this mode.", parent=self)
+                return
+        elif idx == 3:  # factory-default first
+            if self.factory_first_var.get() and not self.existing_root_pwd_var.get():
+                messagebox.showwarning(
+                    "Required",
+                    "Existing root password is required to factory-default a used camera.",
+                    parent=self)
                 return
 
         if idx == len(self.steps) - 1:
@@ -5660,7 +5941,14 @@ class ProgramWizardDialog(tk.Toplevel):
                     selected_iface = iface
                     break
         mode = self.discovery_var.get()
+        admin_user = self.admin_user_var.get().strip() if hasattr(self, 'admin_user_var') else ''
+        if admin_user:
+            try:
+                self.protocol.DEFAULT_USER = admin_user
+            except Exception:
+                pass
         self.result = {
+            'admin_user': admin_user,
             'password': self.password_var.get(),
             'factory_ip': self.factory_ip_var.get().strip() if mode != 'mdns' else None,
             'discovery_mode': mode,
@@ -5820,6 +6108,32 @@ class CameraEditorDialog(tk.Toplevel):
                    command=lambda: set_subnet('255.0.0.0')).pack(side=tk.LEFT, padx=2)
         row += 1
 
+        # Brand check (first 6 of MAC = OUI). v5.0 b2 rethink: the field
+        # isn't a per-camera binding anymore — it's a brand-validation hint.
+        # Just the first 6 hex chars (the OUI) tells the toolkit "this slot
+        # is an Axis camera" (or Bosch, or Hanwha) so it can refuse to
+        # program the wrong brand. Empty = no brand-check, accept whatever
+        # plugs in. Pre-discovered MAC gets truncated to its OUI for display.
+        ttk.Label(frame, text="Brand check (MAC OUI):").grid(row=row, column=0, sticky='w', pady=3)
+        mac_frame = ttk.Frame(frame)
+        mac_frame.grid(row=row, column=1, sticky='ew', pady=3, padx=(10, 0))
+        mac_entry = ttk.Entry(mac_frame, width=14)
+        mac_entry.pack(side=tk.LEFT)
+        # Pre-populate with OUI (first 6 hex) of any existing MAC binding.
+        existing_mac = (camera or {}).get('mac', '') or ''
+        oui_existing = ''.join(c for c in existing_mac if c not in ':-. ')[:6].upper()
+        if oui_existing:
+            mac_entry.insert(0, oui_existing)
+        self.entries['mac'] = mac_entry
+        def _clear_mac():
+            mac_entry.delete(0, tk.END)
+        ttk.Button(mac_frame, text="Clear", width=7,
+                   command=_clear_mac).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(frame, text="(first 6 hex chars of MAC — used to confirm the brand. Empty = accept any brand.)",
+                  foreground='gray', font=('Helvetica', 8)).grid(
+            row=row + 1, column=1, sticky='w', padx=(10, 0))
+        row += 2
+
         # Remaining fields
         for label, key in [("New IP (for updates):", "new_ip"),
                            ("Hostname (optional):", "hostname"),
@@ -5925,7 +6239,11 @@ class CameraEditorDialog(tk.Toplevel):
             'new_ip': self.entries['new_ip'].get().strip(),
             'dhcp': 'Yes' if self.dhcp_var.get() else 'No',
             'serial': self.camera.get('serial', '') if self.camera else '',
-            'mac': self.camera.get('mac', '') if self.camera else '',
+            # v5.0 b2: MAC field is the 6-hex OUI for brand validation, not a
+            # per-camera binding. Strip non-hex, uppercase, cap at 6 chars.
+            # Empty stays empty = no brand check.
+            'mac': ''.join(c for c in self.entries['mac'].get().strip()
+                           if c in '0123456789abcdefABCDEF').upper()[:6],
             'brand': self.camera.get('brand', 'axis') if self.camera else 'axis',
             'pending': pending,
             'processed': False
@@ -6309,6 +6627,11 @@ class CCTVToolkitApp:
         # initialized later, which broke the new icon-loader success log.
         self.log_queue = queue.Queue()
         self.cancel_flag = False
+        # v4.6.0b6 — wizard re-entry guard. True while any programming run
+        # thread is alive; gates start_program_wizard / start_program_wizard_classic
+        # so a click on Program while one is already running can't spawn a
+        # second concurrent run() thread.
+        self._wizard_running = False
         # v4.5.3 — visible build identifier in title. CI injects APP_VERSION
         # at build time (e.g. "4.5.3b6.f5178c4" for beta, "4.5.3" for stable)
         # so this shows the running build's identifier without the operator
@@ -6631,10 +6954,70 @@ class CCTVToolkitApp:
                 parent=self.root)
     
     def create_main_ui(self):
-        # Session networking bar — interface + DHCP server (v4.3, top of window)
-        # Declares "all things on this NIC" up-front so every wizard inherits it.
+        # v5.0 — App header: thin top bar with version + Home + Tools menu.
+        # Replaces the v4.x session+brand bars (interface, DHCP, brand are
+        # now inside the linear Setup flow). Power-user / one-off screens
+        # (Users & Passwords, Discovered, Log, Find Anywhere) accessible
+        # via the Tools menu so they don't clutter the primary path.
+        header = tk.Frame(self.root, bg='#263238', height=42)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(header, text="  CCTV Toolkit", bg='#263238', fg='white',
+                 font=('Helvetica', 13, 'bold')).pack(side=tk.LEFT, padx=(8, 0), pady=8)
+        version_tag = f"v{APP_VERSION}"
+        is_beta = not re.match(r'^\d+\.\d+\.\d+$', APP_VERSION)
+        if is_beta:
+            version_tag += "  ⚠ BETA"
+        tk.Label(header, text=version_tag, bg='#263238', fg='#90A4AE',
+                 font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(8, 0), pady=8)
+
+        def _go_setup():
+            try: self.notebook.select(self.setup_tab)
+            except Exception: pass
+        # v5.0 b2 — was '🏠 Home' but 'home' implies a separate home screen
+        # which doesn't exist; Setup IS the home. 'Back to wizard' reads
+        # correctly per Brian's feedback.
+        tk.Button(header, text="← Back to wizard", bg='#37474F', fg='white',
+                  font=('Helvetica', 9, 'bold'), relief=tk.FLAT, padx=12, cursor='hand2',
+                  command=_go_setup).pack(side=tk.RIGHT, padx=(0, 10), pady=6)
+
+        # Tools menubutton — secondary screens
+        tools_mb = tk.Menubutton(header, text='Tools ▾', bg='#37474F', fg='white',
+                                 font=('Helvetica', 9), relief=tk.FLAT, cursor='hand2', padx=10)
+        tools_menu = tk.Menu(tools_mb, tearoff=0)
+        tools_mb['menu'] = tools_menu
+        def _select_tab(t):
+            try: self.notebook.select(t)
+            except Exception: pass
+        tools_menu.add_command(label="📋 Camera List",
+                               command=lambda: _select_tab(self.cameras_tab))
+        tools_menu.add_command(label="📡 Discovered",
+                               command=lambda: _select_tab(self.discovered_tab))
+        tools_menu.add_command(label="🔑 Users & Passwords",
+                               command=lambda: _select_tab(self.passwords_tab))
+        tools_menu.add_command(label="⚡ Operations",
+                               command=lambda: _select_tab(self.operations_tab))
+        tools_menu.add_command(label="🟢 Programming Status",
+                               command=lambda: _select_tab(self.status_tab))
+        tools_menu.add_separator()
+        tools_menu.add_command(label="📊 Log & Results",
+                               command=lambda: _select_tab(self.log_tab))
+        tools_mb.pack(side=tk.RIGHT, padx=0, pady=6)
+
+        # Hide ttk.Notebook tab strip — the user never sees tabs in v5.0.
+        # Navigation is via the Setup stepper and the Home/Tools header.
+        try:
+            ttk.Style().layout('TNotebook.Tab', [])
+        except Exception:
+            pass
+
+        # The session bar and brand bar widgets are CREATED below for
+        # backwards-compat (other code may reference self.session_iface_var,
+        # self.brand_var, self.session_dhcp_status, etc.) but NOT packed —
+        # so they're invisible in v5.0. The Setup flow re-renders these
+        # controls inline within their respective steps.
         self.session_bar = ttk.Frame(self.root, padding=(10, 6, 10, 6))
-        self.session_bar.pack(fill=tk.X)
+        # NOTE: not packed in v5.0 (was: self.session_bar.pack(fill=tk.X))
         self.session_bar.configure(style='Session.TFrame')
         try:
             ttk.Style().configure('Session.TFrame', background='#ECEFF1')
@@ -6668,8 +7051,11 @@ class CCTVToolkitApp:
         self.session_dhcp_status.pack(side=tk.LEFT, padx=(10, 0))
 
         # Brand selection bar
+        # v5.0 — created for backwards-compat (brand_var, factory_ip_label
+        # are referenced elsewhere) but NOT packed. Setup Step 3 renders
+        # the brand picker inline.
         self.brand_bar = ttk.Frame(self.root)
-        self.brand_bar.pack(fill=tk.X, padx=10, pady=(5, 0))
+        # NOTE: not packed in v5.0 (was: self.brand_bar.pack(...))
 
         ttk.Label(self.brand_bar, text="BRAND:", font=('Helvetica', 10, 'bold')).pack(side=tk.LEFT)
 
@@ -6689,36 +7075,351 @@ class CCTVToolkitApp:
         # Main container with notebook (tabs)
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Tab 0: Camera List
+
+        # v5.0 — NEW DEFAULT TAB: linear guided Setup flow.
+        # Brian's UX rethink 2026-05-11: tabs invite the user to wander
+        # ("do I need Discovered? what's Passwords for?"). A real job is
+        # linear: pick interface → DHCP on/off → pick brand → load camera
+        # list → choose operation → watch programming status. The Setup tab
+        # lays that out as numbered steps so the operator follows the job
+        # instead of decoding the toolkit's information architecture.
+        # Other tabs remain accessible for power-user / one-off tasks.
+        self.setup_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.setup_tab, text="🚀 Setup")
+        self.create_setup_tab()
+
+        # Tab: Camera List
         self.cameras_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.cameras_tab, text="📋 Camera List")
         self.create_cameras_tab()
-        
-        # Tab 1: Discovered Cameras
+
+        # Tab: Discovered Cameras
         self.discovered_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.discovered_tab, text="📡 Discovered")
         self.create_discovered_tab()
-        
-        # Tab 2: Password List
+
+        # Tab: Users & Passwords (renamed from "Passwords" in v5.0 to reflect
+        # that this tab manages both the system-user accounts created during
+        # programming AND the saved password list used for auth attempts).
         self.passwords_tab = ttk.Frame(self.notebook)
-        self.notebook.add(self.passwords_tab, text="🔑 Passwords")
+        self.notebook.add(self.passwords_tab, text="🔑 Users & Passwords")
         self.create_passwords_tab()
-        
-        # Tab 3: Operations
+
+        # Tab: Operations
         self.operations_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.operations_tab, text="⚡ Operations")
         self.create_operations_tab()
-        
-        # Tab 4: Programming Status (live checklist for new wizard)
+
+        # Tab: Programming Status (live checklist for new wizard)
         self.status_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.status_tab, text="🟢 Programming Status")
         self.create_status_tab()
 
-        # Tab 5: Log/Results
+        # Tab: Log/Results
         self.log_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.log_tab, text="📊 Log & Results")
         self.create_log_tab()
+
+        # v5.0 — Setup is the default landing tab. The intent: new operators
+        # see the linear flow, not the tab grid.
+        self.notebook.select(self.setup_tab)
+
+    # ========================================================================
+    # v5.0 — Setup tab: linear guided flow
+    # ========================================================================
+    def create_setup_tab(self):
+        """Linear setup-then-go flow. Each step is one decision; Next moves on.
+        The underlying state (interface, DHCP, brand, camera list) is shared
+        with the rest of the app, so jumping to a 'classic' tab and back is
+        non-destructive. Steps:
+          1. Interface
+          2. DHCP server (on/off + config)
+          3. Camera brand
+          4. Camera list (paste / load)
+          5. Operations (what to do with these cameras)
+          6. Status (shows the live programming screen)
+        """
+        self._setup_step = 0
+        # v5.0 b2 — Brand moved to Step 1. Brand drives everything downstream
+        # (factory IP, default user, protocol) so the operator should pick it
+        # before the others.
+        self._setup_steps_meta = [
+            ('1', 'Brand',         'Axis, Bosch, or Hanwha'),
+            ('2', 'Interface',     'Pick the programming NIC'),
+            ('3', 'DHCP server',   'Turn the bundled DHCP server on or off'),
+            ('4', 'Camera list',   'Paste or load the CSV of cameras to program'),
+            ('5', 'Operations',    'What to do with these cameras'),
+            ('6', 'Status',        'Live programming progress'),
+        ]
+
+        outer = ttk.Frame(self.setup_tab, padding=(15, 15, 15, 10))
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # ---- Stepper header ----
+        stepper = ttk.Frame(outer)
+        stepper.pack(fill=tk.X, pady=(0, 14))
+        self._setup_step_chips = []
+        for i, (num, title, _sub) in enumerate(self._setup_steps_meta):
+            chip = tk.Frame(stepper, bg='#E0E0E0', padx=12, pady=8, cursor='hand2')
+            chip.grid(row=0, column=i*2, sticky='nsew')
+            stepper.columnconfigure(i*2, weight=1)
+            num_lbl = tk.Label(chip, text=num, bg='#E0E0E0', fg='#666',
+                               font=('Helvetica', 14, 'bold'))
+            num_lbl.pack(side=tk.LEFT, padx=(0, 8))
+            title_lbl = tk.Label(chip, text=title, bg='#E0E0E0', fg='#333',
+                                 font=('Helvetica', 11))
+            title_lbl.pack(side=tk.LEFT)
+            for w in (chip, num_lbl, title_lbl):
+                w.bind('<Button-1>', lambda e, idx=i: self._setup_goto(idx))
+            self._setup_step_chips.append({'chip': chip, 'num': num_lbl, 'title': title_lbl})
+            # Separator arrow between chips (not after the last one)
+            if i < len(self._setup_steps_meta) - 1:
+                arrow = tk.Label(stepper, text='›', font=('Helvetica', 18, 'bold'),
+                                 fg='#999')
+                arrow.grid(row=0, column=i*2 + 1, padx=4)
+
+        # ---- Subtitle (current step description) ----
+        self._setup_subtitle = tk.Label(outer, text='',
+                                        font=('Helvetica', 10), fg='#666',
+                                        anchor='w', justify=tk.LEFT)
+        self._setup_subtitle.pack(fill=tk.X, pady=(0, 10))
+
+        # ---- Body (current step content fills here) ----
+        self._setup_body = ttk.Frame(outer)
+        self._setup_body.pack(fill=tk.BOTH, expand=True)
+
+        # ---- Nav row ----
+        nav = ttk.Frame(outer)
+        nav.pack(fill=tk.X, pady=(10, 0))
+        self._setup_back_btn = ttk.Button(nav, text='← Back', width=12,
+                                          command=lambda: self._setup_goto(self._setup_step - 1))
+        self._setup_back_btn.pack(side=tk.LEFT)
+        self._setup_next_btn = tk.Button(nav, text='Next →', width=18,
+                                         bg='#4CAF50', fg='white',
+                                         font=('Helvetica', 10, 'bold'),
+                                         relief=tk.RAISED, cursor='hand2',
+                                         command=lambda: self._setup_goto(self._setup_step + 1))
+        self._setup_next_btn.pack(side=tk.RIGHT)
+        self._setup_progress_lbl = ttk.Label(nav, text='',
+                                             font=('Helvetica', 9), foreground='gray')
+        self._setup_progress_lbl.pack(side=tk.RIGHT, padx=(0, 12))
+
+        self._setup_goto(0)
+
+        # v5.0 b2 — Enter = Next throughout the Setup flow. Brian's ask:
+        # 'on next run, please make sure Enter is the approved next/yes/
+        # auto-select all the way through the program.' Smart handler:
+        # in a multi-line Text widget Enter inserts newline (normal); in a
+        # Combobox / Entry / Button it advances the Setup step (or invokes
+        # the focused button). Idempotent — repeat-binding is fine.
+        def _enter_advances(event=None):
+            try:
+                w = self.root.focus_get()
+                # Multi-line text input: let Enter do its normal thing
+                if isinstance(w, tk.Text):
+                    return None
+                # Focused button: invoke it directly
+                if isinstance(w, (tk.Button, ttk.Button)):
+                    try:
+                        w.invoke()
+                        return 'break'
+                    except Exception:
+                        pass
+                # Only advance if we're currently on a Setup step (i.e. the
+                # Setup tab is selected). Otherwise leave default behavior.
+                if self.notebook.select() == str(self.setup_tab):
+                    self._setup_goto(self._setup_step + 1)
+                    return 'break'
+            except Exception:
+                pass
+            return None
+        try:
+            self.root.bind('<Return>', _enter_advances)
+            self.root.bind('<KP_Enter>', _enter_advances)
+        except Exception:
+            pass
+
+    def _setup_goto(self, idx):
+        if idx < 0 or idx >= len(self._setup_steps_meta):
+            return
+        self._setup_step = idx
+        # Update stepper chip styling
+        for i, chip_set in enumerate(self._setup_step_chips):
+            if i == idx:
+                bg, fg = '#4CAF50', 'white'
+            elif i < idx:
+                bg, fg = '#A5D6A7', '#1B5E20'
+            else:
+                bg, fg = '#E0E0E0', '#666'
+            chip_set['chip'].configure(bg=bg)
+            chip_set['num'].configure(bg=bg, fg=fg)
+            chip_set['title'].configure(bg=bg, fg=fg)
+        # Subtitle
+        num, title, sub = self._setup_steps_meta[idx]
+        self._setup_subtitle.configure(text=f"Step {num} of {len(self._setup_steps_meta)} — {title}: {sub}")
+        self._setup_progress_lbl.configure(text=f"Step {num} of {len(self._setup_steps_meta)}")
+        # Nav state
+        self._setup_back_btn.configure(state='normal' if idx > 0 else 'disabled')
+        if idx == len(self._setup_steps_meta) - 1:
+            self._setup_next_btn.configure(state='disabled', text='— last step —')
+        else:
+            self._setup_next_btn.configure(state='normal', text='Next →')
+        # Render body
+        for w in self._setup_body.winfo_children():
+            w.destroy()
+        # v5.0 b2 — Brand first per Brian's reorder
+        renderer = [
+            self._setup_render_brand,
+            self._setup_render_interface,
+            self._setup_render_dhcp,
+            self._setup_render_camera_list,
+            self._setup_render_operations,
+            self._setup_render_status,
+        ][idx]
+        renderer(self._setup_body)
+
+    def _setup_render_interface(self, body):
+        ttk.Label(body, text="Which network interface is the camera switch plugged into?",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body, text="This is the NIC the toolkit will talk to cameras on. Auto-detect picks the first usable one — fine for single-NIC laptops; pick explicitly for multi-NIC.",
+                  foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        ifaces = getattr(self, '_session_interfaces', None) or ProgramOptionsDialog._get_network_interfaces()
+        self._session_interfaces = ifaces
+        labels = ['Auto-detect'] + [i['label'] for i in ifaces]
+        row = ttk.Frame(body)
+        row.pack(anchor='w', pady=(4, 0))
+        ttk.Label(row, text="Interface:", font=('Helvetica', 10, 'bold')).pack(side=tk.LEFT)
+        cb = ttk.Combobox(row, textvariable=self.session_iface_var, values=labels,
+                          state='readonly', width=50, font=('Helvetica', 10))
+        cb.pack(side=tk.LEFT, padx=(10, 0))
+        cb.bind('<<ComboboxSelected>>', self._on_session_iface_change)
+
+    def _setup_render_dhcp(self, body):
+        ttk.Label(body, text="Run the bundled DHCP server?",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="Turn this ON when the programming switch has no DHCP server. The bundled server hands a single fixed lease IP (default 192.168.0.50) to whatever Axis-vendor camera plugs in. The toolkit's MAC filter ignores non-camera devices so a managed PoE switch on the segment can't steal the lease.",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        row = ttk.Frame(body)
+        row.pack(anchor='w', pady=(4, 0))
+        ttk.Checkbutton(row, text="Bundled DHCP server", variable=self.session_dhcp_var,
+                        command=self._on_session_dhcp_toggle).pack(side=tk.LEFT)
+        ttk.Button(row, text="Configure...", command=self.show_dhcp_config_dialog).pack(side=tk.LEFT, padx=(12, 0))
+
+    def _setup_render_brand(self, body):
+        ttk.Label(body, text="What brand of camera are you programming?",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="The toolkit talks the brand's native protocol. Axis = VAPIX + ONVIF. Bosch = RCP+. Hanwha = STW-CGI / Sunapi. The default IP and root username differ per brand.",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        brands = [
+            ('axis', 'Axis', 'VAPIX/ONVIF · factory 192.168.0.90 · user root'),
+            ('bosch', 'Bosch', 'RCP-over-HTTP · factory 192.168.0.1 · user service'),
+            ('hanwha', 'Hanwha / Wisenet', 'STW-CGI/Sunapi · factory 192.168.1.100 · user admin'),
+        ]
+        for key, name, desc in brands:
+            row = ttk.Frame(body)
+            row.pack(anchor='w', pady=4)
+            ttk.Radiobutton(row, text=name, variable=self.brand_var, value=key,
+                            command=self._on_brand_change).pack(side=tk.LEFT)
+            ttk.Label(row, text=desc, foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(12, 0))
+
+    def _setup_render_camera_list(self, body):
+        ttk.Label(body, text="Load the cameras you want to program",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="99% of jobs come with a CSV. Paste the contents into the Smart Import dialog, or open the Camera List tab to add entries manually.",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        btns = ttk.Frame(body)
+        btns.pack(anchor='w', pady=(4, 14))
+        if hasattr(self, 'show_smart_import_dialog'):
+            ttk.Button(btns, text="📋 Smart Import (paste CSV)…", width=32,
+                       command=self.show_smart_import_dialog).pack(side=tk.LEFT)
+        ttk.Button(btns, text="📂 Open Camera List tab", width=24,
+                   command=lambda: self.notebook.select(self.cameras_tab)).pack(side=tk.LEFT, padx=(10, 0))
+        # Live count
+        try:
+            count = len(self.camera_data.get_all())
+        except Exception:
+            count = 0
+        ttk.Label(body, text=f"Current camera list: {count} entries",
+                  font=('Helvetica', 10)).pack(anchor='w')
+
+    def _setup_render_operations(self, body):
+        ttk.Label(body, text="What do you want to do with these cameras?",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="Pick the operation. Each one runs against the camera list you loaded in Step 4. Configure passwords first if you need to (top button).",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 10))
+
+        # v5.0 b2 — full ops grid wired to the REAL wizard methods. Each
+        # button now resolves to the proper handler (e.g. update_wizard
+        # not the classic programmer). Disabled state ONLY when the
+        # underlying method genuinely doesn't exist on the app.
+        ops_grouped = [
+            ('Prep', [
+                ("🔑  Users & Passwords",
+                 "Make sure your password list is loaded (and any extra user accounts are configured) before programming.",
+                 lambda: self.notebook.select(self.passwords_tab)),
+            ]),
+            ('Programming', [
+                ("🟢  Program New Cameras",
+                 "Step-by-step programming wizard with admin/password confirm, optional factory-default-first, and review screen.",
+                 getattr(self, 'start_program_wizard', None)),
+                ("🔄  Update / Change Settings",
+                 "Push IP / hostname / DHCP-toggle changes to cameras that are ALREADY programmed.",
+                 getattr(self, 'start_update_wizard', None)),
+                ("🔐  Change Password",
+                 "Rotate the root password on already-programmed cameras.",
+                 getattr(self, 'start_change_password_wizard', None)),
+            ]),
+            ('Verify', [
+                ("✅  Confirm Programming",
+                 "Walk the camera list, verify each is at its assigned IP with correct hostname / users / network config.",
+                 getattr(self, 'start_confirm_wizard', None)),
+                ("📡  Test / Ping",
+                 "Quick reachability check — ping every camera at its assigned IP.",
+                 getattr(self, 'start_ping_wizard', None)),
+                ("🧪  Batch Test",
+                 "Comprehensive deep-test of every camera (HTTP, ONVIF, image capture).",
+                 getattr(self, 'start_batch_test_wizard', None)),
+            ]),
+            ('Capture / Reset', [
+                ("📷  Grab Snapshots",
+                 "Capture and save a still image from each camera. Used for install documentation.",
+                 getattr(self, 'start_capture_wizard', None)),
+                ("⚠   Factory Default",
+                 "Wipe one or more cameras back to factory state.",
+                 getattr(self, 'start_factory_default_wizard', None)),
+            ]),
+        ]
+        for group_name, group_ops in ops_grouped:
+            ttk.Label(body, text=group_name, font=('Helvetica', 10, 'bold'),
+                      foreground='#555').pack(anchor='w', pady=(10, 4))
+            for label, desc, cmd in group_ops:
+                row = ttk.Frame(body)
+                row.pack(fill=tk.X, pady=2)
+                enabled = bool(cmd)
+                bg = '#E8F5E9' if enabled else '#EEEEEE'
+                fg = '#1B5E20' if enabled else '#999999'
+                btn = tk.Button(row, text=label, anchor='w', width=28,
+                                font=('Helvetica', 10, 'bold'), bg=bg, fg=fg,
+                                relief=tk.RAISED, padx=10, pady=6, cursor='hand2',
+                                command=cmd if enabled else (lambda: None))
+                btn.pack(side=tk.LEFT)
+                if not enabled:
+                    btn.configure(state='disabled')
+                ttk.Label(row, text=desc, foreground='gray', font=('Helvetica', 9),
+                          wraplength=520, justify=tk.LEFT).pack(side=tk.LEFT, padx=(12, 0))
+
+    def _setup_render_status(self, body):
+        ttk.Label(body, text="Live programming progress",
+                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        ttk.Label(body,
+            text="The Programming Status tab shows the step-by-step checklist while a wizard run is active. Click below to jump there.",
+            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
+        ttk.Button(body, text="🟢 Open Programming Status tab", width=36,
+                   command=lambda: self.notebook.select(self.status_tab)).pack(anchor='w')
 
     def _on_brand_change(self):
         """Handle brand radio button change."""
@@ -7190,18 +7891,34 @@ class CCTVToolkitApp:
         ttk.Button(btns, text="Save", command=_save).pack(side=tk.RIGHT, padx=4)
         _center_on_parent(dlg, self.root, 0, 0)
 
+    def _build_tab_header(self, parent, title, subtitle=None, title_size=16):
+        """v5.0 b5 — standardized top-of-tab header. Top-left is always a green
+        '← Back to wizard' button so every tab has the same exit affordance
+        Brian asked for, followed by the screen title and an optional subtitle.
+        Used by Camera List / Users & Passwords / Discovered / Operations."""
+        header = ttk.Frame(parent)
+        header.pack(fill=tk.X, pady=(0, 10))
+        tk.Button(header, text="← Back to wizard",
+                  font=('Helvetica', 10, 'bold'),
+                  bg='#4CAF50', fg='white', relief=tk.RAISED, padx=14, pady=4,
+                  cursor='hand2',
+                  command=lambda: self.notebook.select(self.setup_tab)).pack(side=tk.LEFT)
+        ttk.Label(header, text=f"  {title}",
+                  font=('Helvetica', title_size, 'bold')).pack(side=tk.LEFT, padx=(12, 0))
+        if subtitle:
+            ttk.Label(header, text=f"  •  {subtitle}",
+                      font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
+        return header
+
     def create_cameras_tab(self):
         """Camera list editor tab"""
         self.cameras_frame = ttk.Frame(self.cameras_tab, padding="10")
         self.cameras_frame.pack(fill=tk.BOTH, expand=True)
         frame = self.cameras_frame
-        
-        # Header with instructions
-        header = ttk.Frame(frame)
-        header.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(header, text="Camera List", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT)
-        ttk.Label(header, text="  •  Add cameras here for programming, pinging, and other operations", 
-                 font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
+
+        self._build_tab_header(
+            frame, "Camera List",
+            "Add cameras here for programming, pinging, and other operations")
         
         # Toolbar
         toolbar = ttk.Frame(frame)
@@ -7271,13 +7988,10 @@ class CCTVToolkitApp:
         """Discovered cameras tab - shows what's on the network"""
         frame = ttk.Frame(self.discovered_tab, padding="10")
         frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Header
-        header = ttk.Frame(frame)
-        header.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(header, text="Discovered Cameras", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT)
-        ttk.Label(header, text="  •  Cameras found on the network (not your programming list)", 
-                 font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
+
+        self._build_tab_header(
+            frame, "Discovered Cameras",
+            "Cameras found on the network (not your programming list)")
         
         # Buttons
         btn_frame = ttk.Frame(frame)
@@ -7616,18 +8330,81 @@ class CCTVToolkitApp:
 
     def create_passwords_tab(self):
         """Password list editor tab + additional users section"""
-        # Top/bottom split: passwords on top, additional users on bottom
-        outer_split = ttk.PanedWindow(self.passwords_tab, orient=tk.VERTICAL)
-        outer_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # v5.0 b5 — Back-to-wizard at top, ABOVE the vertical split, so the
+        # standardized exit button is always visible regardless of how the
+        # operator drags the inner panes.
+        wrapper = ttk.Frame(self.passwords_tab, padding=(10, 10, 10, 0))
+        wrapper.pack(fill=tk.X)
+        self._build_tab_header(
+            wrapper, "Users & Passwords",
+            "Password list for batch testing  +  additional user accounts to create on each camera")
 
-        # ---- TOP: Password List ----
+        # v5.0 b8 — Brian: 'move users above the password list stuff'. Flipped
+        # so Additional Users is the TOP pane (was being crushed at the
+        # bottom). Password List takes the bottom and gets more vertical
+        # space proportionally since its scrollable listbox can absorb it.
+        outer_split = ttk.PanedWindow(self.passwords_tab, orient=tk.VERTICAL)
+        outer_split.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        # ---- TOP: Additional Users ----
+        users_frame = ttk.LabelFrame(outer_split, text="Additional Users  •  Created on each camera during programming",
+                                     padding="10")
+        outer_split.add(users_frame, weight=2)
+
+        # Controls FIRST (pack side=BOTTOM so the Add User row is always
+        # anchored to the bottom of the pane even when the tree grows).
+        users_controls = ttk.Frame(users_frame)
+        users_controls.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+
+        ttk.Label(users_controls, text="Username:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_name_var = tk.StringVar()
+        ttk.Entry(users_controls, textvariable=self.new_user_name_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(users_controls, text="Password:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_pwd_var = tk.StringVar()
+        ttk.Entry(users_controls, textvariable=self.new_user_pwd_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Label(users_controls, text="Role:").pack(side=tk.LEFT, padx=(0, 3))
+        self.new_user_role_var = tk.StringVar(value='Operator')
+        role_combo = ttk.Combobox(users_controls, textvariable=self.new_user_role_var,
+                                  values=AdditionalUsersDataManager.ROLES, state='readonly', width=12)
+        role_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(users_controls, text="Add User", command=self.add_additional_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(users_controls, text="Delete Selected", command=self.delete_additional_user).pack(side=tk.LEFT, padx=3)
+        ttk.Button(users_controls, text="Clear All", command=self.clear_additional_users).pack(side=tk.LEFT, padx=3)
+
+        self.additional_users_status = tk.StringVar(value="0 additional users")
+        ttk.Label(users_controls, textvariable=self.additional_users_status,
+                 font=('Helvetica', 9), foreground='gray').pack(side=tk.RIGHT)
+
+        # Treeview fills above the controls
+        users_top = ttk.Frame(users_frame)
+        users_top.pack(fill=tk.BOTH, expand=True)
+
+        cols = ('username', 'password', 'role')
+        self.users_tree = ttk.Treeview(users_top, columns=cols, show='headings', height=4)
+        self.users_tree.heading('username', text='Username')
+        self.users_tree.heading('password', text='Password')
+        self.users_tree.heading('role', text='Role')
+        self.users_tree.column('username', width=150, anchor='center')
+        self.users_tree.column('password', width=150, anchor='center')
+        self.users_tree.column('role', width=120, anchor='center')
+        users_scroll = ttk.Scrollbar(users_top, orient=tk.VERTICAL, command=self.users_tree.yview)
+        self.users_tree.configure(yscrollcommand=users_scroll.set)
+        self.users_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        users_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.refresh_additional_users_list()
+
+        # ---- BOTTOM: Password List ----
         frame = ttk.Frame(outer_split)
         outer_split.add(frame, weight=3)
 
-        # Header
+        # Section header (no Back button here — moved to tab-level header above)
         header = ttk.Frame(frame)
         header.pack(fill=tk.X, pady=(0, 10))
-        ttk.Label(header, text="Password List", font=('Helvetica', 16, 'bold')).pack(side=tk.LEFT)
+        ttk.Label(header, text="Password List", font=('Helvetica', 13, 'bold')).pack(side=tk.LEFT)
         ttk.Label(header, text="  •  Used for batch password testing to find unknown camera passwords",
                  font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
 
@@ -7668,36 +8445,46 @@ class CCTVToolkitApp:
         pwd_entry.bind('<Return>', lambda e: self.add_password())
         
         ttk.Button(right_frame, text="➕ Add Password", command=self.add_password).pack()
-        
-        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=15)
-        
-        # Mass entry
+
+        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+
+        # v5.0 b8 — Common Defaults promoted ABOVE Bulk Add. Brian flagged
+        # b7 layout: bulk-add textbox at height=6 plus Import button pushed
+        # the defaults grid off the visible area when the tab header above
+        # ate vertical space. Quick-defaults are higher-frequency than bulk
+        # imports, so they belong nearer the top of the column.
+        ttk.Label(right_frame, text="Common defaults:", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W, pady=(0, 4))
+        defaults_grid = ttk.Frame(right_frame)
+        defaults_grid.pack(fill=tk.X, pady=(0, 8))
+        common = ["pass", "admin", "root", "password", "123456", "camera", "axis"]
+        for i, pwd in enumerate(common):
+            r, c = divmod(i, 2)
+            btn = ttk.Button(defaults_grid, text=f"+ '{pwd}'",
+                             command=lambda p=pwd: self.add_password_quick(p))
+            btn.grid(row=r, column=c, padx=2, pady=2, sticky='ew')
+        defaults_grid.columnconfigure(0, weight=1)
+        defaults_grid.columnconfigure(1, weight=1)
+
+        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+
+        # Mass entry — moved BELOW defaults so it can be shorter without
+        # eating the quick-add grid. height=4 (was 6) keeps the whole column
+        # compact enough to fit alongside the v5.0 b5 tab header.
         ttk.Label(right_frame, text="Bulk add (one per line):", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W)
-        self.mass_password_text = scrolledtext.ScrolledText(right_frame, font=('Courier', 10), height=6, width=25)
+        self.mass_password_text = scrolledtext.ScrolledText(right_frame, font=('Courier', 10), height=4, width=25)
         self.mass_password_text.pack(fill=tk.X, pady=(5, 5))
-        
+
         # Right-click menu for mass entry
         mass_menu = tk.Menu(self.mass_password_text, tearoff=0)
         mass_menu.add_command(label="Paste", command=lambda: self.mass_password_text.event_generate('<<Paste>>'))
         mass_menu.add_command(label="Clear", command=lambda: self.mass_password_text.delete('1.0', tk.END))
         self.mass_password_text.bind("<Button-3>", lambda e: mass_menu.tk_popup(e.x_root, e.y_root))
-        
-        ttk.Button(right_frame, text="➕ Add All", command=self.mass_add_passwords).pack(pady=(0, 10))
 
-        # Import from file (compact — single button, no extra labels, keeps the
-        # Additional Users section visible without scrolling)
+        ttk.Button(right_frame, text="➕ Add All", command=self.mass_add_passwords).pack(pady=(0, 6))
+
+        # Import from file (compact — single button, no extra labels)
         ttk.Button(right_frame, text="📂 Import from file…  (.txt / .csv / .md)",
-                   command=self.import_passwords_from_file).pack(pady=(2, 10), fill=tk.X)
-
-        ttk.Separator(right_frame, orient='horizontal').pack(fill=tk.X, pady=8)
-        
-        # Common defaults
-        ttk.Label(right_frame, text="Common defaults:", font=('Helvetica', 10, 'bold')).pack(anchor=tk.W)
-        common = ["pass", "admin", "root", "password", "123456", "camera", "axis"]
-        for pwd in common:
-            btn = ttk.Button(right_frame, text=f"Add '{pwd}'", 
-                           command=lambda p=pwd: self.add_password_quick(p))
-            btn.pack(anchor=tk.W, pady=2)
+                   command=self.import_passwords_from_file).pack(pady=(2, 0), fill=tk.X)
         
         # Status
         self.password_status = tk.StringVar(value="0 passwords")
@@ -7705,66 +8492,17 @@ class CCTVToolkitApp:
         
         self.refresh_password_list()
 
-        # ---- BOTTOM: Additional Users ----
-        users_frame = ttk.LabelFrame(outer_split, text="Additional Users  •  Created on each camera during programming",
-                                     padding="10")
-        outer_split.add(users_frame, weight=2)
-
-        # Users treeview
-        users_top = ttk.Frame(users_frame)
-        users_top.pack(fill=tk.BOTH, expand=True)
-
-        cols = ('username', 'password', 'role')
-        self.users_tree = ttk.Treeview(users_top, columns=cols, show='headings', height=5)
-        self.users_tree.heading('username', text='Username')
-        self.users_tree.heading('password', text='Password')
-        self.users_tree.heading('role', text='Role')
-        # anchor='center' on data columns matches the default-centered headings
-        # — without this, headers center but data left-aligns (Brian flagged
-        # 2026-05-02: visual mismatch, alignment bug)
-        self.users_tree.column('username', width=150, anchor='center')
-        self.users_tree.column('password', width=150, anchor='center')
-        self.users_tree.column('role', width=120, anchor='center')
-        users_scroll = ttk.Scrollbar(users_top, orient=tk.VERTICAL, command=self.users_tree.yview)
-        self.users_tree.configure(yscrollcommand=users_scroll.set)
-        self.users_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        users_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Add/remove controls
-        users_controls = ttk.Frame(users_frame)
-        users_controls.pack(fill=tk.X, pady=(8, 0))
-
-        ttk.Label(users_controls, text="Username:").pack(side=tk.LEFT, padx=(0, 3))
-        self.new_user_name_var = tk.StringVar()
-        ttk.Entry(users_controls, textvariable=self.new_user_name_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Label(users_controls, text="Password:").pack(side=tk.LEFT, padx=(0, 3))
-        self.new_user_pwd_var = tk.StringVar()
-        ttk.Entry(users_controls, textvariable=self.new_user_pwd_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Label(users_controls, text="Role:").pack(side=tk.LEFT, padx=(0, 3))
-        self.new_user_role_var = tk.StringVar(value='Operator')
-        role_combo = ttk.Combobox(users_controls, textvariable=self.new_user_role_var,
-                                  values=AdditionalUsersDataManager.ROLES, state='readonly', width=12)
-        role_combo.pack(side=tk.LEFT, padx=(0, 8))
-
-        ttk.Button(users_controls, text="Add User", command=self.add_additional_user).pack(side=tk.LEFT, padx=3)
-        ttk.Button(users_controls, text="Delete Selected", command=self.delete_additional_user).pack(side=tk.LEFT, padx=3)
-        ttk.Button(users_controls, text="Clear All", command=self.clear_additional_users).pack(side=tk.LEFT, padx=3)
-
-        self.additional_users_status = tk.StringVar(value="0 additional users")
-        ttk.Label(users_controls, textvariable=self.additional_users_status,
-                 font=('Helvetica', 9), foreground='gray').pack(side=tk.RIGHT)
-
-        self.refresh_additional_users_list()
-
     def create_operations_tab(self):
         """Operations tab with big buttons and wizards"""
         frame = ttk.Frame(self.operations_tab, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Header
-        ttk.Label(frame, text="Operations", font=('Helvetica', 20, 'bold')).pack(pady=(0, 20))
+
+        self._build_tab_header(
+            frame, "Operations",
+            "Pick what to do with the loaded camera list",
+            title_size=20)
+        # Spacer below the header
+        ttk.Frame(frame, height=10).pack()
         
         # Grid of operation buttons
         btn_frame = ttk.Frame(frame)
@@ -8597,6 +9335,28 @@ class CCTVToolkitApp:
                     self.log(f"  smart: {ll_ip} ({ll_mac}) — HTTP dead at link-local, deferring to dumb sweep")
                     continue
 
+            # v4.6.0b9 — short-circuit factory-clean cameras. Brian's 4.6b8
+            # test 2026-05-10: smart pass walked all 803 saved passwords
+            # against a factory-clean camera (no auth set) for 37 seconds
+            # before giving up. The camera has NO password to match — the
+            # walk was guaranteed to fail. Fast factory-state probe (single
+            # no-auth HTTP request, <100ms): if pwdgrp.cgi action=list
+            # returns 200 without auth, the camera is in factory state with
+            # no users yet. Skip the walk entirely — the dumb sweep / wait
+            # loop will pick this camera up as factory-clean / ready to
+            # program. Saves ~37s on retest cycles where the camera was
+            # just factory-defaulted.
+            try:
+                fc_resp = requests.get(
+                    f"http://{ll_ip}/axis-cgi/pwdgrp.cgi",
+                    params={"action": "list"},
+                    timeout=3)
+                if fc_resp.status_code == 200:
+                    self.log(f"  smart: {ll_ip} ({ll_mac}) — camera is factory-clean (pwdgrp.cgi action=list no-auth=200) — skipping password walk")
+                    continue
+            except Exception:
+                pass  # fall through to the password walk if the probe fails
+
             # Walk passwords (cache hits in <100ms on a known camera).
             self.log(f"  smart: {ll_ip} ({ll_mac}, {model}) — auth via saved passwords…")
             pwd = self._find_working_password(ll_ip, known_mac=mac_clean)
@@ -8666,6 +9426,26 @@ class CCTVToolkitApp:
         if not iface_idx:
             return 0
 
+        # v4.6.0b10 — short-circuit pre-flight entirely when the bundled DHCP
+        # server says it already has an active lease for a camera-vendor MAC.
+        # The server only ACKs leases to camera-OUI MACs (b1 MAC filter), and
+        # lease_active flips True the instant it sends the ACK — so a True
+        # value means a camera just grabbed the lease, just rebooted, and is
+        # in factory-clean state ready to program. No need to scan 6 /24s
+        # (~34s) looking for previously-configured cameras to reset; there
+        # are none to find. Brian's 4.6b9 test 2026-05-10: 34s of dumb
+        # sweep producing 'already factory-clean — no reset prompt needed'
+        # — pure overhead.
+        srv = getattr(self, 'session_dhcp_server', None)
+        try:
+            if srv and getattr(srv, 'lease_active', False) and getattr(srv, 'last_client_mac', ''):
+                lease_mac = srv.last_client_mac
+                if self._lease_holder_is_camera(lease_mac):
+                    self.log(f"\nPre-flight: bundled DHCP shows camera {lease_mac} at lease IP — already factory-clean, ready to program. Skipping pre-flight discovery scan.")
+                    return 0
+        except Exception:
+            pass  # Fall through to the normal pre-flight if anything goes wrong
+
         # ---- Stage 1: smart pass via link-local mDNS + camera self-report ----
         self.log("\nPre-flight (smart): mDNS on link-local + ask each camera its real IP…")
         smart_found = self._smart_preflight_via_linklocal(iface_idx)
@@ -8683,6 +9463,22 @@ class CCTVToolkitApp:
         for sn in DEFAULT_FIND_ANYWHERE_SUBNETS:
             if getattr(self, 'cancel_flag', False):
                 break
+            # v4.6.0b11 — bail mid-sweep when bundled DHCP gets an active
+            # camera lease. The b10 entry-check missed this case: pre-flight
+            # had already started before the camera grabbed its lease.
+            # Without this in-loop check, the dumb sweep churns through 5-6
+            # subnets looking for cameras while the answer arrived 13s in.
+            # Brian's 4.6b10 trace 2026-05-10: lease ACK at 18:53:00, dumb
+            # sweep didn't finish until 18:53:21 = 21 wasted seconds.
+            try:
+                _srv = getattr(self, 'session_dhcp_server', None)
+                if _srv and getattr(_srv, 'lease_active', False) and getattr(_srv, 'last_client_mac', ''):
+                    _lease_mac = _srv.last_client_mac
+                    if self._lease_holder_is_camera(_lease_mac):
+                        self.log(f"Pre-flight (sweep): bundled DHCP picked up camera {_lease_mac} at lease IP mid-sweep — aborting remaining subnet scans.")
+                        break
+            except Exception:
+                pass
             already = _have_route_to(f"{sn}.1")
             alias_ip = None
             if already and already.get('iface_index') == iface_idx:
@@ -8931,8 +9727,30 @@ class CCTVToolkitApp:
 
         if reset_count:
             self.log(f"\nPre-flight complete: {reset_count} camera(s) factory-reset and rebooting.")
-            self.log(f"Pausing 8s for them to drop offline, then the wait loop will catch them as they come back at factory IP / DHCP / link-local.")
-            time.sleep(8)
+            # v4.6.0b7 — was: blind time.sleep(8) regardless of actual camera
+            # state. Now: poll the reset IPs every 500ms for up to 8s, exit
+            # as soon as ALL of them have stopped responding to ping (which
+            # means they've successfully gone offline for the reboot). On a
+            # fast camera (most modern Axis), this saves 5-7s vs the blind
+            # sleep. Worst case still capped at 8s like before.
+            self.log(f"Waiting (up to 8s) for camera(s) to drop offline before the wait loop catches them coming back…")
+            reset_ips = []
+            for entry in found:
+                ip = entry.get('ip', '')
+                if ip and ip not in reset_ips:
+                    reset_ips.append(ip)
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                all_offline = True
+                for ip in reset_ips:
+                    if self.ping_camera(ip, timeout_ms=400):
+                        all_offline = False
+                        break
+                if all_offline:
+                    elapsed = 8.0 - (deadline - time.time())
+                    self.log(f"  ✓ All {reset_count} camera(s) confirmed offline after {elapsed:.1f}s")
+                    break
+                time.sleep(0.5)
         return reset_count
 
     def _cleanup_multihome(self):
@@ -11473,6 +12291,26 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "5.0.0": (
+            "What's new in v5.0.0",
+            [
+                "• MAJOR UX REWRITE: tabs are gone. The toolkit now opens to a linear, numbered Setup flow that walks you through Interface → DHCP → Brand → Camera List → Operations → Status — one decision per screen, the way a real job actually unfolds. No more 'do I need Discovered? what's Passwords for?' wandering.",
+                "• The old session bar (interface + DHCP at the top) and the brand selector are now Setup Steps 1, 2, and 3 — inline where they belong instead of slapped on every screen.",
+                "• 'Passwords' is renamed 'Users & Passwords' to reflect that the tab manages both the system-user accounts created during programming AND the saved password list used for auth attempts.",
+                "• Power-user / one-off screens (Camera List editor, Discovered, Users & Passwords, Operations, Programming Status, Log & Results) are still there — reach them via the 'Tools ▾' menu in the top-right of the new header bar. Home button in the same header returns you to Setup any time.",
+                "• Everything from v4.6 carries forward: the FW-aware set_network path (90s → 5s on FW 10.x), bundled DHCP MAC filter, wizard re-entry guard, ONVIF user CreateUsers/DeleteUsers fixes, instant camera-found via bundled DHCP lease state, MAC editor in the camera list. Two cameras programmed end-to-end in under two minutes in the last v4.6 field test.",
+            ],
+        ),
+        "4.6.0": (
+            "What's new in v4.6.0",
+            [
+                "• HEADLINE: FW 10.x cameras program in ~5 seconds instead of ~90. The set_network step now picks its path based on the camera's firmware — older firmware (anything before AXIS OS 12) skips the slow ONVIF SOAP route and uses VAPIX param.cgi directly, which is the same path the camera's own web UI uses and is dramatically faster on those cameras.",
+                "• Why it was slow before: on FW 10.12.x, the camera's ONVIF SetNetworkDefaultGateway handler takes 60-90 seconds to commit network config to flash. The toolkit's 15-second read timeout fired three times during that one commit, retried, stacked ghost requests behind the in-flight one, and then SetNetworkInterfaces sat behind the queue. Net effect: ~90s of wait time per FW 10.x camera. FW 12 wasn't affected because its ONVIF service was rewritten to commit in ~1s.",
+                "• Why VAPIX is fast on FW 10.x: the camera's web UI uses /axis-cgi/network_settings.cgi (and friends) which calls a different camera-side handler that writes the running config directly without the slow ONVIF validate-commit-restart pipeline. Browser opens to a freshly-defaulted FW 10.x camera in seconds. Now the toolkit gets the same speed.",
+                "• Safety: VAPIX is 4 separate calls (DHCP=no, gateway, subnet, IP) instead of ONVIF's single atomic SOAP envelope. If the link drops between calls the camera could end up partially configured. On FW 10.x this is a fair trade for going from 90s to 5s — and ONVIF still runs as a fallback if VAPIX fails. FW 12 keeps the ONVIF-first path (fast and atomic, no trade-off).",
+                "• If the wizard didn't capture the firmware version during discovery, set_network does a quick no-auth basicdeviceinfo.cgi probe (~50ms) to figure it out before picking the path.",
+            ],
+        ),
         "4.5.3": (
             "What's new in v4.5.3",
             [
@@ -11935,6 +12773,14 @@ https://buymeacoffee.com/thelostping""")
     
     def start_program_wizard_classic(self):
         """Classic programming flow — original combined-options dialog + log-only UI."""
+        # v4.6.0b6 — same re-entry guard as start_program_wizard.
+        if getattr(self, '_wizard_running', False):
+            messagebox.showwarning(
+                "A programming run is already active",
+                "Click Cancel on the active run first, or wait for it to "
+                "finish.",
+                parent=self.root)
+            return
         cameras = self.validate_cameras_for_programming()
         if not cameras:
             return
@@ -12732,13 +13578,178 @@ https://buymeacoffee.com/thelostping""")
             self._cleanup_multihome()  # v4.3 #11 — tear down any auto-added IPs
             self._close_wizard_run_log()
 
-        threading.Thread(target=run, daemon=True).start()
+        # v4.6.0b6 — re-entry guard. Set BEFORE thread spawn (race window),
+        # cleared in finally inside the wrapper so any exit path releases it.
+        self._wizard_running = True
+        def _run_with_flag():
+            try:
+                run()
+            finally:
+                self._wizard_running = False
+        threading.Thread(target=_run_with_flag, daemon=True).start()
 
     # ========================================================================
     # NEW PROGRAMMING FLOW (step-by-step wizard + live status view)
     # ========================================================================
+    def start_program_wizard_with_confirm(self):
+        """v5.0 b4 — folded into the main wizard. The pre-flight confirm
+        is now Step 2 (Credentials) of the programming wizard itself, so
+        operators see one flow instead of two. Kept as a thin shim that
+        forwards to start_program_wizard for any older bindings."""
+        self.start_program_wizard()
+        return
+
+    def _start_program_wizard_with_confirm_DEPRECATED(self):
+        """v5.0 b3 — pre-flight confirm dialog before launching the
+        step-by-step programming wizard. Brian's ask: 'Program new cameras
+        should confirm the admin user, then the confirmed programming
+        password. Extra users? Yes/No.' This is the operator's last chance
+        to verify the three highest-stakes inputs before programming starts.
+        After confirm, calls into start_program_wizard which has the full
+        step-by-step flow."""
+        # Re-entry guard FIRST so the confirm dialog doesn't sit open while
+        # an old run is still alive in another thread.
+        if getattr(self, '_wizard_running', False):
+            messagebox.showwarning(
+                "A programming run is already active",
+                "Click Cancel on the active run first, or wait for it to finish.",
+                parent=self.root)
+            return
+        cameras = self.validate_cameras_for_programming()
+        if not cameras:
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Confirm before programming")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        _center_on_parent(dlg, self.root, 540, 360)
+
+        body = ttk.Frame(dlg, padding=20)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text=f"Program {len(cameras)} {self.protocol.BRAND_NAME} camera(s)",
+                  font=('Helvetica', 13, 'bold')).pack(anchor='w', pady=(0, 4))
+        ttk.Label(body,
+                  text="Confirm the three high-stakes inputs before the wizard fires.",
+                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(0, 14))
+
+        # Admin user
+        user_row = ttk.Frame(body); user_row.pack(fill=tk.X, pady=4)
+        ttk.Label(user_row, text="Admin user:", width=18,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        user_var = tk.StringVar(value=self.protocol.DEFAULT_USER or 'root')
+        ttk.Entry(user_row, textvariable=user_var, width=20,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        ttk.Label(user_row, text=f"(brand default: {self.protocol.DEFAULT_USER})",
+                  foreground='gray', font=('Helvetica', 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+        # Password + confirm
+        pwd1_row = ttk.Frame(body); pwd1_row.pack(fill=tk.X, pady=4)
+        ttk.Label(pwd1_row, text="Programming password:", width=18,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        pwd1_var = tk.StringVar(value='')
+        pwd1_entry = ttk.Entry(pwd1_row, textvariable=pwd1_var, width=24, show='•',
+                               font=('Helvetica', 10))
+        pwd1_entry.pack(side=tk.LEFT)
+
+        pwd2_row = ttk.Frame(body); pwd2_row.pack(fill=tk.X, pady=4)
+        ttk.Label(pwd2_row, text="Confirm password:", width=18,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        pwd2_var = tk.StringVar(value='')
+        ttk.Entry(pwd2_row, textvariable=pwd2_var, width=24, show='•',
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+
+        # Extra users yes/no
+        extras_count = 0
+        try:
+            extras_count = len(self.additional_users_data.get_all())
+        except Exception:
+            pass
+        extras_row = ttk.Frame(body); extras_row.pack(fill=tk.X, pady=(12, 4))
+        ttk.Label(extras_row, text="Add extra users?", width=18,
+                  font=('Helvetica', 10)).pack(side=tk.LEFT)
+        extras_var = tk.BooleanVar(value=False)
+        if extras_count > 0:
+            ttk.Radiobutton(extras_row, text=f"Yes ({extras_count} configured)",
+                            variable=extras_var, value=True).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Radiobutton(extras_row, text="No",
+                            variable=extras_var, value=False).pack(side=tk.LEFT)
+        else:
+            ttk.Label(extras_row,
+                      text="(no extra users configured — use Users & Passwords to add)",
+                      foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT)
+
+        # Buttons
+        btns = ttk.Frame(body); btns.pack(fill=tk.X, pady=(20, 0))
+        result = {'ok': False, 'user': '', 'pwd': '', 'extras': False}
+        def _ok():
+            u = user_var.get().strip()
+            p1 = pwd1_var.get()
+            p2 = pwd2_var.get()
+            if not u:
+                messagebox.showwarning("Required", "Admin user is required.", parent=dlg)
+                return
+            if not p1:
+                messagebox.showwarning("Required", "Programming password is required.", parent=dlg)
+                return
+            if p1 != p2:
+                messagebox.showerror("Mismatch", "The two password fields don't match.", parent=dlg)
+                pwd1_entry.focus_set()
+                return
+            result['ok'] = True
+            result['user'] = u
+            result['pwd'] = p1
+            result['extras'] = bool(extras_var.get())
+            dlg.destroy()
+        def _cancel():
+            dlg.destroy()
+        ttk.Button(btns, text="Cancel", command=_cancel).pack(side=tk.RIGHT, padx=(8, 0))
+        ok_btn = tk.Button(btns, text="✓ Start Programming",
+                           bg='#4CAF50', fg='white', font=('Helvetica', 10, 'bold'),
+                           padx=14, pady=6, relief=tk.RAISED, cursor='hand2',
+                           command=_ok)
+        ok_btn.pack(side=tk.RIGHT)
+        dlg.bind('<Return>', lambda e: _ok())
+        dlg.bind('<Escape>', lambda e: _cancel())
+        pwd1_entry.focus_set()
+        dlg.wait_window(dlg)
+
+        if not result['ok']:
+            return
+
+        # Stash the confirmed values into the protocol's defaults so the
+        # subsequent ProgramWizardDialog inside start_program_wizard picks
+        # them up. Then hand off to the real wizard.
+        try:
+            self.protocol.DEFAULT_USER = result['user']
+        except Exception:
+            pass
+        # Pre-seed the wizard dialog's password and extra-users by stashing
+        # on the app for the wizard to read at construction time.
+        self._preconfirmed_password = result['pwd']
+        self._preconfirmed_add_extra_users = result['extras']
+        self.start_program_wizard()
+
     def start_program_wizard(self):
         """Step-by-step programming flow with live checklist UI."""
+        # v4.6.0b6 — re-entry guard. Without this, clicking Program a second
+        # time before the first run fully exits leaves TWO run() threads
+        # alive. They both look at the same camera list, both factory-reset
+        # the same camera, and their set_network calls race. Brian's
+        # 4.6b1slow.pcap from 2026-05-10 caught it: thread #1's
+        # set_network was atomically writing the new IP while thread #2's
+        # factory_first reset path was wiping the camera that #1 had just
+        # finished programming. ~80s of redo + interleaved log spam.
+        if getattr(self, '_wizard_running', False):
+            messagebox.showwarning(
+                "A programming run is already active",
+                "Click Cancel on the active run first, or wait for it to "
+                "finish.\n\nStarting a second run while another is in flight "
+                "races both runs on the same camera list and can corrupt "
+                "in-progress programming.",
+                parent=self.root)
+            return
         cameras = self.validate_cameras_for_programming()
         if not cameras:
             return
@@ -12938,24 +13949,44 @@ https://buymeacoffee.com/thelostping""")
                 _wait_start = time.time()
                 _last_heartbeat = _wait_start
                 while not self.cancel_flag:
-                    # Bundled DHCP path: when the server is on, the camera
-                    # picks up our lease almost immediately on power-up.
-                    # Check this IP first — it's the "always know" address.
+                    # v4.6.0b8 — FASTEST path: the bundled DHCP server itself
+                    # is the authoritative source of "camera just grabbed the
+                    # lease". `lease_active` flips True the instant the
+                    # server ACKs a REQUEST, and the b1 MAC filter ensures
+                    # only camera-vendor OUIs ever get to that point.
+                    # No need to ICMP-probe — the lease ACK IS the signal.
+                    # Brian 4.6b1 test 2026-05-10: camera at .50 from
+                    # 18:20:36 (DHCP ACK timestamp), toolkit took 42s of
+                    # ping-based polling to find it via mDNS instead. FW 12
+                    # cameras can ARP-probe for tens of seconds before
+                    # responding to ICMP at the new IP, so ICMP-based
+                    # polling is unreliable. Server-side lease state is
+                    # instant and reliable.
                     if self._bundled_dhcp and dhcp_lease_ip:
+                        try:
+                            lease_active = bool(getattr(self._bundled_dhcp, 'lease_active', False))
+                            lease_mac_from_server = getattr(self._bundled_dhcp, 'last_client_mac', '') or ''
+                        except Exception:
+                            lease_active = False
+                            lease_mac_from_server = ''
+                        if lease_active and lease_mac_from_server:
+                            # MAC filter at the DHCP server already guarantees this is
+                            # a camera-vendor MAC, but verify once more for safety.
+                            if self._lease_holder_is_camera(lease_mac_from_server):
+                                camera_ip = dhcp_lease_ip
+                                self.status_log(f"Camera found at bundled DHCP lease {dhcp_lease_ip} (server says {lease_mac_from_server} is active)")
+                                break
+                        # Older slower path: ICMP probe as fallback when the
+                        # lease isn't active yet (e.g. server just started,
+                        # camera hasn't requested DHCP yet, or camera is on a
+                        # static IP at the lease address from a previous run).
                         if self.ping_camera(dhcp_lease_ip, timeout_ms=1000):
-                            # Verify whoever holds the lease matches the
-                            # camera-vendor OUI / whitelist. Managed PoE
-                            # switches and rogue laptops on the segment can
-                            # race for the same single lease IP — without
-                            # this check the wait-loop would falsely declare
-                            # "Camera found" and try to factory-reset them.
                             lease_mac = self._mac_for_ip(dhcp_lease_ip)
                             if not self._lease_holder_is_camera(lease_mac):
                                 self.status_log(
                                     f"  Lease {dhcp_lease_ip} is held by "
                                     f"{lease_mac or '?'} — not a {self.protocol.BRAND_NAME} camera, "
                                     f"ignoring and continuing to wait")
-                                # Pause briefly so we don't spam this on every loop tick
                                 time.sleep(2)
                             else:
                                 camera_ip = dhcp_lease_ip
@@ -13089,6 +14120,25 @@ https://buymeacoffee.com/thelostping""")
                     # source; the camera just answered ICMP from us.
                     if not mac:
                         mac = self.get_mac_from_arp(camera_ip)
+                    # v4.6.0b12 — last-resort fallback: when bundled DHCP fed
+                    # us this camera, the server already KNOWS the MAC from
+                    # the DHCP REQUEST. Probe_unrestricted may return empty
+                    # mac during the camera's HTTP-not-yet-ready window post
+                    # DHCP ACK (FW 12 ARP-probe phase, etc.) and ARP cache
+                    # may not be populated yet either. The server-side
+                    # last_client_mac is authoritative. Brian's 4.6b11 test
+                    # 2026-05-10 hit exactly this: 'No MAC from ARP' even
+                    # though session_dhcp_server.last_client_mac was set
+                    # to the correct value 8 seconds prior. Use it.
+                    if not mac:
+                        try:
+                            srv = getattr(self, '_bundled_dhcp', None)
+                            if srv and camera_ip == dhcp_lease_ip:
+                                fallback_mac = getattr(srv, 'last_client_mac', '') or ''
+                                if fallback_mac:
+                                    mac = fallback_mac
+                        except Exception:
+                            pass
                     if mac:
                         mac_norm = mac.upper().replace(':', '').replace('-', '')
                         if mac_norm not in seen_macs:
@@ -13991,7 +15041,14 @@ https://buymeacoffee.com/thelostping""")
             self._bundled_dhcp = None
             self._close_wizard_run_log()
 
-        threading.Thread(target=run, daemon=True).start()
+        # v4.6.0b6 — re-entry guard wrapper (see comment in classic flow).
+        self._wizard_running = True
+        def _run_with_flag():
+            try:
+                run()
+            finally:
+                self._wizard_running = False
+        threading.Thread(target=_run_with_flag, daemon=True).start()
 
     def start_factory_default_wizard(self, prefill_ip=None):
         """v4.3 — Standalone factory default. Asks for IP + existing root
