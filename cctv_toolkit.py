@@ -5847,7 +5847,14 @@ class ProgramWizardDialog(tk.Toplevel):
         step['frame'].pack(fill=tk.BOTH, expand=True)
         self.header_title.config(text=step['title'])
         self.header_subtitle.config(text=step['subtitle'])
-        self.step_label.config(text=f"Step {idx + 1} of {len(self.steps)}")
+        # v5.0 b6 — count Welcome as "Welcome" not "Step 1 of 6". Real numbered
+        # steps start at 1 from the SECOND screen onwards so the top-banner
+        # label matches the "Step X of 5" wording in each step's title.
+        total_real = max(len(self.steps) - 1, 1)
+        if idx == 0:
+            self.step_label.config(text="Welcome")
+        else:
+            self.step_label.config(text=f"Step {idx} of {total_real}")
         self.back_btn.config(state='normal' if idx > 0 else 'disabled')
         if idx == len(self.steps) - 1:
             self.next_btn.config(text='✓ Start Programming')
