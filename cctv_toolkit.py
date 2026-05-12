@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.0.1"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -7283,16 +7283,142 @@ class CCTVToolkitApp:
                   font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
         ttk.Label(body, text="This is the NIC the toolkit will talk to cameras on. Auto-detect picks the first usable one — fine for single-NIC laptops; pick explicitly for multi-NIC.",
                   foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
-        ifaces = getattr(self, '_session_interfaces', None) or ProgramOptionsDialog._get_network_interfaces()
+        # v5.0.1 — re-enumerate every time Step 2 renders. Interfaces gain/lose
+        # IPs while the app is open (auto-multihome adds/removes, the OS hands
+        # out a new DHCP lease, VPN connects/disconnects, the user manually
+        # configures a new alias). Previously this was cached on first render
+        # and only refreshed by close+reopen.
+        ifaces = ProgramOptionsDialog._get_network_interfaces()
         self._session_interfaces = ifaces
         labels = ['Auto-detect'] + [i['label'] for i in ifaces]
+        # Preserve the operator's selection if it survived the refresh.
+        if self.session_iface_var.get() not in labels:
+            self.session_iface_var.set('Auto-detect')
         row = ttk.Frame(body)
         row.pack(anchor='w', pady=(4, 0))
         ttk.Label(row, text="Interface:", font=('Helvetica', 10, 'bold')).pack(side=tk.LEFT)
         cb = ttk.Combobox(row, textvariable=self.session_iface_var, values=labels,
                           state='readonly', width=50, font=('Helvetica', 10))
         cb.pack(side=tk.LEFT, padx=(10, 0))
-        cb.bind('<<ComboboxSelected>>', self._on_session_iface_change)
+        ttk.Button(row, text='↻ Refresh', width=11,
+                   command=lambda: self._setup_goto(self._setup_step)).pack(side=tk.LEFT, padx=(8, 0))
+        cb.bind('<<ComboboxSelected>>', self._on_session_iface_change_with_subnet_check)
+
+        # v5.0.1 — subnet-reachability hint. When the selected interface can't
+        # reach the brand's factory IP (e.g. NIC at 10.0.0.2 trying to program
+        # an Axis camera at 192.168.0.90), surface that here and offer to add
+        # a temporary same-subnet alias before the operator hits a wall mid-run.
+        self._setup_subnet_check_frame = ttk.Frame(body)
+        self._setup_subnet_check_frame.pack(fill=tk.X, anchor='w', pady=(16, 0))
+        self._render_subnet_check()
+
+    def _on_session_iface_change_with_subnet_check(self, event=None):
+        """v5.0.1 — wraps _on_session_iface_change so Step 2's reachability
+        hint refreshes whenever the operator picks a different interface."""
+        self._on_session_iface_change(event)
+        self._render_subnet_check()
+
+    def _render_subnet_check(self):
+        """v5.0.1 — paint the Step 2 reachability hint. Idempotent; safe to
+        call from the combobox handler and after a successful alias-add."""
+        frame = getattr(self, '_setup_subnet_check_frame', None)
+        if frame is None:
+            return
+        try:
+            if not frame.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        for w in frame.winfo_children():
+            w.destroy()
+        factory_ip = ''
+        if hasattr(self, 'protocol') and self.protocol is not None:
+            factory_ip = getattr(self.protocol, 'FACTORY_IP', '') or ''
+        if not factory_ip or '.' not in factory_ip:
+            return
+        iface = self._resolve_session_iface()
+        if iface is None:
+            ttk.Label(frame, text=f"ℹ Auto-detect selected — the toolkit will pick whichever NIC has a route to the factory IP ({factory_ip}) at run-time.",
+                      foreground='#666', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w')
+            return
+        route = _have_route_to(factory_ip)
+        if route:
+            ttk.Label(frame, text=f"✓ Reachable — this interface can talk to the factory IP {factory_ip} directly.",
+                      foreground='#1B5E20', font=('Helvetica', 10, 'bold')).pack(anchor='w')
+            return
+        parts = factory_ip.split('.')
+        subnet_base = '.'.join(parts[:3]) if len(parts) == 4 else ''
+        # .89 is in the candidate list per Brian's "make 0.89 a thing" request;
+        # _pick_free_host_ip walks in order and takes the first unused entry.
+        candidates = (99, 98, 97, 89, 250, 249, 200, 150, 100, 50)
+        chosen = _pick_free_host_ip(subnet_base, '255.255.255.0', candidates=candidates) if subnet_base else None
+        ttk.Label(frame, text=f"⚠ {iface.get('ip', '?')} can't reach the factory IP {factory_ip} — different subnet.",
+                  foreground='#C62828', font=('Helvetica', 10, 'bold'),
+                  wraplength=900, justify=tk.LEFT).pack(anchor='w')
+        if not chosen:
+            ttk.Label(frame, text=f"Couldn't find a free host IP in {subnet_base}.x to alias.",
+                      foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(2, 0))
+            return
+        if not _is_admin_windows():
+            ttk.Label(frame, text=f"Relaunch the toolkit as admin to auto-add {chosen}/24 to this NIC so it can reach the factory camera.",
+                      foreground='gray', font=('Helvetica', 9),
+                      wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(2, 0))
+            return
+        ttk.Label(frame, text=f"Add {chosen}/24 to this NIC as a temporary alias so the toolkit can reach the factory camera at {factory_ip}.\nCleanup runs automatically at wizard end and on app close.",
+                  foreground='#555', font=('Helvetica', 9),
+                  wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(4, 4))
+        tk.Button(frame, text=f"➕ Add {chosen}/24 alias",
+                  font=('Helvetica', 10, 'bold'), bg='#FFA000', fg='white',
+                  relief=tk.RAISED, padx=12, pady=4, cursor='hand2',
+                  command=lambda: self._add_factory_subnet_alias(factory_ip)).pack(anchor='w')
+
+    def _add_factory_subnet_alias(self, factory_ip):
+        """v5.0.1 — Step 2 'Add alias' button. Adds a same-subnet IP to the
+        selected NIC via netsh, registers it in multihome_state.json so the
+        existing teardown machinery cleans it up, then re-renders the hint."""
+        iface = self._resolve_session_iface()
+        if not iface:
+            messagebox.showwarning("Pick an interface",
+                                   "Pick a specific interface above first (not Auto-detect) "
+                                   "so the toolkit knows which NIC to add the alias to.",
+                                   parent=self.root)
+            return
+        iface_idx = iface.get('index')
+        if not iface_idx:
+            messagebox.showerror("No interface index",
+                                 "Selected interface has no usable InterfaceIndex.",
+                                 parent=self.root)
+            return
+        parts = factory_ip.split('.')
+        if len(parts) != 4:
+            return
+        subnet_base = '.'.join(parts[:3])
+        chosen = _pick_free_host_ip(subnet_base, '255.255.255.0',
+                                    candidates=(99, 98, 97, 89, 250, 249, 200, 150, 100, 50))
+        if not chosen:
+            messagebox.showinfo("No free host IP",
+                                f"All candidate IPs in {subnet_base}.x are already in use.",
+                                parent=self.root)
+            return
+        if not _netsh_add_ip(iface_idx, chosen, '255.255.255.0'):
+            messagebox.showerror("Add alias failed",
+                                 f"netsh add {chosen}/24 to interface {iface_idx} failed. "
+                                 "Check that the toolkit is running as admin.",
+                                 parent=self.root)
+            self._render_subnet_check()
+            return
+        existing = _load_multihome_state() or []
+        existing.append({'iface_index': iface_idx, 'ip': chosen,
+                         'mask': '255.255.255.0', 'subnet_base': subnet_base,
+                         '_added_by': 'step2_subnet_check',
+                         '_for_target': factory_ip})
+        _save_multihome_state(existing)
+        try:
+            self.log(f"Step 2: added subnet alias {chosen}/24 on iface {iface_idx} for factory IP {factory_ip}")
+        except Exception:
+            pass
+        time.sleep(1.0)  # let the OS wire up the address before re-checking
+        self._render_subnet_check()
 
     def _setup_render_dhcp(self, body):
         ttk.Label(body, text="Run the bundled DHCP server?",
@@ -7345,7 +7471,39 @@ class CCTVToolkitApp:
         ttk.Label(body, text=f"Current camera list: {count} entries",
                   font=('Helvetica', 10)).pack(anchor='w')
 
+    def _make_scrollable_frame(self, parent):
+        """v5.0.1 — return a Frame that grows beyond `parent`'s visible area.
+        A vertical scrollbar appears automatically. MouseWheel scrolls when
+        the cursor is over the canvas. Used by step renderers whose content
+        clips on shorter screens / higher DPI scaling."""
+        canvas = tk.Canvas(parent, borderwidth=0, highlightthickness=0)
+        vsb = ttk.Scrollbar(parent, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+
+        def _on_inner_configure(_e):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+        def _on_canvas_configure(e):
+            canvas.itemconfigure(inner_id, width=e.width)
+        inner.bind('<Configure>', _on_inner_configure)
+        canvas.bind('<Configure>', _on_canvas_configure)
+
+        def _on_mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), 'units')
+        canvas.bind('<Enter>', lambda _e: canvas.bind_all('<MouseWheel>', _on_mousewheel))
+        canvas.bind('<Leave>', lambda _e: canvas.unbind_all('<MouseWheel>'))
+        canvas.bind('<Destroy>', lambda _e: canvas.unbind_all('<MouseWheel>'))
+        return inner
+
     def _setup_render_operations(self, body):
+        # v5.0.1 — wrap operations content in a scrollable frame. At 1920x1080
+        # with 150% DPI scaling the four ops groups overrun the visible window,
+        # hiding Factory Default and the bottom-right scroll affordance. The
+        # canvas+scrollbar pairing keeps everything reachable at any DPI.
+        body = self._make_scrollable_frame(body)
         ttk.Label(body, text="What do you want to do with these cameras?",
                   font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
         ttk.Label(body,
@@ -12291,6 +12449,14 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "5.0.1": (
+            "What's new in v5.0.1",
+            [
+                "• Step 5 'Operations' no longer hides the bottom buttons on smaller screens or at 125% / 150% Windows scaling. The list now scrolls, so Factory Default and the rest of the Capture / Reset row are always reachable.",
+                "• Step 2 'Interface' now refreshes the network adapter list every time you land on the step. Before, the list was captured once at app launch — if you minimized the toolkit, picked up a new IP (VPN, DHCP renew, plugged a new NIC in), and came back, the dropdown was stale until you closed and reopened the whole app. Now it always reflects what your PC has right now. (There's also a manual ↻ Refresh button next to the dropdown.)",
+                "• NEW on Step 2: when the interface you picked can't reach the factory IP of the brand you chose in Step 1 (typical case: laptop on 10.0.0.x, programming an Axis camera at 192.168.0.90), the toolkit now tells you up-front and offers a one-click button to add a temporary same-subnet IP (like 192.168.0.89) to that NIC. No more discovering the gap during the wizard and having to back out. Cleanup runs automatically — same machinery as the existing Auto Multi-Home.",
+            ],
+        ),
         "5.0.0": (
             "What's new in v5.0.0",
             [
