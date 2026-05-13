@@ -14720,6 +14720,35 @@ https://buymeacoffee.com/thelostping""")
                         except Exception:
                             pass
 
+                        # v5.1.0b8 — Switch Loading "fire and forget": DHCP
+                        # gave us a MAC. Axis cameras in factory state listen
+                        # at 192.168.0.90 even when multiple are plugged in
+                        # simultaneously. ARP-pin the discovered MAC to that
+                        # IP — our traffic to .90 now goes specifically to
+                        # this MAC regardless of who else is ARP-claiming it
+                        # on the wire — and proceed to programming. No
+                        # discovery dance, no neighbor-table dependency, no
+                        # multicast voodoo. Per Brian: "Mac found > arp pin
+                        # mac --> factory_ip > fire programmer."
+                        if switch_loading_mode and dhcp_found_mac and not camera_ip:
+                            try:
+                                pinned_ok = self.arp_pin(factory_ip, dhcp_found_mac)
+                                if pinned_ok:
+                                    self.status_log(
+                                        f"  ARP-pinned {dhcp_found_mac} → {factory_ip} "
+                                        f"(switch_loading fire-and-forget)")
+                                else:
+                                    self.status_log(
+                                        f"  ⚠ arp_pin returned False — need admin? "
+                                        f"Proceeding anyway and letting HTTP fail-fast tell us.")
+                                # Set the slot and bail out of discovery. The
+                                # programming pipeline takes over from here.
+                                camera_ip = factory_ip
+                                pinned_mac = dhcp_found_mac
+                                break
+                            except Exception as _ap_e:
+                                self.status_log(f"  [diag] arp_pin error: {_ap_e!r}")
+
                         # v5.1.0b4 — reverse ARP lookup: cameras emit
                         # ARP-ANNOUNCE for their link-local self-assigned IPs
                         # (RFC 3927) so the OS neighbor table almost always
