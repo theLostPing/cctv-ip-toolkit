@@ -14503,6 +14503,39 @@ https://buymeacoffee.com/thelostping""")
                         except Exception:
                             pass
 
+                        # v5.1.0b4 — reverse ARP lookup: cameras emit
+                        # ARP-ANNOUNCE for their link-local self-assigned IPs
+                        # (RFC 3927) so the OS neighbor table almost always
+                        # already knows the MAC↔IP binding even before mDNS
+                        # comes around in its window. Pivot DHCP MAC → IP via
+                        # Get-NetNeighbor on the selected NIC and use it
+                        # directly. Scoped to the chosen interface so we
+                        # don't pick up the same MAC's stale entry from
+                        # another NIC.
+                        if dhcp_found_mac and not camera_ip:
+                            try:
+                                iface_alias = None
+                                if selected_iface:
+                                    iface_alias = selected_iface.get('alias') or selected_iface.get('name')
+                                neighbor_ip = self.get_ip_from_neighbor_for_mac(
+                                    dhcp_found_mac, iface_alias=iface_alias)
+                                if neighbor_ip:
+                                    # Make sure we have a route to that IP (link-local fast-path)
+                                    if neighbor_ip.startswith('169.254.'):
+                                        self.add_linklocal_route()
+                                    if self.ping_camera(neighbor_ip, timeout_ms=1500):
+                                        camera_ip = neighbor_ip
+                                        pinned_mac = dhcp_found_mac
+                                        self.status_log(
+                                            f"Camera (neighbor table): {neighbor_ip}  MAC {dhcp_found_mac}")
+                                        break
+                                    else:
+                                        self.status_log(
+                                            f"  Neighbor table has {dhcp_found_mac} at {neighbor_ip} "
+                                            f"but ping failed — falling through")
+                            except Exception:
+                                pass
+
                         if dhcp_found_mac and not camera_ip:
                             try:
                                 if self.ping_camera(factory_ip, timeout_ms=1000):
@@ -16389,6 +16422,66 @@ https://buymeacoffee.com/thelostping""")
                 _t.sleep(0.4)
         return None
     
+    def get_ip_from_neighbor_for_mac(self, mac, iface_alias=None):
+        """v5.1.0b4 — reverse ARP lookup: given a MAC, return the IP currently
+        associated with it in the Windows neighbor table. Optionally scoped to
+        a single interface by alias.
+
+        This is the "they're screaming, listen to who said it" path: when DHCP
+        snoop tells us a camera-vendor MAC is on the wire, the cameras have
+        almost always also sent ARP-ANNOUNCE / ARP-PROBE for their link-local
+        self-assigned IPs (RFC 3927). Those land in Get-NetNeighbor and let
+        us go MAC → IP without needing mDNS to come around in its own window.
+
+        Returns IP string or None. Filters out 0.0.0.0 / multicast / broadcast
+        / unreachable / incomplete entries."""
+        import subprocess
+        norm = (mac or '').upper().replace(':', '-').replace('.', '-')
+        if len(norm.replace('-', '')) != 12:
+            return None
+        # Build the PowerShell filter. Quote interface alias if given.
+        if iface_alias:
+            cmd = (f"Get-NetNeighbor -AddressFamily IPv4 "
+                   f"-InterfaceAlias '{iface_alias}' "
+                   f"-ErrorAction SilentlyContinue | "
+                   f"Where-Object {{ $_.LinkLayerAddress -eq '{norm}' -and "
+                   f"$_.State -ne 'Unreachable' }} | "
+                   f"Select-Object -ExpandProperty IPAddress")
+        else:
+            cmd = (f"Get-NetNeighbor -AddressFamily IPv4 "
+                   f"-ErrorAction SilentlyContinue | "
+                   f"Where-Object {{ $_.LinkLayerAddress -eq '{norm}' -and "
+                   f"$_.State -ne 'Unreachable' }} | "
+                   f"Select-Object -ExpandProperty IPAddress")
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=5,
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            if result.returncode != 0:
+                return None
+            for line in result.stdout.splitlines():
+                ip = line.strip()
+                if not ip:
+                    continue
+                # Filter out garbage: 0.0.0.0, multicast (224-239), broadcast
+                if ip == '0.0.0.0' or ip == '255.255.255.255':
+                    continue
+                try:
+                    first_octet = int(ip.split('.')[0])
+                    if 224 <= first_octet <= 239:
+                        continue
+                except (ValueError, IndexError):
+                    continue
+                return ip
+        except Exception:
+            pass
+        return None
+
     def arp_pin(self, ip, mac):
         """Pin ARP entry so all traffic to IP goes to specific MAC.
         Note: requires Run as Administrator on Windows for arp -s to work.
