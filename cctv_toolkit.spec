@@ -10,7 +10,16 @@ a = Analysis(
     # Both must be in datas so PyInstaller bundles them; runtime code at line ~5764
     # explicitly looks for app.ico — without it, Tk falls back to its feather icon.
     datas=[('app.ico', '.'), ('logo.ico', '.')],
-    hiddenimports=[],
+    # v5.1.0b7 — scapy + zeroconf needed for Switch Loading L2 discovery.
+    # PyInstaller can't auto-detect scapy submodules; explicit hidden imports.
+    hiddenimports=[
+        'scapy.all',
+        'scapy.arch.windows',
+        'scapy.layers.l2',
+        'scapy.layers.inet',
+        'scapy.layers.dhcp',
+        'zeroconf',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

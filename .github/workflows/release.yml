@@ -32,7 +32,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller==6.18.0 requests pillow openpyxl
+          python -m pip install pyinstaller==6.18.0 requests pillow openpyxl scapy zeroconf
 
       - name: Install Inno Setup (for installer build)
         # windows-latest ships chocolatey pre-installed

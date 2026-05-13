@@ -3658,6 +3658,163 @@ class BundledDHCPServer:
 # ============================================================================
 # AXIS CAMERA DISCOVERY via SSDP / UPnP (NOTIFY + M-SEARCH)
 # ============================================================================
+class AxisL2Discovery:
+    """v5.1.0b7 — Raw L2 packet capture via scapy + npcap. Bypasses Windows
+    OS multicast routing entirely.
+
+    The OS socket path (AxisSSDPDiscovery, AxisMDNSDiscovery) misses
+    link-local cameras on multi-IP NICs because Windows treats logical
+    subnets as isolated for multicast even when sharing a physical wire:
+    even after IP_ADD_MEMBERSHIP on both the link-local helper IP AND the
+    routable iface IP, SSDP NOTIFY from 169.254.x.x cameras doesn't make
+    it to the socket. SSDPSRV also likely steals port 1900 even with
+    SO_REUSEADDR.
+
+    scapy via npcap captures frames at L2 BEFORE the OS network stack
+    sees them, so multicast routing rules and port-binding contention
+    don't apply. Confirmed working against Brian's bench (iputility.pcapng
+    captured on Ethernet 3 was readable by scapy and contained all 4
+    cameras' SSDP NOTIFY traffic).
+
+    Returns list of {ip, mac, model, proto} for each discovered camera.
+
+    Detects via:
+      • SSDP NOTIFY (UDP src or dst port 1900) — payload check 'AXIS'
+      • mDNS responses (UDP port 5353) — source MAC OUI check
+      • Gratuitous ARP / ARP-ANNOUNCE — source MAC OUI check, gives MAC↔IP
+        in one packet, the most prolific source for fresh link-local
+        cameras (every ~few seconds during boot)
+    """
+
+    AXIS_OUIS = ("B8:A4:4F", "AC:CC:8E", "00:40:8C", "E8:27:EB")
+    BPF_FILTER = "(udp port 1900) or (udp port 5353) or arp"
+
+    @staticmethod
+    def _resolve_scapy_iface(iface_ip=None, iface_index=None):
+        """Resolve a scapy iface name from an IP address or Windows iface index.
+        scapy's get_windows_if_list() returns dicts with 'name', 'win_index',
+        and 'ips'. Match by win_index first (exact), then by IP (any match)."""
+        try:
+            from scapy.arch.windows import get_windows_if_list
+        except Exception:
+            return None
+        target_ips = []
+        if iface_ip:
+            if isinstance(iface_ip, str):
+                target_ips = [iface_ip]
+            else:
+                target_ips = [ip for ip in iface_ip if ip]
+        try:
+            for entry in get_windows_if_list():
+                ename = entry.get('name')
+                if iface_index is not None:
+                    try:
+                        if int(entry.get('win_index') or -1) == int(iface_index):
+                            return ename
+                    except Exception:
+                        pass
+                if target_ips:
+                    entry_ips = entry.get('ips') or []
+                    if any(ip in entry_ips for ip in target_ips):
+                        return ename
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def discover(timeout=5, callback=None, iface_ip=None, iface_index=None):
+        cameras = []
+        seen_macs = set()
+        seen_ips = set()
+
+        try:
+            from scapy.all import sniff, Ether, ARP, IP, UDP, Raw
+        except Exception as e:
+            AxisL2Discovery._last_error = f"scapy import failed: {e!r}"
+            return cameras
+
+        iface_name = AxisL2Discovery._resolve_scapy_iface(
+            iface_ip=iface_ip, iface_index=iface_index)
+        AxisL2Discovery._last_iface = iface_name
+        if not iface_name:
+            AxisL2Discovery._last_error = "could not resolve scapy iface from iface_ip/iface_index"
+            return cameras
+
+        def is_axis_mac(mac_str):
+            if not mac_str:
+                return False
+            m = mac_str.upper()
+            return any(m.startswith(o) for o in AxisL2Discovery.AXIS_OUIS)
+
+        def add(mac, ip, proto, model=''):
+            if not mac:
+                return
+            mac = mac.upper()
+            if not is_axis_mac(mac):
+                return
+            key = (mac, ip or '')
+            if key in seen_macs:
+                return
+            seen_macs.add(key)
+            if ip:
+                seen_ips.add(ip)
+            cam = {'mac': mac, 'ip': ip or '', 'model': model, 'proto': proto,
+                   'serial': '', 'name': ''}
+            cameras.append(cam)
+            if callback:
+                try:
+                    callback(cam)
+                except Exception:
+                    pass
+
+        def on_pkt(pkt):
+            try:
+                if pkt.haslayer(ARP):
+                    a = pkt[ARP]
+                    src_mac = (a.hwsrc or pkt[Ether].src if pkt.haslayer(Ether) else a.hwsrc) or ''
+                    src_ip = a.psrc or ''
+                    if src_ip and src_ip != '0.0.0.0' and is_axis_mac(src_mac):
+                        add(src_mac, src_ip, 'arp')
+                    return
+                if pkt.haslayer(UDP) and pkt.haslayer(IP) and pkt.haslayer(Ether):
+                    u = pkt[UDP]
+                    src_mac = pkt[Ether].src
+                    src_ip = pkt[IP].src
+                    # mDNS response — any Axis-OUI source is a hit
+                    if u.sport == 5353 or u.dport == 5353:
+                        if is_axis_mac(src_mac) and src_ip and src_ip != '0.0.0.0':
+                            add(src_mac, src_ip, 'mdns')
+                            return
+                    # SSDP — payload sniff for AXIS regardless of OUI (the
+                    # OUI check is also done, but SSDP confirms it's a
+                    # camera not just any vendor with the same OUI prefix)
+                    if u.sport == 1900 or u.dport == 1900:
+                        payload = bytes(pkt[Raw]) if pkt.haslayer(Raw) else b''
+                        if is_axis_mac(src_mac) or b'AXIS' in payload.upper():
+                            # try to grab model from SERVER: header
+                            model = ''
+                            try:
+                                txt = payload.decode('ascii', errors='ignore')
+                                m = re.search(r'AXIS[\s_\-]*([A-Z0-9\-]+)', txt, re.IGNORECASE)
+                                if m:
+                                    model = m.group(1)
+                            except Exception:
+                                pass
+                            if src_ip and src_ip != '0.0.0.0':
+                                add(src_mac, src_ip, 'ssdp', model=model)
+            except Exception:
+                pass
+
+        try:
+            AxisL2Discovery._last_error = None
+            sniff(iface=iface_name, prn=on_pkt, store=False,
+                  timeout=timeout, filter=AxisL2Discovery.BPF_FILTER)
+        except Exception as e:
+            AxisL2Discovery._last_error = f"scapy sniff failed: {e!r}"
+
+        return cameras
+
+
 class AxisSSDPDiscovery:
     """v5.1.1 — SSDP/UPnP discovery, bound to a specific NIC.
 
@@ -14667,6 +14824,49 @@ https://buymeacoffee.com/thelostping""")
                                     break
                             except Exception:
                                 pass
+
+                        # v5.1.0b7 — L2 raw capture via scapy/npcap. Tried FIRST
+                        # because it bypasses Windows OS multicast routing
+                        # entirely. Catches SSDP NOTIFY, mDNS responses, and
+                        # Axis-OUI ARP/ANNOUNCE packets at the wire level.
+                        if not camera_ip:
+                            try:
+                                _l2_iface_idx = (selected_iface or {}).get('index')
+                                self.status_log(
+                                    f"  [diag] L2 sniff starting (iface_idx={_l2_iface_idx})")
+                                l2_cams = AxisL2Discovery.discover(
+                                    timeout=4,
+                                    iface_ip=wizard_iface_ip,
+                                    iface_index=_l2_iface_idx)
+                                _l2_err = getattr(AxisL2Discovery, '_last_error', None)
+                                _l2_resolved = getattr(AxisL2Discovery, '_last_iface', None)
+                                self.status_log(
+                                    f"  [diag] L2 sniff returned {len(l2_cams)} hit(s) "
+                                    f"(iface={_l2_resolved!r}"
+                                    + (f", err={_l2_err}" if _l2_err else "")
+                                    + ")")
+                                for lc in l2_cams:
+                                    lc_ip = lc.get('ip', '')
+                                    lc_mac = lc.get('mac', '').upper().replace(':', '').replace('-', '')
+                                    if lc_mac and lc_mac in seen_macs:
+                                        continue
+                                    if not lc_ip:
+                                        continue
+                                    if lc_ip.startswith('169.254.'):
+                                        self.add_linklocal_route()
+                                    elif not self._ensure_route_to_camera(lc_ip):
+                                        continue
+                                    if self.ping_camera(lc_ip, timeout_ms=1000):
+                                        camera_ip = lc_ip
+                                        pinned_mac = lc.get('mac', '')
+                                        self.status_log(
+                                            f"Camera (L2 {lc.get('proto','?')}): {lc_ip}  MAC {pinned_mac}"
+                                            + (f"  {lc.get('model','')}" if lc.get('model') else ''))
+                                        break
+                                if camera_ip:
+                                    break
+                            except Exception as _l2e:
+                                self.status_log(f"  [diag] L2 sniff exception: {_l2e!r}")
 
                         if not camera_ip:
                             try:
