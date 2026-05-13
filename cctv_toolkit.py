@@ -14195,6 +14195,16 @@ https://buymeacoffee.com/thelostping""")
             return
 
         opts = wiz.result
+
+        # v5.1.0b3 — Switch Loading IMPLIES auto-multihome. Without it the
+        # toolkit programs cameras to (e.g.) 10.20.30.x but can't reach any
+        # of them to verify because the NIC has no route to that subnet.
+        # In v5.0b4 the UI checkbox was removed (intended to be auto-driven),
+        # so we set the opts flag explicitly here before the hard gate fires.
+        if _sl_pending:
+            opts['switch_loading_mode'] = True
+            opts['auto_multihome'] = True
+
         password = opts['password']
         factory_ip = opts['factory_ip']
         discovery_mode = opts['discovery_mode']
@@ -14263,10 +14273,8 @@ https://buymeacoffee.com/thelostping""")
 
         # v5.1.0: Switch Loading mode — bulk programming where the operator
         # plugs all cameras into the switch at once and the toolkit programs
-        # them by MAC match to the CSV. Set by start_switch_loading_wizard
-        # before it forwards to this method.
-        if _sl_pending:
-            opts['switch_loading_mode'] = True
+        # them by MAC match to the CSV. Flag was already set earlier (before
+        # the hard gate) when _sl_pending was True, so here we just read it.
         switch_loading_mode = bool(opts.get('switch_loading_mode', False))
 
         # v5.1.1: pin discovery sockets to the chosen NIC. Without this on a
