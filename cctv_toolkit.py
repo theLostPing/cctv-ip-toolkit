@@ -3680,9 +3680,22 @@ class AxisSSDPDiscovery:
 
     @staticmethod
     def discover(timeout=5, callback=None, iface_ip=None):
+        """`iface_ip` accepts a string or a list of strings. Multiple IPs are
+        useful on multi-NIC hosts where the cameras live on a link-local
+        subnet (169.254.x.x) but the toolkit's "real" IP for the same NIC is
+        on a different subnet (e.g. 192.168.0.x multihome). Joining multicast
+        on EACH listed IP makes the socket a member of the SSDP group on
+        every logical subnet sharing the physical wire."""
         cameras = []
         seen = set()
         sock = None
+        # Normalize iface_ip to a list of unique non-empty IPs
+        if isinstance(iface_ip, str):
+            ips = [iface_ip] if iface_ip else []
+        elif iface_ip:
+            ips = [ip for ip in iface_ip if ip]
+        else:
+            ips = []
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -3703,20 +3716,30 @@ class AxisSSDPDiscovery:
             AxisSSDPDiscovery._last_bound_to_port = bound_to_port
             AxisSSDPDiscovery._last_bind_error = bind_error
 
-            # Join the SSDP multicast group on the chosen interface (or all)
-            iface_for_join = iface_ip if iface_ip else '0.0.0.0'
-            try:
-                mreq = socket.inet_aton(AxisSSDPDiscovery.SSDP_ADDR) + socket.inet_aton(iface_for_join)
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            except OSError:
-                pass
+            # Join the SSDP multicast group on EACH interface IP — critical for
+            # cross-subnet multicast reception on multi-IP NICs (link-local
+            # cameras' NOTIFY won't reach a socket only joined on 192.168.0.x).
+            join_targets = ips or ['0.0.0.0']
+            joined_count = 0
+            for jip in join_targets:
+                try:
+                    mreq = socket.inet_aton(AxisSSDPDiscovery.SSDP_ADDR) + socket.inet_aton(jip)
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                    joined_count += 1
+                except OSError:
+                    pass
+            AxisSSDPDiscovery._last_join_targets = join_targets
+            AxisSSDPDiscovery._last_join_count = joined_count
 
-            # Pin OUTBOUND multicast to the chosen NIC so M-SEARCH lands on
-            # the right wire (most important on multi-NIC machines).
-            if iface_ip:
+            # Pin OUTBOUND multicast to the FIRST listed IP so M-SEARCH lands
+            # on the right wire. Callers should put the link-local IP first
+            # when targeting link-local cameras (replies to M-SEARCH need a
+            # source the camera can ARP back to, and a link-local camera
+            # can only ARP a link-local source).
+            if ips:
                 try:
                     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
-                                    socket.inet_aton(iface_ip))
+                                    socket.inet_aton(ips[0]))
                 except OSError:
                     pass
 
@@ -4115,12 +4138,14 @@ class AxisMDNSDiscovery:
             def update_service(self, zc, type_, name):
                 pass
         
-        # v5.1.1: pin Zeroconf to a specific NIC when provided. Default
-        # (interfaces=None) listens on all v4 NICs that zeroconf considers
-        # routable — link-local 169.254.x.x ones are silently skipped, which
-        # is why Switch Loading on Ethernet 3 (link-local) needs explicit binding.
+        # v5.1.1/b6: pin Zeroconf to specific NIC IPs. Accepts str or list so
+        # callers can pass [link_local_ip, routable_ip] for multi-IP NICs.
         if iface_ip:
-            zc = Zeroconf(interfaces=[iface_ip])
+            if isinstance(iface_ip, str):
+                _zc_ifaces = [iface_ip]
+            else:
+                _zc_ifaces = [ip for ip in iface_ip if ip]
+            zc = Zeroconf(interfaces=_zc_ifaces) if _zc_ifaces else Zeroconf()
         else:
             zc = Zeroconf()
         listener = AxisListener()
@@ -4169,19 +4194,32 @@ class AxisMDNSDiscovery:
                 # Port 5353 in use (e.g., Bonjour service) - bind to any port
                 sock.bind(('', 0))
             
-            # Join multicast group — pin to specific NIC if provided (v5.1.1).
-            try:
-                iface_for_join = iface_ip if iface_ip else '0.0.0.0'
-                mreq = socket.inet_aton(AxisMDNSDiscovery.MDNS_ADDR) + socket.inet_aton(iface_for_join)
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            except Exception as e:
-                pass  # May fail on some systems, continue anyway
+            # Normalize iface_ip to list (v5.1.0b6 — multi-IP NICs)
+            if isinstance(iface_ip, str):
+                _mdns_ips = [iface_ip] if iface_ip else []
+            elif iface_ip:
+                _mdns_ips = [ip for ip in iface_ip if ip]
+            else:
+                _mdns_ips = []
 
-            # Pin OUTBOUND multicast send to the chosen NIC (v5.1.1).
-            if iface_ip:
+            # Join multicast group on EACH listed IP — critical for receiving
+            # multicast across multi-subnet NICs (link-local cameras' mDNS
+            # responses come from 169.254.x.x even when our "main" IP is
+            # 192.168.0.x, and Windows requires explicit membership on the
+            # logical subnet the traffic is on).
+            for jip in (_mdns_ips or ['0.0.0.0']):
+                try:
+                    mreq = socket.inet_aton(AxisMDNSDiscovery.MDNS_ADDR) + socket.inet_aton(jip)
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                except Exception:
+                    pass
+
+            # Pin OUTBOUND multicast send to the FIRST listed IP. Callers put
+            # the link-local helper IP first when targeting link-local cams.
+            if _mdns_ips:
                 try:
                     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
-                                    socket.inet_aton(iface_ip))
+                                    socket.inet_aton(_mdns_ips[0]))
                 except Exception:
                     pass
             
@@ -14289,6 +14327,23 @@ https://buymeacoffee.com/thelostping""")
         # Step 2). None falls back to all-NICs behavior (legacy).
         wizard_iface_ip = (selected_iface or {}).get('ip') if selected_iface else None
 
+        # v5.1.0b6: discovery_ips is a LIST passed to AxisMDNSDiscovery /
+        # AxisSSDPDiscovery so multicast group join happens on BOTH the
+        # link-local helper IP (169.254.100.1) and the routable iface IP.
+        # On Brian's bench, cameras at 169.254.x.x announce SSDP/mDNS on the
+        # link-local logical subnet — joining the group only on the routable
+        # 192.168.0.x multihome address didn't receive their traffic even
+        # though it's the same physical wire (Windows treats logical subnets
+        # as isolated for multicast even when sharing an interface).
+        # The link-local helper IP 169.254.100.1 is added later by
+        # add_linklocal_route(); we'll refresh the list inside the loop after
+        # that call too. Initial population:
+        discovery_ips = []
+        if getattr(self, '_linklocal_route_active', False):
+            discovery_ips.append('169.254.100.1')
+        if wizard_iface_ip:
+            discovery_ips.append(wizard_iface_ip)
+
         # Determine which checklist steps will actually run for this config
         used_steps = ['discover', 'pin', 'verify_model', 'firmware', 'auth']
         if add_additional_users and self.additional_users_data.get_all():
@@ -14544,8 +14599,15 @@ https://buymeacoffee.com/thelostping""")
                                     # answer unicast, OS captures their IP/MAC.
                                     self.status_log(
                                         f"  [diag] not in neighbor table — provoking via mDNS query")
+                                    # Refresh discovery_ips in case link-local route
+                                    # was added between wizard start and now.
+                                    _provoke_ips = []
+                                    if getattr(self, '_linklocal_route_active', False):
+                                        _provoke_ips.append('169.254.100.1')
+                                    if wizard_iface_ip:
+                                        _provoke_ips.append(wizard_iface_ip)
                                     try:
-                                        AxisMDNSDiscovery.discover(timeout=2, iface_ip=wizard_iface_ip)
+                                        AxisMDNSDiscovery.discover(timeout=2, iface_ip=_provoke_ips)
                                     except Exception:
                                         pass
                                     neighbor_ip = self.get_ip_from_neighbor_for_mac(
@@ -14608,7 +14670,15 @@ https://buymeacoffee.com/thelostping""")
 
                         if not camera_ip:
                             try:
-                                mdns_cams = AxisMDNSDiscovery.discover(timeout=2, iface_ip=wizard_iface_ip)
+                                # v5.1.0b6 — refresh + use multi-IP list so we
+                                # join multicast on the link-local logical
+                                # subnet (where the cameras live) too.
+                                _disc_ips = []
+                                if getattr(self, '_linklocal_route_active', False):
+                                    _disc_ips.append('169.254.100.1')
+                                if wizard_iface_ip:
+                                    _disc_ips.append(wizard_iface_ip)
+                                mdns_cams = AxisMDNSDiscovery.discover(timeout=2, iface_ip=_disc_ips)
                                 for mc in mdns_cams:
                                     mc_ip = mc.get('ip', '')
                                     mc_mac = mc.get('mac', '').upper().replace(':', '').replace('-', '')
@@ -14637,10 +14707,18 @@ https://buymeacoffee.com/thelostping""")
                         # see link-local cameras on the right wire.
                         if not camera_ip:
                             try:
+                                # v5.1.0b6 — pass multi-IP list so we join SSDP
+                                # multicast on both link-local AND routable
+                                # subnets sharing the physical wire.
+                                _ssdp_ips = []
+                                if getattr(self, '_linklocal_route_active', False):
+                                    _ssdp_ips.append('169.254.100.1')
+                                if wizard_iface_ip:
+                                    _ssdp_ips.append(wizard_iface_ip)
                                 self.status_log(
-                                    f"  [diag] SSDP discover starting (iface_ip={wizard_iface_ip})")
+                                    f"  [diag] SSDP discover starting (iface_ips={_ssdp_ips})")
                                 ssdp_cams = AxisSSDPDiscovery.discover(
-                                    timeout=3, iface_ip=wizard_iface_ip)
+                                    timeout=3, iface_ip=_ssdp_ips)
                                 _sl_bound = getattr(AxisSSDPDiscovery, '_last_bound_to_port', None)
                                 _sl_err = getattr(AxisSSDPDiscovery, '_last_bind_error', None)
                                 self.status_log(
