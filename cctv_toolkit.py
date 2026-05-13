@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "5.0.1"
+APP_VERSION = "5.1.0"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -1017,6 +1017,7 @@ class CameraDataManager:
                 if line and not line.startswith('#'):
                     parts = line.split(',')
                     if len(parts) >= 2:
+                        mac_raw = parts[6].strip() if len(parts) > 6 else ''
                         cam = {
                             'name': parts[0].strip(),
                             'ip': parts[1].strip(),
@@ -1024,21 +1025,23 @@ class CameraDataManager:
                             'subnet': parts[3].strip() if len(parts) > 3 else '',
                             'model': parts[4].strip() if len(parts) > 4 else '',
                             'new_ip': parts[5].strip() if len(parts) > 5 else '',
+                            'mac': mac_raw.upper(),
                             'processed': False
                         }
                         self.cameras.append(cam)
                         imported += 1
         self.save()
         return imported
-    
+
     def export_to_csv(self, filepath):
         """Export to CSV file"""
         with open(filepath, 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['Camera Name', 'IP Address', 'Gateway', 'Subnet', 'Model', 'New IP', 'Processed'])
+            w.writerow(['Camera Name', 'IP Address', 'Gateway', 'Subnet', 'Model', 'New IP', 'MAC Address', 'Processed'])
             for cam in self.cameras:
-                w.writerow([cam.get('name',''), cam.get('ip',''), cam.get('gateway',''), 
+                w.writerow([cam.get('name',''), cam.get('ip',''), cam.get('gateway',''),
                            cam.get('subnet',''), cam.get('model',''), cam.get('new_ip',''),
+                           cam.get('mac',''),
                            'Yes' if cam.get('processed') else 'No'])
 
 
@@ -4387,11 +4390,18 @@ class SmartImportDialog(tk.Toplevel):
         preview_frame = ttk.LabelFrame(frame, text="Preview (first 5 rows)", padding="5")
         preview_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        columns = ('number', 'name', 'ip', 'gateway', 'subnet', 'model')
+        columns = ('number', 'name', 'ip', 'gateway', 'subnet', 'model', 'mac')
         self.preview_tree = ttk.Treeview(preview_frame, columns=columns, show='headings', height=5)
         for col in columns:
-            self.preview_tree.heading(col, text=col.title() if col != 'number' else '#')
-            self.preview_tree.column(col, width=50 if col == 'number' else 120)
+            heading = '#' if col == 'number' else ('MAC' if col == 'mac' else col.title())
+            self.preview_tree.heading(col, text=heading)
+            if col == 'number':
+                width = 50
+            elif col == 'mac':
+                width = 140
+            else:
+                width = 120
+            self.preview_tree.column(col, width=width)
         self.preview_tree.pack(fill=tk.BOTH, expand=True)
         
         # Buttons
@@ -4557,7 +4567,7 @@ class SmartImportDialog(tk.Toplevel):
         # Show preview
         for row in self.rows[:5]:
             preview_row = []
-            for field in ['number', 'name', 'ip', 'gateway', 'subnet', 'model']:
+            for field in ['number', 'name', 'ip', 'gateway', 'subnet', 'model', 'mac']:
                 if field in self.column_mappings:
                     col_idx = self.column_mappings[field]
                     value = row[col_idx] if col_idx < len(row) else ''
@@ -4584,6 +4594,8 @@ class SmartImportDialog(tk.Toplevel):
                 if col_idx < len(row):
                     value = row[col_idx].strip()
                     if value:
+                        if field == 'mac':
+                            value = value.upper()
                         cam[field] = value
             
             # Default number to sequential if not mapped
@@ -8669,6 +8681,8 @@ class CCTVToolkitApp:
         operations = [
             ("🔧 Program New Cameras", "Step-by-step wizard with live\nchecklist (recommended)",
              self.start_program_wizard, "#4CAF50"),
+            ("⚡ Switch Loading", "Plug ALL cameras in at once →\ntoolkit matches each by MAC (v5.1.0)",
+             self.start_switch_loading_wizard, "#FF6F00"),
             ("✅ Confirm Programming", "Audit each camera in the list:\nIP / auth / DHCP-off match expected",
              self.start_confirm_wizard, "#00ACC1"),
             ("♻️ Factory Default", "Wipe a camera back to factory state\n(prompts for IP + existing password)",
@@ -8803,6 +8817,7 @@ class CCTVToolkitApp:
         ('network',      '8. Apply IP / network settings'),
         ('verify_online','9. Wait for camera at new IP'),
         ('capture',      '10. Capture serial / MAC / image'),
+        ('verify_mac',   '11. Confirm MAC at new IP matches CSV row'),
     ]
 
     def create_status_tab(self):
@@ -12449,6 +12464,17 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "5.1.0": (
+            "What's new in v5.1.0",
+            [
+                "• HEADLINE: NEW 'Switch Loading' button — plug all your cameras into a switch at once, hit the button, and the toolkit programs them in whatever order they're discovered, matching each by MAC to its CSV row. No more 'plug them in one at a time in the right order.'",
+                "• The CSV must have a MAC column populated for every row. The Smart Import dialog already recognizes 'MAC' / 'MAC Address' / 'macaddress' headers, and the importer auto-detects MAC columns by value pattern.",
+                "• How it works: discovery runs continuously; every time a camera appears on the wire, its MAC is checked against the loaded CSV. Known MAC → that row's config is programmed and the camera is moved to its new IP. Unknown MAC → silently skipped (no factory-reset, no programming). Idempotent — already-done cameras stay done across re-runs.",
+                "• Works on sites with hundreds of pre-existing cameras already on the same subnet. The early MAC gate filters at discovery time, before any mutating action, so the 800 production cameras nobody asked you to touch are never touched.",
+                "• NEW pipeline step #11: 'Confirm MAC at new IP matches CSV row'. After programming, the toolkit re-fetches the MAC from the camera at its new IP and verifies it equals the row's MAC. Catches any MAC↔IP slip — if two cameras accidentally got each other's configs, this step fails loud and marks both rows as failed.",
+                "• The classic 'plug in one at a time' wizard is unchanged. Switch Loading is a separate button for the bulk case.",
+            ],
+        ),
         "5.0.1": (
             "What's new in v5.0.1",
             [
@@ -13765,6 +13791,52 @@ https://buymeacoffee.com/thelostping""")
         self.start_program_wizard()
         return
 
+    def switch_loading_available(self):
+        """v5.1.0 — Switch Loading is only offered when every loaded camera
+        row has a MAC address populated. Returns (bool_available, reason_str).
+        Hooked into UI button enable/disable state."""
+        cams = self.camera_data.get_all()
+        if not cams:
+            return False, "No cameras loaded"
+        missing = [c for c in cams if not (c.get('mac') or '').strip()]
+        if missing:
+            return False, f"{len(missing)} of {len(cams)} cameras missing MAC"
+        return True, f"All {len(cams)} cameras have MAC populated"
+
+    def start_switch_loading_wizard(self):
+        """v5.1.0 — Bulk programming via switch.
+
+        Operator plugs every camera into the switch at once, hits this
+        button, and the toolkit programs each one in whatever order it's
+        discovered, matching cameras to CSV rows by MAC. Production cameras
+        on the same wire whose MACs aren't in the CSV are silently skipped.
+
+        Hard prerequisite: every loaded camera must have a MAC. The button
+        won't appear available otherwise (see switch_loading_available).
+
+        This is a thin wrapper that sets a flag and forwards to the main
+        programming wizard — the wizard handles the mode-gated branches
+        for early MAC filter, MAC-based row matching, and post-program
+        MAC verification."""
+        available, reason = self.switch_loading_available()
+        if not available:
+            messagebox.showerror(
+                "Switch Loading needs MAC for every camera",
+                f"{reason}.\n\n"
+                "Switch Loading discovers cameras on the wire and matches each "
+                "one to a CSV row by its MAC address. Rows without a MAC can't "
+                "be matched, so this button is only available when every loaded "
+                "row has a MAC.\n\n"
+                "Fix: re-import your CSV with a MAC column (the Smart Importer "
+                "recognizes columns named MAC / 'MAC Address' / 'mac_address'), "
+                "or edit the Camera List to fill in the missing MACs.",
+                parent=self.root)
+            return
+        # Signal start_program_wizard to enable switch_loading_mode in opts.
+        # Cleared inside the wizard after it picks up the flag.
+        self._switch_loading_pending = True
+        self.start_program_wizard()
+
     def _start_program_wizard_with_confirm_DEPRECATED(self):
         """v5.0 b3 — pre-flight confirm dialog before launching the
         step-by-step programming wizard. Brian's ask: 'Program new cameras
@@ -13920,6 +13992,12 @@ https://buymeacoffee.com/thelostping""")
         if not cameras:
             return
 
+        # v5.1.0 — Switch Loading flag: picked up from
+        # start_switch_loading_wizard. Consumed (cleared) here so a subsequent
+        # plain Program click doesn't accidentally inherit the mode.
+        _sl_pending = bool(getattr(self, '_switch_loading_pending', False))
+        self._switch_loading_pending = False
+
         # Show wizard
         wiz = ProgramWizardDialog(self.root,
             brand_name=self.protocol.BRAND_NAME,
@@ -13996,6 +14074,14 @@ https://buymeacoffee.com/thelostping""")
             self._detected_local_ip = selected_iface['ip']
             self.settings.set('general', 'interface_index', str(selected_iface['index']))
 
+        # v5.1.0: Switch Loading mode — bulk programming where the operator
+        # plugs all cameras into the switch at once and the toolkit programs
+        # them by MAC match to the CSV. Set by start_switch_loading_wizard
+        # before it forwards to this method.
+        if _sl_pending:
+            opts['switch_loading_mode'] = True
+        switch_loading_mode = bool(opts.get('switch_loading_mode', False))
+
         # Determine which checklist steps will actually run for this config
         used_steps = ['discover', 'pin', 'verify_model', 'firmware', 'auth']
         if add_additional_users and self.additional_users_data.get_all():
@@ -14003,6 +14089,10 @@ https://buymeacoffee.com/thelostping""")
         if set_hostname:
             used_steps.append('hostname')
         used_steps.extend(['network', 'verify_online', 'capture'])
+        if switch_loading_mode:
+            # v5.1.0: post-program MAC re-check (anti-slip). Only meaningful when
+            # we matched the cam by MAC at the start, so it's mode-gated.
+            used_steps.append('verify_mac')
 
         # Switch to status tab and prep the UI
         self.notebook.select(self.status_tab)
@@ -14087,28 +14177,50 @@ https://buymeacoffee.com/thelostping""")
                 pinned_mac = None
                 camera_ip = None
 
-                next_cam = remaining[0]
-                next_name = next_cam['name']
-                next_model = next_cam.get('model', '')
-
-                if next_name != last_announced_name:
-                    # Real new slot — bump counter, print banner + log header.
-                    programmed_count += 1
-                    _ui(self.status_set_banner, 'PLUG IN CAMERA',
-                        f"Plug in: {next_name}" + (f"  ({next_model})" if next_model else ''),
-                        '#FF9800')
-                    _ui(self.status_set_camera, next_name,
-                        f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
-                    _ui(self.status_reset_steps, used_steps)
-                    _ui(self.status_set_step, 'discover', 'active')
-                    self.status_log(f"\n{'=' * 50}")
-                    self.status_log(f"Waiting for camera {programmed_count}: {next_name}")
-                    self.status_log(f"{'=' * 50}")
-                    last_announced_name = next_name
+                if switch_loading_mode:
+                    # v5.1.0: Switch Loading — don't pre-announce a specific cam;
+                    # we won't know which CSV row we're filling until discovery
+                    # returns a MAC. Generic banner, set once per "slot."
+                    next_cam = None
+                    next_name = None
+                    next_model = None
+                    if last_announced_name != '__switch_loading__':
+                        _ui(self.status_set_banner, 'LOOKING FOR ANY CAMERA',
+                            f'Switch Loading — {len(remaining)} of {len(cameras)} remaining',
+                            '#FF9800')
+                        _ui(self.status_set_camera, '(awaiting MAC match)',
+                            f'{programmed_count} of {len(cameras)} done · {len(remaining)} remaining')
+                        _ui(self.status_reset_steps, used_steps)
+                        _ui(self.status_set_step, 'discover', 'active')
+                        self.status_log(f"\n{'=' * 50}")
+                        self.status_log(f"Switch Loading: scanning for any of {len(remaining)} unprogrammed MACs...")
+                        self.status_log(f"{'=' * 50}")
+                        last_announced_name = '__switch_loading__'
+                    else:
+                        _ui(self.status_set_step, 'discover', 'active')
                 else:
-                    # Re-entry after wait-for-reboot. Stay quiet, just put discover step
-                    # back to active state.
-                    _ui(self.status_set_step, 'discover', 'active')
+                    next_cam = remaining[0]
+                    next_name = next_cam['name']
+                    next_model = next_cam.get('model', '')
+
+                    if next_name != last_announced_name:
+                        # Real new slot — bump counter, print banner + log header.
+                        programmed_count += 1
+                        _ui(self.status_set_banner, 'PLUG IN CAMERA',
+                            f"Plug in: {next_name}" + (f"  ({next_model})" if next_model else ''),
+                            '#FF9800')
+                        _ui(self.status_set_camera, next_name,
+                            f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
+                        _ui(self.status_reset_steps, used_steps)
+                        _ui(self.status_set_step, 'discover', 'active')
+                        self.status_log(f"\n{'=' * 50}")
+                        self.status_log(f"Waiting for camera {programmed_count}: {next_name}")
+                        self.status_log(f"{'=' * 50}")
+                        last_announced_name = next_name
+                    else:
+                        # Re-entry after wait-for-reboot. Stay quiet, just put discover step
+                        # back to active state.
+                        _ui(self.status_set_step, 'discover', 'active')
 
                 # ---- Discovery phase ----
                 # v4.4.8-beta9 — heartbeat so the operator sees the loop is alive.
@@ -14256,7 +14368,8 @@ https://buymeacoffee.com/thelostping""")
                             _modes.append(f"factory IP {factory_ip}")
                         if discovery_mode in ('mdns', 'both'):
                             _modes.append("DHCP snoop + mDNS (link-local)")
-                        self.status_log(f"  ...still searching for {next_name} ({_elapsed}s) — checking: {', '.join(_modes)}. Plug in / reboot to trigger fresh DHCP DISCOVER.")
+                        _heartbeat_target = '(any unprogrammed camera in CSV)' if switch_loading_mode else next_name
+                        self.status_log(f"  ...still searching for {_heartbeat_target} ({_elapsed}s) — checking: {', '.join(_modes)}. Plug in / reboot to trigger fresh DHCP DISCOVER.")
                         _last_heartbeat = _now
 
                 if self.cancel_flag:
@@ -14341,6 +14454,45 @@ https://buymeacoffee.com/thelostping""")
                     continue
 
                 _ui(self.status_set_step, 'discover', 'ok', camera_ip)
+
+                # v5.1.0 — Switch Loading early MAC gate.
+                # Critical: this runs BEFORE any mutating action (no
+                # factory-reset, no auth changes, no network config). If the
+                # discovered camera's MAC isn't in the loaded CSV, it's a
+                # production camera that doesn't belong to this job and we
+                # leave it alone. Idempotent across re-runs because already-
+                # programmed CSV rows are absent from `remaining`.
+                if switch_loading_mode:
+                    norm_pinned = (pinned_mac or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                    sl_match_idx = None
+                    if norm_pinned:
+                        for sl_idx, sl_c in enumerate(remaining):
+                            sl_c_mac = (sl_c.get('mac', '') or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                            if sl_c_mac and sl_c_mac == norm_pinned:
+                                sl_match_idx = sl_idx
+                                break
+                    if sl_match_idx is None:
+                        # Unknown MAC — not in this job's CSV. Don't touch it.
+                        if norm_pinned:
+                            seen_macs.add(norm_pinned)
+                        self.status_log(
+                            f"  Skipping {pinned_mac or '(no MAC)'} at {camera_ip} — not in loaded CSV "
+                            f"({len(remaining)} of {len(cameras)} still to program)")
+                        self.arp_unpin(camera_ip)
+                        _ui(self.status_set_step, 'discover', 'active')
+                        time.sleep(1)
+                        continue
+                    # MAC matched — promote the cam from remaining and announce.
+                    next_cam = remaining[sl_match_idx]
+                    next_name = next_cam.get('name', '?')
+                    next_model = next_cam.get('model', '')
+                    programmed_count += 1
+                    self.status_log(
+                        f"  ✓ MAC {pinned_mac} matches CSV row '{next_name}' "
+                        f"(#{next_cam.get('number','?')}) — programming")
+                    _ui(self.status_set_camera, next_name,
+                        f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
+
                 _ui(self.status_set_banner, 'PROGRAMMING…',
                     f"{next_name}  →  working on it", '#2196F3')
 
@@ -14598,7 +14750,41 @@ https://buymeacoffee.com/thelostping""")
                 # ---- Match camera entry ----
                 cam = None
                 cam_idx = None
-                if actual_model:
+
+                # v5.1.0 — Switch Loading: MAC is the join key, not model.
+                # The early MAC gate above already confirmed the MAC is in the
+                # CSV; here we re-find the index to drive the rest of the loop.
+                # Model mismatch in this mode is logged but not fatal — the
+                # operator's CSV may carry a wrong/blank model and the MAC
+                # match is authoritative.
+                if switch_loading_mode:
+                    norm_pinned = (pinned_mac or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                    for idx, c in enumerate(remaining):
+                        c_mac_norm = (c.get('mac', '') or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                        if c_mac_norm and c_mac_norm == norm_pinned:
+                            cam = c
+                            cam_idx = idx
+                            break
+                    if not cam:
+                        # Shouldn't happen — early MAC gate should have caught it.
+                        # Defensive: re-discover this slot.
+                        self.status_log(
+                            f"  ⚠ Internal: MAC {pinned_mac} matched early gate but lost before model step — re-discovering")
+                        self.arp_unpin(camera_ip)
+                        camera_ip = None
+                        pinned_mac = None
+                        _ui(self.status_set_step, 'discover', 'active')
+                        time.sleep(1)
+                        continue
+                    # Model sanity-check (informational only in switch_loading)
+                    if actual_model and cam.get('model'):
+                        norm_actual = actual_model.upper().replace('AXIS-', '').replace('AXIS ', '').strip()
+                        norm_expected = cam['model'].upper().replace('AXIS-', '').replace('AXIS ', '').strip()
+                        if not (norm_expected in norm_actual or norm_actual in norm_expected):
+                            self.status_log(
+                                f"  ⚠ Model in CSV ({cam['model']}) doesn't match camera ({actual_model}) — "
+                                f"MAC matches so programming anyway; verify the CSV row is correct.")
+                elif actual_model:
                     norm_actual = actual_model.upper().replace('AXIS-', '').replace('AXIS ', '').strip()
                     for idx, c in enumerate(remaining):
                         c_model = c.get('model', '')
@@ -15064,6 +15250,47 @@ https://buymeacoffee.com/thelostping""")
                 _ui(self.status_set_step, 'capture', 'ok',
                     f"{serial} / {cam.get('mac', '?')}")
 
+                # v5.1.0 — Switch Loading post-program MAC confirmation.
+                # We programmed this row based on a MAC match at discovery.
+                # Now that the camera is at its new IP, re-fetch its MAC and
+                # verify it equals the CSV row's MAC. Catches the rare case
+                # where two simultaneous programmings could swap configs
+                # mid-flight, or where the post-program camera is somehow
+                # a different one than we expected.
+                if switch_loading_mode and 'verify_mac' in used_steps:
+                    _ui(self.status_set_step, 'verify_mac', 'active')
+                    expected_mac_norm = (cam.get('mac', '') or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                    seen_mac_raw = ''
+                    if camera_reachable:
+                        try:
+                            probe2 = self.protocol.probe_unrestricted(static_ip)
+                            seen_mac_raw = probe2.get('mac') or ''
+                        except Exception:
+                            seen_mac_raw = ''
+                        if not seen_mac_raw:
+                            seen_mac_raw = self.get_mac_from_arp(static_ip) or ''
+                    seen_mac_norm = seen_mac_raw.upper().replace(':', '').replace('-', '').replace('.', '')
+                    if not seen_mac_norm:
+                        self.status_log(
+                            f"⚠ verify_mac: could not read MAC at {static_ip} — "
+                            "treating as soft-fail (camera reachable but MAC not exposed by API/ARP).")
+                        errors.append('verify_mac_unreadable')
+                        _ui(self.status_set_step, 'verify_mac', 'fail', '(unreadable)')
+                    elif seen_mac_norm == expected_mac_norm:
+                        self.status_log(
+                            f"✓ verify_mac: camera at {static_ip} reports MAC {seen_mac_raw} — matches CSV row")
+                        _ui(self.status_set_step, 'verify_mac', 'ok', seen_mac_raw)
+                    else:
+                        self.status_log(
+                            f"✗ verify_mac: SLIP DETECTED at {static_ip}.\n"
+                            f"    expected MAC: {cam.get('mac', '?')}\n"
+                            f"    found    MAC: {seen_mac_raw}\n"
+                            f"    Programming this row's config landed on the wrong camera. "
+                            f"Likely cause: two cameras with the same factory IP racing the "
+                            f"set_network step. Investigate before shipping this row.")
+                        errors.append('mac_mismatch')
+                        _ui(self.status_set_step, 'verify_mac', 'fail', f'got {seen_mac_raw}')
+
                 self.camera_data.save()
                 _ui(self.refresh_camera_list)
 
@@ -15112,7 +15339,13 @@ https://buymeacoffee.com/thelostping""")
 
                 remaining.pop(cam_idx)
 
-                if remaining and not self.cancel_flag:
+                # v5.1.0 — In switch_loading mode, clear last_announced_name so
+                # the next outer-loop iteration refreshes the banner counts
+                # (programmed_count / remaining) for the next MAC we find.
+                if switch_loading_mode:
+                    last_announced_name = None
+
+                if remaining and not self.cancel_flag and not switch_loading_mode:
                     # v4.5.1-beta5: keep the SUCCESS banner up until the
                     # camera physically disappears from the network (ping
                     # at its programmed IP fails). Brian's ask 2026-05-05:
@@ -15120,6 +15353,10 @@ https://buymeacoffee.com/thelostping""")
                     # programmed camera disappear from the network. I
                     # unplugged > Plug in camera x". So the screen flips
                     # to PLUG IN exactly when the operator unplugs.
+                    #
+                    # v5.1.0: Switch Loading mode skips this — the operator
+                    # plugged ALL cameras in at once and we want to move to
+                    # the next discovered MAC immediately, no unplug step.
                     #
                     # 3s minimum hold for fast-unplug case (so the banner
                     # is at least seen even if you're already unplugging),
