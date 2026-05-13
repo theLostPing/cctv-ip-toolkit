@@ -1165,22 +1165,28 @@ class AxisDiscovery:
         return local_ips
     
     @staticmethod
-    def discover(timeout=5, callback=None):
+    def discover(timeout=5, callback=None, iface_ip=None):
         """
         Discover Axis cameras on the network.
         Returns list of dicts with camera info.
         callback(camera_dict) is called for each camera found (optional).
+
+        v5.1.1: `iface_ip` binds the broadcast send socket to a specific NIC.
+        On multi-NIC hosts the OS otherwise routes 255.255.255.255 out the
+        default-route interface only.
         """
         cameras = []
         seen_macs = set()
-        
+
         try:
             # Create UDP socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.settimeout(0.5)  # Short timeout for recv
-            sock.bind(('', 0))  # Bind to any available port
+            # v5.1.1: bind to specific NIC if given so 255.255.255.255 goes
+            # out that interface rather than the system default route.
+            sock.bind(((iface_ip or ''), 0))
             
             # Send discovery broadcast
             broadcast_addr = ('255.255.255.255', AxisDiscovery.DISCOVERY_PORT)
@@ -3650,6 +3656,164 @@ class BundledDHCPServer:
 
 
 # ============================================================================
+# AXIS CAMERA DISCOVERY via SSDP / UPnP (NOTIFY + M-SEARCH)
+# ============================================================================
+class AxisSSDPDiscovery:
+    """v5.1.1 — SSDP/UPnP discovery, bound to a specific NIC.
+
+    Axis cameras send periodic SSDP NOTIFY announcements to
+    239.255.255.250:1900 and also answer SSDP M-SEARCH queries. This is
+    the primary protocol AXIS IP Utility uses to find link-local cameras
+    that don't have a routable IP yet — they're often louder on SSDP than
+    on mDNS, especially before they've fully bootstrapped Bonjour.
+
+    Returns a list of dicts: {'ip': str, 'server': str, 'usn': str,
+    'location': str}. The wizard then ARP-resolves MAC from the IP.
+
+    `iface_ip` is REQUIRED for correctness on multi-NIC machines — without
+    it, the OS picks the default-route interface and link-local cameras on
+    other NICs are missed entirely. When None we fall back to all-NICs
+    behavior (works on single-NIC hosts).
+    """
+    SSDP_ADDR = '239.255.255.250'
+    SSDP_PORT = 1900
+
+    @staticmethod
+    def discover(timeout=5, callback=None, iface_ip=None):
+        cameras = []
+        seen = set()
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                # Listen on all addresses for the SSDP port — multicast group
+                # membership is what scopes us to the right NIC.
+                sock.bind(('', AxisSSDPDiscovery.SSDP_PORT))
+                bound_to_port = True
+            except OSError:
+                # Port 1900 may be in use by Windows SSDPSRV. Fall back to
+                # an ephemeral port — we can still send M-SEARCH and receive
+                # unicast replies; we just miss passive NOTIFY traffic.
+                sock.bind(('', 0))
+                bound_to_port = False
+
+            # Join the SSDP multicast group on the chosen interface (or all)
+            iface_for_join = iface_ip if iface_ip else '0.0.0.0'
+            try:
+                mreq = socket.inet_aton(AxisSSDPDiscovery.SSDP_ADDR) + socket.inet_aton(iface_for_join)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            except OSError:
+                pass
+
+            # Pin OUTBOUND multicast to the chosen NIC so M-SEARCH lands on
+            # the right wire (most important on multi-NIC machines).
+            if iface_ip:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                    socket.inet_aton(iface_ip))
+                except OSError:
+                    pass
+
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+            sock.settimeout(0.5)
+
+            # Active M-SEARCH probe — cameras reply unicast within MX seconds.
+            # MX=2 keeps the storm short. ST=ssdp:all matches everything;
+            # we filter by "AXIS" in the response below.
+            msearch = (
+                "M-SEARCH * HTTP/1.1\r\n"
+                f"HOST: {AxisSSDPDiscovery.SSDP_ADDR}:{AxisSSDPDiscovery.SSDP_PORT}\r\n"
+                'MAN: "ssdp:discover"\r\n'
+                "MX: 2\r\n"
+                "ST: ssdp:all\r\n"
+                "\r\n"
+            ).encode('ascii')
+            try:
+                sock.sendto(msearch, (AxisSSDPDiscovery.SSDP_ADDR, AxisSSDPDiscovery.SSDP_PORT))
+                # Send a second one ~1s in for late-joiners
+                _msearch_sent_at = time.time()
+            except OSError:
+                _msearch_sent_at = 0
+
+            end_time = time.time() + timeout
+            while time.time() < end_time:
+                try:
+                    data, addr = sock.recvfrom(8192)
+                    src_ip = addr[0]
+                    try:
+                        text = data.decode('ascii', errors='ignore')
+                    except Exception:
+                        continue
+
+                    # Only care about Axis-ish packets — server string OR
+                    # NOTIFY-with-axis URN. Filter aggressively to stay fast.
+                    upper = text.upper()
+                    is_axis = ('AXIS' in upper) or ('AXIS-COM' in upper)
+                    if not is_axis:
+                        continue
+
+                    # Already seen this camera? dedupe by source IP.
+                    if src_ip in seen:
+                        continue
+                    seen.add(src_ip)
+
+                    server = ''
+                    usn = ''
+                    location = ''
+                    for line in text.split('\r\n'):
+                        low = line.lower()
+                        if low.startswith('server:'):
+                            server = line.split(':', 1)[1].strip()
+                        elif low.startswith('usn:'):
+                            usn = line.split(':', 1)[1].strip()
+                        elif low.startswith('location:'):
+                            location = line.split(':', 1)[1].strip()
+
+                    cam = {
+                        'ip': src_ip,
+                        'mac': '',  # caller ARP-resolves
+                        'model': '',
+                        'serial': '',
+                        'name': '',
+                        'server': server,
+                        'usn': usn,
+                        'location': location,
+                    }
+                    # Try to pull model out of server string (e.g. "AXIS P3268-LV/...")
+                    m = re.search(r'AXIS\s+([A-Z0-9\-]+)', server, re.IGNORECASE)
+                    if m:
+                        cam['model'] = m.group(1)
+
+                    cameras.append(cam)
+                    if callback:
+                        try:
+                            callback(cam)
+                        except Exception:
+                            pass
+
+                    # Re-fire M-SEARCH once around the 1s mark to catch
+                    # cameras that just joined the wire.
+                    if _msearch_sent_at and time.time() - _msearch_sent_at > 1.0:
+                        try:
+                            sock.sendto(msearch,
+                                        (AxisSSDPDiscovery.SSDP_ADDR, AxisSSDPDiscovery.SSDP_PORT))
+                            _msearch_sent_at = 0  # only re-fire once
+                        except OSError:
+                            pass
+                except socket.timeout:
+                    continue
+                except Exception:
+                    continue
+        finally:
+            if sock:
+                try: sock.close()
+                except Exception: pass
+
+        return cameras
+
+
+# ============================================================================
 # AXIS CAMERA DISCOVERY via mDNS (Multicast DNS / Bonjour)
 # ============================================================================
 class AxisMDNSDiscovery:
@@ -3854,27 +4018,31 @@ class AxisMDNSDiscovery:
             return None
     
     @staticmethod
-    def discover(timeout=5, callback=None):
+    def discover(timeout=5, callback=None, iface_ip=None):
         """
         Discover Axis cameras using mDNS.
         Returns list of dicts with camera info.
         callback(camera_dict) is called for each camera found (optional).
-        
+
         Tries zeroconf library first (handles Windows quirks), falls back to manual.
+
+        v5.1.1: `iface_ip` pins multicast send + receive to a specific NIC.
+        Critical on multi-NIC machines; without it, link-local cameras on
+        non-default-route interfaces are invisible. None = legacy (all-NICs).
         """
         # Try using zeroconf library if available (handles all edge cases)
         try:
-            return AxisMDNSDiscovery._discover_zeroconf(timeout, callback)
+            return AxisMDNSDiscovery._discover_zeroconf(timeout, callback, iface_ip)
         except ImportError:
             pass
         except Exception:
             pass
-        
+
         # Fall back to manual mDNS implementation
-        return AxisMDNSDiscovery._discover_manual(timeout, callback)
-    
+        return AxisMDNSDiscovery._discover_manual(timeout, callback, iface_ip)
+
     @staticmethod
-    def _discover_zeroconf(timeout=5, callback=None):
+    def _discover_zeroconf(timeout=5, callback=None, iface_ip=None):
         """Discover using zeroconf library (pip install zeroconf)"""
         from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
         
@@ -3942,7 +4110,14 @@ class AxisMDNSDiscovery:
             def update_service(self, zc, type_, name):
                 pass
         
-        zc = Zeroconf()
+        # v5.1.1: pin Zeroconf to a specific NIC when provided. Default
+        # (interfaces=None) listens on all v4 NICs that zeroconf considers
+        # routable — link-local 169.254.x.x ones are silently skipped, which
+        # is why Switch Loading on Ethernet 3 (link-local) needs explicit binding.
+        if iface_ip:
+            zc = Zeroconf(interfaces=[iface_ip])
+        else:
+            zc = Zeroconf()
         listener = AxisListener()
         browsers = []
         
@@ -3958,7 +4133,7 @@ class AxisMDNSDiscovery:
         return cameras
     
     @staticmethod
-    def _discover_manual(timeout=5, callback=None):
+    def _discover_manual(timeout=5, callback=None, iface_ip=None):
         """Manual mDNS discovery (fallback when zeroconf not available)"""
         cameras = []
         seen = set()  # Track by MAC or IP to avoid duplicates
@@ -3989,12 +4164,21 @@ class AxisMDNSDiscovery:
                 # Port 5353 in use (e.g., Bonjour service) - bind to any port
                 sock.bind(('', 0))
             
-            # Join multicast group on all interfaces
+            # Join multicast group — pin to specific NIC if provided (v5.1.1).
             try:
-                mreq = socket.inet_aton(AxisMDNSDiscovery.MDNS_ADDR) + socket.inet_aton('0.0.0.0')
+                iface_for_join = iface_ip if iface_ip else '0.0.0.0'
+                mreq = socket.inet_aton(AxisMDNSDiscovery.MDNS_ADDR) + socket.inet_aton(iface_for_join)
                 sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
             except Exception as e:
                 pass  # May fail on some systems, continue anyway
+
+            # Pin OUTBOUND multicast send to the chosen NIC (v5.1.1).
+            if iface_ip:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                    socket.inet_aton(iface_ip))
+                except Exception:
+                    pass
             
             sock.settimeout(0.5)
             
@@ -14085,6 +14269,13 @@ https://buymeacoffee.com/thelostping""")
             opts['switch_loading_mode'] = True
         switch_loading_mode = bool(opts.get('switch_loading_mode', False))
 
+        # v5.1.1: pin discovery sockets to the chosen NIC. Without this on a
+        # multi-NIC host, mDNS / SSDP / broadcast probes go out the system's
+        # default-route interface and link-local cameras on other NICs are
+        # invisible. selected_iface comes from the session top bar (Setup
+        # Step 2). None falls back to all-NICs behavior (legacy).
+        wizard_iface_ip = (selected_iface or {}).get('ip') if selected_iface else None
+
         # Determine which checklist steps will actually run for this config
         used_steps = ['discover', 'pin', 'verify_model', 'firmware', 'auth']
         if add_additional_users and self.additional_users_data.get_all():
@@ -14337,7 +14528,7 @@ https://buymeacoffee.com/thelostping""")
 
                         if not camera_ip:
                             try:
-                                mdns_cams = AxisMDNSDiscovery.discover(timeout=2)
+                                mdns_cams = AxisMDNSDiscovery.discover(timeout=2, iface_ip=wizard_iface_ip)
                                 for mc in mdns_cams:
                                     mc_ip = mc.get('ip', '')
                                     mc_mac = mc.get('mac', '').upper().replace(':', '').replace('-', '')
@@ -14352,6 +14543,41 @@ https://buymeacoffee.com/thelostping""")
                                         camera_ip = mc_ip
                                         pinned_mac = mc.get('mac', '')
                                         self.status_log(f"Camera (mDNS): {mc_ip}  Model: {mc.get('model', '?')}")
+                                        break
+                                if camera_ip:
+                                    break
+                            except Exception:
+                                pass
+
+                        # v5.1.1 — SSDP/UPnP discovery (the protocol AXIS IP
+                        # Utility relies on most heavily). Axis cameras
+                        # announce themselves loudly via SSDP NOTIFY and
+                        # answer SSDP M-SEARCH, often before mDNS catches up.
+                        # IP-bound to the selected NIC so multi-NIC hosts
+                        # see link-local cameras on the right wire.
+                        if not camera_ip:
+                            try:
+                                ssdp_cams = AxisSSDPDiscovery.discover(
+                                    timeout=3, iface_ip=wizard_iface_ip)
+                                for sc in ssdp_cams:
+                                    sc_ip = sc.get('ip', '')
+                                    if not sc_ip:
+                                        continue
+                                    # SSDP gives us an IP — resolve MAC via ARP.
+                                    sc_mac = self.get_mac_from_arp(sc_ip) or ''
+                                    sc_mac_norm = sc_mac.upper().replace(':', '').replace('-', '')
+                                    if sc_mac_norm and sc_mac_norm in seen_macs:
+                                        continue
+                                    if sc_ip.startswith('169.254.'):
+                                        self.add_linklocal_route()
+                                    elif not self._ensure_route_to_camera(sc_ip):
+                                        continue
+                                    if self.ping_camera(sc_ip, timeout_ms=1000):
+                                        camera_ip = sc_ip
+                                        pinned_mac = sc_mac
+                                        self.status_log(
+                                            f"Camera (SSDP): {sc_ip}  "
+                                            f"{sc.get('model','?')}  via {sc.get('server','')[:40]}")
                                         break
                                 if camera_ip:
                                     break
