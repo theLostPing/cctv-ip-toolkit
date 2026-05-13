@@ -3686,17 +3686,22 @@ class AxisSSDPDiscovery:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bound_to_port = False
+            bind_error = None
             try:
                 # Listen on all addresses for the SSDP port — multicast group
                 # membership is what scopes us to the right NIC.
                 sock.bind(('', AxisSSDPDiscovery.SSDP_PORT))
                 bound_to_port = True
-            except OSError:
+            except OSError as _be:
                 # Port 1900 may be in use by Windows SSDPSRV. Fall back to
                 # an ephemeral port — we can still send M-SEARCH and receive
                 # unicast replies; we just miss passive NOTIFY traffic.
+                bind_error = repr(_be)
                 sock.bind(('', 0))
-                bound_to_port = False
+            # Stash for caller's diagnostics
+            AxisSSDPDiscovery._last_bound_to_port = bound_to_port
+            AxisSSDPDiscovery._last_bind_error = bind_error
 
             # Join the SSDP multicast group on the chosen interface (or all)
             iface_for_join = iface_ip if iface_ip else '0.0.0.0'
@@ -14516,11 +14521,41 @@ https://buymeacoffee.com/thelostping""")
                             try:
                                 iface_alias = None
                                 if selected_iface:
-                                    iface_alias = selected_iface.get('alias') or selected_iface.get('name')
+                                    iface_alias = (selected_iface.get('alias')
+                                                   or selected_iface.get('name')
+                                                   or selected_iface.get('label'))
+                                self.status_log(
+                                    f"  [diag] reverse-ARP lookup: MAC {dhcp_found_mac} "
+                                    f"on iface={iface_alias!r}")
                                 neighbor_ip = self.get_ip_from_neighbor_for_mac(
                                     dhcp_found_mac, iface_alias=iface_alias)
+                                if not neighbor_ip and iface_alias:
+                                    # Fall back to system-wide lookup if scoped lookup empty
+                                    neighbor_ip = self.get_ip_from_neighbor_for_mac(dhcp_found_mac)
+                                    if neighbor_ip:
+                                        self.status_log(
+                                            f"  [diag] found in system-wide neighbor table at {neighbor_ip}")
+                                if not neighbor_ip:
+                                    # v5.1.0b5: provoke ARP — Windows doesn't auto-fill
+                                    # neighbor table from unsolicited ARP-ANNOUNCE, but
+                                    # mDNS/SSDP responses we've seen DO populate it as a
+                                    # side effect because they unicast to our IP. Force
+                                    # the issue with a quick mDNS ping query — cameras
+                                    # answer unicast, OS captures their IP/MAC.
+                                    self.status_log(
+                                        f"  [diag] not in neighbor table — provoking via mDNS query")
+                                    try:
+                                        AxisMDNSDiscovery.discover(timeout=2, iface_ip=wizard_iface_ip)
+                                    except Exception:
+                                        pass
+                                    neighbor_ip = self.get_ip_from_neighbor_for_mac(
+                                        dhcp_found_mac, iface_alias=iface_alias)
+                                    if not neighbor_ip:
+                                        neighbor_ip = self.get_ip_from_neighbor_for_mac(dhcp_found_mac)
+                                    if neighbor_ip:
+                                        self.status_log(
+                                            f"  [diag] provoke worked — neighbor table now has {neighbor_ip}")
                                 if neighbor_ip:
-                                    # Make sure we have a route to that IP (link-local fast-path)
                                     if neighbor_ip.startswith('169.254.'):
                                         self.add_linklocal_route()
                                     if self.ping_camera(neighbor_ip, timeout_ms=1500):
@@ -14533,8 +14568,12 @@ https://buymeacoffee.com/thelostping""")
                                         self.status_log(
                                             f"  Neighbor table has {dhcp_found_mac} at {neighbor_ip} "
                                             f"but ping failed — falling through")
-                            except Exception:
-                                pass
+                                else:
+                                    self.status_log(
+                                        f"  [diag] still no neighbor entry for {dhcp_found_mac} after provoke — "
+                                        f"falling through to factory/mDNS/SSDP")
+                            except Exception as _e:
+                                self.status_log(f"  [diag] reverse-ARP error: {_e!r}")
 
                         if dhcp_found_mac and not camera_ip:
                             try:
@@ -14598,8 +14637,17 @@ https://buymeacoffee.com/thelostping""")
                         # see link-local cameras on the right wire.
                         if not camera_ip:
                             try:
+                                self.status_log(
+                                    f"  [diag] SSDP discover starting (iface_ip={wizard_iface_ip})")
                                 ssdp_cams = AxisSSDPDiscovery.discover(
                                     timeout=3, iface_ip=wizard_iface_ip)
+                                _sl_bound = getattr(AxisSSDPDiscovery, '_last_bound_to_port', None)
+                                _sl_err = getattr(AxisSSDPDiscovery, '_last_bind_error', None)
+                                self.status_log(
+                                    f"  [diag] SSDP returned {len(ssdp_cams)} candidate(s) "
+                                    f"(bound_port_1900={_sl_bound}"
+                                    + (f", bind_err={_sl_err}" if _sl_err else "")
+                                    + ")")
                                 for sc in ssdp_cams:
                                     sc_ip = sc.get('ip', '')
                                     if not sc_ip:
