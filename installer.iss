@@ -86,12 +86,16 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+; Check: DesktopShortcutMissing — don't overwrite an existing .lnk, so a user
+; who repositioned/renamed-in-place their desktop icon keeps it where they put
+; it across upgrades. Inno has no [Icons] skip-if-exists flag; a Check is the
+; supported way. If the user deleted it, it's recreated (task still selected).
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Check: DesktopShortcutMissing
 
 [Run]
 ; Auto-launch DROPPED AGAIN in v4.4.6.
@@ -103,11 +107,25 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 ; Reverted to v4.4.4 behavior: installer ends with the standard Setup Complete
 ; page, user opens the toolkit from Start Menu / Desktop shortcut.
 ;
-; (No [Run] entries — intentional. Don't re-add without solving the race
-; deterministically — e.g. waiting on a process-handle from the running app
-; rather than a fixed sleep, or shipping a tiny stub launcher that polls the
-; install dir for stability before exec'ing the toolkit.)
+; (No app-autolaunch [Run] entry — intentional. Don't re-add without solving
+; the race deterministically — e.g. waiting on a process-handle from the
+; running app rather than a fixed sleep, or shipping a tiny stub launcher that
+; polls the install dir for stability before exec'ing the toolkit.)
+;
+; The README opener below is NOT the autolaunch race: it opens a static .md
+; with its default handler, it's user-opt-in (unchecked checkbox on the Setup
+; Complete page), and it never touches the freshly-extracted PyInstaller exe.
+Filename: "{app}\README.md"; Description: "View the README"; Flags: postinstall shellexec skipifsilent unchecked nowait
 
 [UninstallDelete]
 ; Clean up app data on uninstall (optional — comment out to keep user settings)
 ; Type: filesandordirs; Name: "{userappdata}\theLostPing\CCTV IP Toolkit"
+
+[Code]
+// True only when the desktop shortcut does not already exist, so the [Icons]
+// entry skips (re)creating it on upgrades and the user's icon position sticks.
+// autodesktop resolves to the same per-user/common desktop the icon uses.
+function DesktopShortcutMissing: Boolean;
+begin
+  Result := not FileExists(ExpandConstant('{autodesktop}\{#MyAppName}.lnk'));
+end;
