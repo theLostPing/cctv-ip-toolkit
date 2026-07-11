@@ -21,10 +21,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -152,9 +152,12 @@ jobs:
           Write-Host "source zip: $(Get-Item $zip | Select-Object -Expand Length) bytes"
 
       # ============================================================
-      # Code signing — currently disabled, replaced 2026-05-03 with SignPath Foundation.
-      # SignPath application submitted 2026-05-03; CI wiring lands here when approved.
-      # When the cert is provisioned, sign IN THIS ORDER:
+      # Code signing — still disabled. SignPath Foundation DECLINED 2026-05-13
+      # (project too young; reapply invited once it has external traction).
+      # Current plan: Azure Trusted Signing (Brian's personal tenant cleared the
+      # 30-day age gate ~2026-06-02; profile not yet created). The SignPath step
+      # below stays as reference; an Azure Trusted Signing step (azure/trusted-signing-action)
+      # would replace it. When ANY cert is provisioned, sign IN THIS ORDER:
       #   1. Sign dist\CCTVIPToolkit.exe FIRST (the bare PyInstaller output)
       #   2. THEN re-run ISCC so the installer bundles the already-signed exe
       #   3. THEN sign dist\CCTVIPToolkit-Setup-v*.exe (the installer)
@@ -178,7 +181,7 @@ jobs:
         run: Get-ChildItem dist | Format-Table Name, Length
 
       - name: Upload build artifacts (always)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CCTVIPToolkit-v${{ steps.vers.outputs.version }}
           path: |
@@ -191,7 +194,7 @@ jobs:
 
       - name: Attach to GitHub Release (stable tag)
         if: steps.vers.outputs.release_kind == 'stable'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/CCTVIPToolkit.exe
@@ -203,7 +206,7 @@ jobs:
 
       - name: Create Beta Prerelease (beta/** branch)
         if: steps.vers.outputs.release_kind == 'beta'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: beta-v${{ steps.vers.outputs.version }}
           name: Beta v${{ steps.vers.outputs.version }}
