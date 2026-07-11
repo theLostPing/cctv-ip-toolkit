@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "5.0.1"
+APP_VERSION = "5.1.0"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -1017,6 +1017,7 @@ class CameraDataManager:
                 if line and not line.startswith('#'):
                     parts = line.split(',')
                     if len(parts) >= 2:
+                        mac_raw = parts[6].strip() if len(parts) > 6 else ''
                         cam = {
                             'name': parts[0].strip(),
                             'ip': parts[1].strip(),
@@ -1024,21 +1025,23 @@ class CameraDataManager:
                             'subnet': parts[3].strip() if len(parts) > 3 else '',
                             'model': parts[4].strip() if len(parts) > 4 else '',
                             'new_ip': parts[5].strip() if len(parts) > 5 else '',
+                            'mac': mac_raw.upper(),
                             'processed': False
                         }
                         self.cameras.append(cam)
                         imported += 1
         self.save()
         return imported
-    
+
     def export_to_csv(self, filepath):
         """Export to CSV file"""
         with open(filepath, 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['Camera Name', 'IP Address', 'Gateway', 'Subnet', 'Model', 'New IP', 'Processed'])
+            w.writerow(['Camera Name', 'IP Address', 'Gateway', 'Subnet', 'Model', 'New IP', 'MAC Address', 'Processed'])
             for cam in self.cameras:
-                w.writerow([cam.get('name',''), cam.get('ip',''), cam.get('gateway',''), 
+                w.writerow([cam.get('name',''), cam.get('ip',''), cam.get('gateway',''),
                            cam.get('subnet',''), cam.get('model',''), cam.get('new_ip',''),
+                           cam.get('mac',''),
                            'Yes' if cam.get('processed') else 'No'])
 
 
@@ -1162,22 +1165,28 @@ class AxisDiscovery:
         return local_ips
     
     @staticmethod
-    def discover(timeout=5, callback=None):
+    def discover(timeout=5, callback=None, iface_ip=None):
         """
         Discover Axis cameras on the network.
         Returns list of dicts with camera info.
         callback(camera_dict) is called for each camera found (optional).
+
+        v5.1.1: `iface_ip` binds the broadcast send socket to a specific NIC.
+        On multi-NIC hosts the OS otherwise routes 255.255.255.255 out the
+        default-route interface only.
         """
         cameras = []
         seen_macs = set()
-        
+
         try:
             # Create UDP socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.settimeout(0.5)  # Short timeout for recv
-            sock.bind(('', 0))  # Bind to any available port
+            # v5.1.1: bind to specific NIC if given so 255.255.255.255 goes
+            # out that interface rather than the system default route.
+            sock.bind(((iface_ip or ''), 0))
             
             # Send discovery broadcast
             broadcast_addr = ('255.255.255.255', AxisDiscovery.DISCOVERY_PORT)
@@ -3647,6 +3656,349 @@ class BundledDHCPServer:
 
 
 # ============================================================================
+# AXIS CAMERA DISCOVERY via SSDP / UPnP (NOTIFY + M-SEARCH)
+# ============================================================================
+class AxisL2Discovery:
+    """v5.1.0b7 — Raw L2 packet capture via scapy + npcap. Bypasses Windows
+    OS multicast routing entirely.
+
+    The OS socket path (AxisSSDPDiscovery, AxisMDNSDiscovery) misses
+    link-local cameras on multi-IP NICs because Windows treats logical
+    subnets as isolated for multicast even when sharing a physical wire:
+    even after IP_ADD_MEMBERSHIP on both the link-local helper IP AND the
+    routable iface IP, SSDP NOTIFY from 169.254.x.x cameras doesn't make
+    it to the socket. SSDPSRV also likely steals port 1900 even with
+    SO_REUSEADDR.
+
+    scapy via npcap captures frames at L2 BEFORE the OS network stack
+    sees them, so multicast routing rules and port-binding contention
+    don't apply. Confirmed working against Brian's bench (iputility.pcapng
+    captured on Ethernet 3 was readable by scapy and contained all 4
+    cameras' SSDP NOTIFY traffic).
+
+    Returns list of {ip, mac, model, proto} for each discovered camera.
+
+    Detects via:
+      • SSDP NOTIFY (UDP src or dst port 1900) — payload check 'AXIS'
+      • mDNS responses (UDP port 5353) — source MAC OUI check
+      • Gratuitous ARP / ARP-ANNOUNCE — source MAC OUI check, gives MAC↔IP
+        in one packet, the most prolific source for fresh link-local
+        cameras (every ~few seconds during boot)
+    """
+
+    AXIS_OUIS = ("B8:A4:4F", "AC:CC:8E", "00:40:8C", "E8:27:EB")
+    BPF_FILTER = "(udp port 1900) or (udp port 5353) or arp"
+
+    @staticmethod
+    def _resolve_scapy_iface(iface_ip=None, iface_index=None):
+        """Resolve a scapy iface name from an IP address or Windows iface index.
+        scapy's get_windows_if_list() returns dicts with 'name', 'win_index',
+        and 'ips'. Match by win_index first (exact), then by IP (any match)."""
+        try:
+            from scapy.arch.windows import get_windows_if_list
+        except Exception:
+            return None
+        target_ips = []
+        if iface_ip:
+            if isinstance(iface_ip, str):
+                target_ips = [iface_ip]
+            else:
+                target_ips = [ip for ip in iface_ip if ip]
+        try:
+            for entry in get_windows_if_list():
+                ename = entry.get('name')
+                if iface_index is not None:
+                    try:
+                        if int(entry.get('win_index') or -1) == int(iface_index):
+                            return ename
+                    except Exception:
+                        pass
+                if target_ips:
+                    entry_ips = entry.get('ips') or []
+                    if any(ip in entry_ips for ip in target_ips):
+                        return ename
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def discover(timeout=5, callback=None, iface_ip=None, iface_index=None):
+        cameras = []
+        seen_macs = set()
+        seen_ips = set()
+
+        try:
+            from scapy.all import sniff, Ether, ARP, IP, UDP, Raw
+        except Exception as e:
+            AxisL2Discovery._last_error = f"scapy import failed: {e!r}"
+            return cameras
+
+        iface_name = AxisL2Discovery._resolve_scapy_iface(
+            iface_ip=iface_ip, iface_index=iface_index)
+        AxisL2Discovery._last_iface = iface_name
+        if not iface_name:
+            AxisL2Discovery._last_error = "could not resolve scapy iface from iface_ip/iface_index"
+            return cameras
+
+        def is_axis_mac(mac_str):
+            if not mac_str:
+                return False
+            m = mac_str.upper()
+            return any(m.startswith(o) for o in AxisL2Discovery.AXIS_OUIS)
+
+        def add(mac, ip, proto, model=''):
+            if not mac:
+                return
+            mac = mac.upper()
+            if not is_axis_mac(mac):
+                return
+            key = (mac, ip or '')
+            if key in seen_macs:
+                return
+            seen_macs.add(key)
+            if ip:
+                seen_ips.add(ip)
+            cam = {'mac': mac, 'ip': ip or '', 'model': model, 'proto': proto,
+                   'serial': '', 'name': ''}
+            cameras.append(cam)
+            if callback:
+                try:
+                    callback(cam)
+                except Exception:
+                    pass
+
+        def on_pkt(pkt):
+            try:
+                if pkt.haslayer(ARP):
+                    a = pkt[ARP]
+                    src_mac = (a.hwsrc or pkt[Ether].src if pkt.haslayer(Ether) else a.hwsrc) or ''
+                    src_ip = a.psrc or ''
+                    if src_ip and src_ip != '0.0.0.0' and is_axis_mac(src_mac):
+                        add(src_mac, src_ip, 'arp')
+                    return
+                if pkt.haslayer(UDP) and pkt.haslayer(IP) and pkt.haslayer(Ether):
+                    u = pkt[UDP]
+                    src_mac = pkt[Ether].src
+                    src_ip = pkt[IP].src
+                    # mDNS response — any Axis-OUI source is a hit
+                    if u.sport == 5353 or u.dport == 5353:
+                        if is_axis_mac(src_mac) and src_ip and src_ip != '0.0.0.0':
+                            add(src_mac, src_ip, 'mdns')
+                            return
+                    # SSDP — payload sniff for AXIS regardless of OUI (the
+                    # OUI check is also done, but SSDP confirms it's a
+                    # camera not just any vendor with the same OUI prefix)
+                    if u.sport == 1900 or u.dport == 1900:
+                        payload = bytes(pkt[Raw]) if pkt.haslayer(Raw) else b''
+                        if is_axis_mac(src_mac) or b'AXIS' in payload.upper():
+                            # try to grab model from SERVER: header
+                            model = ''
+                            try:
+                                txt = payload.decode('ascii', errors='ignore')
+                                m = re.search(r'AXIS[\s_\-]*([A-Z0-9\-]+)', txt, re.IGNORECASE)
+                                if m:
+                                    model = m.group(1)
+                            except Exception:
+                                pass
+                            if src_ip and src_ip != '0.0.0.0':
+                                add(src_mac, src_ip, 'ssdp', model=model)
+            except Exception:
+                pass
+
+        try:
+            AxisL2Discovery._last_error = None
+            sniff(iface=iface_name, prn=on_pkt, store=False,
+                  timeout=timeout, filter=AxisL2Discovery.BPF_FILTER)
+        except Exception as e:
+            AxisL2Discovery._last_error = f"scapy sniff failed: {e!r}"
+
+        return cameras
+
+
+class AxisSSDPDiscovery:
+    """v5.1.1 — SSDP/UPnP discovery, bound to a specific NIC.
+
+    Axis cameras send periodic SSDP NOTIFY announcements to
+    239.255.255.250:1900 and also answer SSDP M-SEARCH queries. This is
+    the primary protocol AXIS IP Utility uses to find link-local cameras
+    that don't have a routable IP yet — they're often louder on SSDP than
+    on mDNS, especially before they've fully bootstrapped Bonjour.
+
+    Returns a list of dicts: {'ip': str, 'server': str, 'usn': str,
+    'location': str}. The wizard then ARP-resolves MAC from the IP.
+
+    `iface_ip` is REQUIRED for correctness on multi-NIC machines — without
+    it, the OS picks the default-route interface and link-local cameras on
+    other NICs are missed entirely. When None we fall back to all-NICs
+    behavior (works on single-NIC hosts).
+    """
+    SSDP_ADDR = '239.255.255.250'
+    SSDP_PORT = 1900
+
+    @staticmethod
+    def discover(timeout=5, callback=None, iface_ip=None):
+        """`iface_ip` accepts a string or a list of strings. Multiple IPs are
+        useful on multi-NIC hosts where the cameras live on a link-local
+        subnet (169.254.x.x) but the toolkit's "real" IP for the same NIC is
+        on a different subnet (e.g. 192.168.0.x multihome). Joining multicast
+        on EACH listed IP makes the socket a member of the SSDP group on
+        every logical subnet sharing the physical wire."""
+        cameras = []
+        seen = set()
+        sock = None
+        # Normalize iface_ip to a list of unique non-empty IPs
+        if isinstance(iface_ip, str):
+            ips = [iface_ip] if iface_ip else []
+        elif iface_ip:
+            ips = [ip for ip in iface_ip if ip]
+        else:
+            ips = []
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bound_to_port = False
+            bind_error = None
+            try:
+                # Listen on all addresses for the SSDP port — multicast group
+                # membership is what scopes us to the right NIC.
+                sock.bind(('', AxisSSDPDiscovery.SSDP_PORT))
+                bound_to_port = True
+            except OSError as _be:
+                # Port 1900 may be in use by Windows SSDPSRV. Fall back to
+                # an ephemeral port — we can still send M-SEARCH and receive
+                # unicast replies; we just miss passive NOTIFY traffic.
+                bind_error = repr(_be)
+                sock.bind(('', 0))
+            # Stash for caller's diagnostics
+            AxisSSDPDiscovery._last_bound_to_port = bound_to_port
+            AxisSSDPDiscovery._last_bind_error = bind_error
+
+            # Join the SSDP multicast group on EACH interface IP — critical for
+            # cross-subnet multicast reception on multi-IP NICs (link-local
+            # cameras' NOTIFY won't reach a socket only joined on 192.168.0.x).
+            join_targets = ips or ['0.0.0.0']
+            joined_count = 0
+            for jip in join_targets:
+                try:
+                    mreq = socket.inet_aton(AxisSSDPDiscovery.SSDP_ADDR) + socket.inet_aton(jip)
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                    joined_count += 1
+                except OSError:
+                    pass
+            AxisSSDPDiscovery._last_join_targets = join_targets
+            AxisSSDPDiscovery._last_join_count = joined_count
+
+            # Pin OUTBOUND multicast to the FIRST listed IP so M-SEARCH lands
+            # on the right wire. Callers should put the link-local IP first
+            # when targeting link-local cameras (replies to M-SEARCH need a
+            # source the camera can ARP back to, and a link-local camera
+            # can only ARP a link-local source).
+            if ips:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                    socket.inet_aton(ips[0]))
+                except OSError:
+                    pass
+
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+            sock.settimeout(0.5)
+
+            # Active M-SEARCH probe — cameras reply unicast within MX seconds.
+            # MX=2 keeps the storm short. ST=ssdp:all matches everything;
+            # we filter by "AXIS" in the response below.
+            msearch = (
+                "M-SEARCH * HTTP/1.1\r\n"
+                f"HOST: {AxisSSDPDiscovery.SSDP_ADDR}:{AxisSSDPDiscovery.SSDP_PORT}\r\n"
+                'MAN: "ssdp:discover"\r\n'
+                "MX: 2\r\n"
+                "ST: ssdp:all\r\n"
+                "\r\n"
+            ).encode('ascii')
+            try:
+                sock.sendto(msearch, (AxisSSDPDiscovery.SSDP_ADDR, AxisSSDPDiscovery.SSDP_PORT))
+                # Send a second one ~1s in for late-joiners
+                _msearch_sent_at = time.time()
+            except OSError:
+                _msearch_sent_at = 0
+
+            end_time = time.time() + timeout
+            while time.time() < end_time:
+                try:
+                    data, addr = sock.recvfrom(8192)
+                    src_ip = addr[0]
+                    try:
+                        text = data.decode('ascii', errors='ignore')
+                    except Exception:
+                        continue
+
+                    # Only care about Axis-ish packets — server string OR
+                    # NOTIFY-with-axis URN. Filter aggressively to stay fast.
+                    upper = text.upper()
+                    is_axis = ('AXIS' in upper) or ('AXIS-COM' in upper)
+                    if not is_axis:
+                        continue
+
+                    # Already seen this camera? dedupe by source IP.
+                    if src_ip in seen:
+                        continue
+                    seen.add(src_ip)
+
+                    server = ''
+                    usn = ''
+                    location = ''
+                    for line in text.split('\r\n'):
+                        low = line.lower()
+                        if low.startswith('server:'):
+                            server = line.split(':', 1)[1].strip()
+                        elif low.startswith('usn:'):
+                            usn = line.split(':', 1)[1].strip()
+                        elif low.startswith('location:'):
+                            location = line.split(':', 1)[1].strip()
+
+                    cam = {
+                        'ip': src_ip,
+                        'mac': '',  # caller ARP-resolves
+                        'model': '',
+                        'serial': '',
+                        'name': '',
+                        'server': server,
+                        'usn': usn,
+                        'location': location,
+                    }
+                    # Try to pull model out of server string (e.g. "AXIS P3268-LV/...")
+                    m = re.search(r'AXIS\s+([A-Z0-9\-]+)', server, re.IGNORECASE)
+                    if m:
+                        cam['model'] = m.group(1)
+
+                    cameras.append(cam)
+                    if callback:
+                        try:
+                            callback(cam)
+                        except Exception:
+                            pass
+
+                    # Re-fire M-SEARCH once around the 1s mark to catch
+                    # cameras that just joined the wire.
+                    if _msearch_sent_at and time.time() - _msearch_sent_at > 1.0:
+                        try:
+                            sock.sendto(msearch,
+                                        (AxisSSDPDiscovery.SSDP_ADDR, AxisSSDPDiscovery.SSDP_PORT))
+                            _msearch_sent_at = 0  # only re-fire once
+                        except OSError:
+                            pass
+                except socket.timeout:
+                    continue
+                except Exception:
+                    continue
+        finally:
+            if sock:
+                try: sock.close()
+                except Exception: pass
+
+        return cameras
+
+
+# ============================================================================
 # AXIS CAMERA DISCOVERY via mDNS (Multicast DNS / Bonjour)
 # ============================================================================
 class AxisMDNSDiscovery:
@@ -3851,27 +4203,31 @@ class AxisMDNSDiscovery:
             return None
     
     @staticmethod
-    def discover(timeout=5, callback=None):
+    def discover(timeout=5, callback=None, iface_ip=None):
         """
         Discover Axis cameras using mDNS.
         Returns list of dicts with camera info.
         callback(camera_dict) is called for each camera found (optional).
-        
+
         Tries zeroconf library first (handles Windows quirks), falls back to manual.
+
+        v5.1.1: `iface_ip` pins multicast send + receive to a specific NIC.
+        Critical on multi-NIC machines; without it, link-local cameras on
+        non-default-route interfaces are invisible. None = legacy (all-NICs).
         """
         # Try using zeroconf library if available (handles all edge cases)
         try:
-            return AxisMDNSDiscovery._discover_zeroconf(timeout, callback)
+            return AxisMDNSDiscovery._discover_zeroconf(timeout, callback, iface_ip)
         except ImportError:
             pass
         except Exception:
             pass
-        
+
         # Fall back to manual mDNS implementation
-        return AxisMDNSDiscovery._discover_manual(timeout, callback)
-    
+        return AxisMDNSDiscovery._discover_manual(timeout, callback, iface_ip)
+
     @staticmethod
-    def _discover_zeroconf(timeout=5, callback=None):
+    def _discover_zeroconf(timeout=5, callback=None, iface_ip=None):
         """Discover using zeroconf library (pip install zeroconf)"""
         from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
         
@@ -3939,7 +4295,16 @@ class AxisMDNSDiscovery:
             def update_service(self, zc, type_, name):
                 pass
         
-        zc = Zeroconf()
+        # v5.1.1/b6: pin Zeroconf to specific NIC IPs. Accepts str or list so
+        # callers can pass [link_local_ip, routable_ip] for multi-IP NICs.
+        if iface_ip:
+            if isinstance(iface_ip, str):
+                _zc_ifaces = [iface_ip]
+            else:
+                _zc_ifaces = [ip for ip in iface_ip if ip]
+            zc = Zeroconf(interfaces=_zc_ifaces) if _zc_ifaces else Zeroconf()
+        else:
+            zc = Zeroconf()
         listener = AxisListener()
         browsers = []
         
@@ -3955,7 +4320,7 @@ class AxisMDNSDiscovery:
         return cameras
     
     @staticmethod
-    def _discover_manual(timeout=5, callback=None):
+    def _discover_manual(timeout=5, callback=None, iface_ip=None):
         """Manual mDNS discovery (fallback when zeroconf not available)"""
         cameras = []
         seen = set()  # Track by MAC or IP to avoid duplicates
@@ -3986,12 +4351,34 @@ class AxisMDNSDiscovery:
                 # Port 5353 in use (e.g., Bonjour service) - bind to any port
                 sock.bind(('', 0))
             
-            # Join multicast group on all interfaces
-            try:
-                mreq = socket.inet_aton(AxisMDNSDiscovery.MDNS_ADDR) + socket.inet_aton('0.0.0.0')
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-            except Exception as e:
-                pass  # May fail on some systems, continue anyway
+            # Normalize iface_ip to list (v5.1.0b6 — multi-IP NICs)
+            if isinstance(iface_ip, str):
+                _mdns_ips = [iface_ip] if iface_ip else []
+            elif iface_ip:
+                _mdns_ips = [ip for ip in iface_ip if ip]
+            else:
+                _mdns_ips = []
+
+            # Join multicast group on EACH listed IP — critical for receiving
+            # multicast across multi-subnet NICs (link-local cameras' mDNS
+            # responses come from 169.254.x.x even when our "main" IP is
+            # 192.168.0.x, and Windows requires explicit membership on the
+            # logical subnet the traffic is on).
+            for jip in (_mdns_ips or ['0.0.0.0']):
+                try:
+                    mreq = socket.inet_aton(AxisMDNSDiscovery.MDNS_ADDR) + socket.inet_aton(jip)
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                except Exception:
+                    pass
+
+            # Pin OUTBOUND multicast send to the FIRST listed IP. Callers put
+            # the link-local helper IP first when targeting link-local cams.
+            if _mdns_ips:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                    socket.inet_aton(_mdns_ips[0]))
+                except Exception:
+                    pass
             
             sock.settimeout(0.5)
             
@@ -4387,11 +4774,18 @@ class SmartImportDialog(tk.Toplevel):
         preview_frame = ttk.LabelFrame(frame, text="Preview (first 5 rows)", padding="5")
         preview_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        columns = ('number', 'name', 'ip', 'gateway', 'subnet', 'model')
+        columns = ('number', 'name', 'ip', 'gateway', 'subnet', 'model', 'mac')
         self.preview_tree = ttk.Treeview(preview_frame, columns=columns, show='headings', height=5)
         for col in columns:
-            self.preview_tree.heading(col, text=col.title() if col != 'number' else '#')
-            self.preview_tree.column(col, width=50 if col == 'number' else 120)
+            heading = '#' if col == 'number' else ('MAC' if col == 'mac' else col.title())
+            self.preview_tree.heading(col, text=heading)
+            if col == 'number':
+                width = 50
+            elif col == 'mac':
+                width = 140
+            else:
+                width = 120
+            self.preview_tree.column(col, width=width)
         self.preview_tree.pack(fill=tk.BOTH, expand=True)
         
         # Buttons
@@ -4557,7 +4951,7 @@ class SmartImportDialog(tk.Toplevel):
         # Show preview
         for row in self.rows[:5]:
             preview_row = []
-            for field in ['number', 'name', 'ip', 'gateway', 'subnet', 'model']:
+            for field in ['number', 'name', 'ip', 'gateway', 'subnet', 'model', 'mac']:
                 if field in self.column_mappings:
                     col_idx = self.column_mappings[field]
                     value = row[col_idx] if col_idx < len(row) else ''
@@ -4584,6 +4978,8 @@ class SmartImportDialog(tk.Toplevel):
                 if col_idx < len(row):
                     value = row[col_idx].strip()
                     if value:
+                        if field == 'mac':
+                            value = value.upper()
                         cam[field] = value
             
             # Default number to sequential if not mapped
@@ -7524,6 +7920,9 @@ class CCTVToolkitApp:
                 ("🟢  Program New Cameras",
                  "Step-by-step programming wizard with admin/password confirm, optional factory-default-first, and review screen.",
                  getattr(self, 'start_program_wizard', None)),
+                ("⚡  Switch Loading (v5.1.0)",
+                 "Plug ALL cameras into the switch at once — toolkit programs each one in whatever order it's discovered, matching cameras to CSV rows by MAC. Requires every CSV row to have a MAC.",
+                 getattr(self, 'start_switch_loading_wizard', None)),
                 ("🔄  Update / Change Settings",
                  "Push IP / hostname / DHCP-toggle changes to cameras that are ALREADY programmed.",
                  getattr(self, 'start_update_wizard', None)),
@@ -8669,6 +9068,8 @@ class CCTVToolkitApp:
         operations = [
             ("🔧 Program New Cameras", "Step-by-step wizard with live\nchecklist (recommended)",
              self.start_program_wizard, "#4CAF50"),
+            ("⚡ Switch Loading", "Plug ALL cameras in at once →\ntoolkit matches each by MAC (v5.1.0)",
+             self.start_switch_loading_wizard, "#FF6F00"),
             ("✅ Confirm Programming", "Audit each camera in the list:\nIP / auth / DHCP-off match expected",
              self.start_confirm_wizard, "#00ACC1"),
             ("♻️ Factory Default", "Wipe a camera back to factory state\n(prompts for IP + existing password)",
@@ -8803,6 +9204,7 @@ class CCTVToolkitApp:
         ('network',      '8. Apply IP / network settings'),
         ('verify_online','9. Wait for camera at new IP'),
         ('capture',      '10. Capture serial / MAC / image'),
+        ('verify_mac',   '11. Confirm MAC at new IP matches CSV row'),
     ]
 
     def create_status_tab(self):
@@ -12449,6 +12851,17 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "5.1.0": (
+            "What's new in v5.1.0",
+            [
+                "• HEADLINE: NEW 'Switch Loading' button — plug all your cameras into a switch at once, hit the button, and the toolkit programs them in whatever order they're discovered, matching each by MAC to its CSV row. No more 'plug them in one at a time in the right order.'",
+                "• The CSV must have a MAC column populated for every row. The Smart Import dialog already recognizes 'MAC' / 'MAC Address' / 'macaddress' headers, and the importer auto-detects MAC columns by value pattern.",
+                "• How it works: discovery runs continuously; every time a camera appears on the wire, its MAC is checked against the loaded CSV. Known MAC → that row's config is programmed and the camera is moved to its new IP. Unknown MAC → silently skipped (no factory-reset, no programming). Idempotent — already-done cameras stay done across re-runs.",
+                "• Works on sites with hundreds of pre-existing cameras already on the same subnet. The early MAC gate filters at discovery time, before any mutating action, so the 800 production cameras nobody asked you to touch are never touched.",
+                "• NEW pipeline step #11: 'Confirm MAC at new IP matches CSV row'. After programming, the toolkit re-fetches the MAC from the camera at its new IP and verifies it equals the row's MAC. Catches any MAC↔IP slip — if two cameras accidentally got each other's configs, this step fails loud and marks both rows as failed.",
+                "• The classic 'plug in one at a time' wizard is unchanged. Switch Loading is a separate button for the bulk case.",
+            ],
+        ),
         "5.0.1": (
             "What's new in v5.0.1",
             [
@@ -13765,6 +14178,52 @@ https://buymeacoffee.com/thelostping""")
         self.start_program_wizard()
         return
 
+    def switch_loading_available(self):
+        """v5.1.0 — Switch Loading is only offered when every loaded camera
+        row has a MAC address populated. Returns (bool_available, reason_str).
+        Hooked into UI button enable/disable state."""
+        cams = self.camera_data.get_all()
+        if not cams:
+            return False, "No cameras loaded"
+        missing = [c for c in cams if not (c.get('mac') or '').strip()]
+        if missing:
+            return False, f"{len(missing)} of {len(cams)} cameras missing MAC"
+        return True, f"All {len(cams)} cameras have MAC populated"
+
+    def start_switch_loading_wizard(self):
+        """v5.1.0 — Bulk programming via switch.
+
+        Operator plugs every camera into the switch at once, hits this
+        button, and the toolkit programs each one in whatever order it's
+        discovered, matching cameras to CSV rows by MAC. Production cameras
+        on the same wire whose MACs aren't in the CSV are silently skipped.
+
+        Hard prerequisite: every loaded camera must have a MAC. The button
+        won't appear available otherwise (see switch_loading_available).
+
+        This is a thin wrapper that sets a flag and forwards to the main
+        programming wizard — the wizard handles the mode-gated branches
+        for early MAC filter, MAC-based row matching, and post-program
+        MAC verification."""
+        available, reason = self.switch_loading_available()
+        if not available:
+            messagebox.showerror(
+                "Switch Loading needs MAC for every camera",
+                f"{reason}.\n\n"
+                "Switch Loading discovers cameras on the wire and matches each "
+                "one to a CSV row by its MAC address. Rows without a MAC can't "
+                "be matched, so this button is only available when every loaded "
+                "row has a MAC.\n\n"
+                "Fix: re-import your CSV with a MAC column (the Smart Importer "
+                "recognizes columns named MAC / 'MAC Address' / 'mac_address'), "
+                "or edit the Camera List to fill in the missing MACs.",
+                parent=self.root)
+            return
+        # Signal start_program_wizard to enable switch_loading_mode in opts.
+        # Cleared inside the wizard after it picks up the flag.
+        self._switch_loading_pending = True
+        self.start_program_wizard()
+
     def _start_program_wizard_with_confirm_DEPRECATED(self):
         """v5.0 b3 — pre-flight confirm dialog before launching the
         step-by-step programming wizard. Brian's ask: 'Program new cameras
@@ -13920,6 +14379,12 @@ https://buymeacoffee.com/thelostping""")
         if not cameras:
             return
 
+        # v5.1.0 — Switch Loading flag: picked up from
+        # start_switch_loading_wizard. Consumed (cleared) here so a subsequent
+        # plain Program click doesn't accidentally inherit the mode.
+        _sl_pending = bool(getattr(self, '_switch_loading_pending', False))
+        self._switch_loading_pending = False
+
         # Show wizard
         wiz = ProgramWizardDialog(self.root,
             brand_name=self.protocol.BRAND_NAME,
@@ -13930,6 +14395,16 @@ https://buymeacoffee.com/thelostping""")
             return
 
         opts = wiz.result
+
+        # v5.1.0b3 — Switch Loading IMPLIES auto-multihome. Without it the
+        # toolkit programs cameras to (e.g.) 10.20.30.x but can't reach any
+        # of them to verify because the NIC has no route to that subnet.
+        # In v5.0b4 the UI checkbox was removed (intended to be auto-driven),
+        # so we set the opts flag explicitly here before the hard gate fires.
+        if _sl_pending:
+            opts['switch_loading_mode'] = True
+            opts['auto_multihome'] = True
+
         password = opts['password']
         factory_ip = opts['factory_ip']
         discovery_mode = opts['discovery_mode']
@@ -13996,6 +14471,36 @@ https://buymeacoffee.com/thelostping""")
             self._detected_local_ip = selected_iface['ip']
             self.settings.set('general', 'interface_index', str(selected_iface['index']))
 
+        # v5.1.0: Switch Loading mode — bulk programming where the operator
+        # plugs all cameras into the switch at once and the toolkit programs
+        # them by MAC match to the CSV. Flag was already set earlier (before
+        # the hard gate) when _sl_pending was True, so here we just read it.
+        switch_loading_mode = bool(opts.get('switch_loading_mode', False))
+
+        # v5.1.1: pin discovery sockets to the chosen NIC. Without this on a
+        # multi-NIC host, mDNS / SSDP / broadcast probes go out the system's
+        # default-route interface and link-local cameras on other NICs are
+        # invisible. selected_iface comes from the session top bar (Setup
+        # Step 2). None falls back to all-NICs behavior (legacy).
+        wizard_iface_ip = (selected_iface or {}).get('ip') if selected_iface else None
+
+        # v5.1.0b6: discovery_ips is a LIST passed to AxisMDNSDiscovery /
+        # AxisSSDPDiscovery so multicast group join happens on BOTH the
+        # link-local helper IP (169.254.100.1) and the routable iface IP.
+        # On Brian's bench, cameras at 169.254.x.x announce SSDP/mDNS on the
+        # link-local logical subnet — joining the group only on the routable
+        # 192.168.0.x multihome address didn't receive their traffic even
+        # though it's the same physical wire (Windows treats logical subnets
+        # as isolated for multicast even when sharing an interface).
+        # The link-local helper IP 169.254.100.1 is added later by
+        # add_linklocal_route(); we'll refresh the list inside the loop after
+        # that call too. Initial population:
+        discovery_ips = []
+        if getattr(self, '_linklocal_route_active', False):
+            discovery_ips.append('169.254.100.1')
+        if wizard_iface_ip:
+            discovery_ips.append(wizard_iface_ip)
+
         # Determine which checklist steps will actually run for this config
         used_steps = ['discover', 'pin', 'verify_model', 'firmware', 'auth']
         if add_additional_users and self.additional_users_data.get_all():
@@ -14003,6 +14508,10 @@ https://buymeacoffee.com/thelostping""")
         if set_hostname:
             used_steps.append('hostname')
         used_steps.extend(['network', 'verify_online', 'capture'])
+        if switch_loading_mode:
+            # v5.1.0: post-program MAC re-check (anti-slip). Only meaningful when
+            # we matched the cam by MAC at the start, so it's mode-gated.
+            used_steps.append('verify_mac')
 
         # Switch to status tab and prep the UI
         self.notebook.select(self.status_tab)
@@ -14087,28 +14596,50 @@ https://buymeacoffee.com/thelostping""")
                 pinned_mac = None
                 camera_ip = None
 
-                next_cam = remaining[0]
-                next_name = next_cam['name']
-                next_model = next_cam.get('model', '')
-
-                if next_name != last_announced_name:
-                    # Real new slot — bump counter, print banner + log header.
-                    programmed_count += 1
-                    _ui(self.status_set_banner, 'PLUG IN CAMERA',
-                        f"Plug in: {next_name}" + (f"  ({next_model})" if next_model else ''),
-                        '#FF9800')
-                    _ui(self.status_set_camera, next_name,
-                        f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
-                    _ui(self.status_reset_steps, used_steps)
-                    _ui(self.status_set_step, 'discover', 'active')
-                    self.status_log(f"\n{'=' * 50}")
-                    self.status_log(f"Waiting for camera {programmed_count}: {next_name}")
-                    self.status_log(f"{'=' * 50}")
-                    last_announced_name = next_name
+                if switch_loading_mode:
+                    # v5.1.0: Switch Loading — don't pre-announce a specific cam;
+                    # we won't know which CSV row we're filling until discovery
+                    # returns a MAC. Generic banner, set once per "slot."
+                    next_cam = None
+                    next_name = None
+                    next_model = None
+                    if last_announced_name != '__switch_loading__':
+                        _ui(self.status_set_banner, 'LOOKING FOR ANY CAMERA',
+                            f'Switch Loading — {len(remaining)} of {len(cameras)} remaining',
+                            '#FF9800')
+                        _ui(self.status_set_camera, '(awaiting MAC match)',
+                            f'{programmed_count} of {len(cameras)} done · {len(remaining)} remaining')
+                        _ui(self.status_reset_steps, used_steps)
+                        _ui(self.status_set_step, 'discover', 'active')
+                        self.status_log(f"\n{'=' * 50}")
+                        self.status_log(f"Switch Loading: scanning for any of {len(remaining)} unprogrammed MACs...")
+                        self.status_log(f"{'=' * 50}")
+                        last_announced_name = '__switch_loading__'
+                    else:
+                        _ui(self.status_set_step, 'discover', 'active')
                 else:
-                    # Re-entry after wait-for-reboot. Stay quiet, just put discover step
-                    # back to active state.
-                    _ui(self.status_set_step, 'discover', 'active')
+                    next_cam = remaining[0]
+                    next_name = next_cam['name']
+                    next_model = next_cam.get('model', '')
+
+                    if next_name != last_announced_name:
+                        # Real new slot — bump counter, print banner + log header.
+                        programmed_count += 1
+                        _ui(self.status_set_banner, 'PLUG IN CAMERA',
+                            f"Plug in: {next_name}" + (f"  ({next_model})" if next_model else ''),
+                            '#FF9800')
+                        _ui(self.status_set_camera, next_name,
+                            f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
+                        _ui(self.status_reset_steps, used_steps)
+                        _ui(self.status_set_step, 'discover', 'active')
+                        self.status_log(f"\n{'=' * 50}")
+                        self.status_log(f"Waiting for camera {programmed_count}: {next_name}")
+                        self.status_log(f"{'=' * 50}")
+                        last_announced_name = next_name
+                    else:
+                        # Re-entry after wait-for-reboot. Stay quiet, just put discover step
+                        # back to active state.
+                        _ui(self.status_set_step, 'discover', 'active')
 
                 # ---- Discovery phase ----
                 # v4.4.8-beta9 — heartbeat so the operator sees the loop is alive.
@@ -14189,6 +14720,109 @@ https://buymeacoffee.com/thelostping""")
                         except Exception:
                             pass
 
+                        # v5.1.0b8 — Switch Loading "fire and forget": DHCP
+                        # gave us a MAC. Axis cameras in factory state listen
+                        # at 192.168.0.90 even when multiple are plugged in
+                        # simultaneously. ARP-pin the discovered MAC to that
+                        # IP — our traffic to .90 now goes specifically to
+                        # this MAC regardless of who else is ARP-claiming it
+                        # on the wire — and proceed to programming. No
+                        # discovery dance, no neighbor-table dependency, no
+                        # multicast voodoo. Per Brian: "Mac found > arp pin
+                        # mac --> factory_ip > fire programmer."
+                        if switch_loading_mode and dhcp_found_mac and not camera_ip:
+                            try:
+                                pinned_ok = self.arp_pin(factory_ip, dhcp_found_mac)
+                                if pinned_ok:
+                                    self.status_log(
+                                        f"  ARP-pinned {dhcp_found_mac} → {factory_ip} "
+                                        f"(switch_loading fire-and-forget)")
+                                else:
+                                    self.status_log(
+                                        f"  ⚠ arp_pin returned False — need admin? "
+                                        f"Proceeding anyway and letting HTTP fail-fast tell us.")
+                                # Set the slot and bail out of discovery. The
+                                # programming pipeline takes over from here.
+                                camera_ip = factory_ip
+                                pinned_mac = dhcp_found_mac
+                                break
+                            except Exception as _ap_e:
+                                self.status_log(f"  [diag] arp_pin error: {_ap_e!r}")
+
+                        # v5.1.0b4 — reverse ARP lookup: cameras emit
+                        # ARP-ANNOUNCE for their link-local self-assigned IPs
+                        # (RFC 3927) so the OS neighbor table almost always
+                        # already knows the MAC↔IP binding even before mDNS
+                        # comes around in its window. Pivot DHCP MAC → IP via
+                        # Get-NetNeighbor on the selected NIC and use it
+                        # directly. Scoped to the chosen interface so we
+                        # don't pick up the same MAC's stale entry from
+                        # another NIC.
+                        if dhcp_found_mac and not camera_ip:
+                            try:
+                                iface_alias = None
+                                if selected_iface:
+                                    iface_alias = (selected_iface.get('alias')
+                                                   or selected_iface.get('name')
+                                                   or selected_iface.get('label'))
+                                self.status_log(
+                                    f"  [diag] reverse-ARP lookup: MAC {dhcp_found_mac} "
+                                    f"on iface={iface_alias!r}")
+                                neighbor_ip = self.get_ip_from_neighbor_for_mac(
+                                    dhcp_found_mac, iface_alias=iface_alias)
+                                if not neighbor_ip and iface_alias:
+                                    # Fall back to system-wide lookup if scoped lookup empty
+                                    neighbor_ip = self.get_ip_from_neighbor_for_mac(dhcp_found_mac)
+                                    if neighbor_ip:
+                                        self.status_log(
+                                            f"  [diag] found in system-wide neighbor table at {neighbor_ip}")
+                                if not neighbor_ip:
+                                    # v5.1.0b5: provoke ARP — Windows doesn't auto-fill
+                                    # neighbor table from unsolicited ARP-ANNOUNCE, but
+                                    # mDNS/SSDP responses we've seen DO populate it as a
+                                    # side effect because they unicast to our IP. Force
+                                    # the issue with a quick mDNS ping query — cameras
+                                    # answer unicast, OS captures their IP/MAC.
+                                    self.status_log(
+                                        f"  [diag] not in neighbor table — provoking via mDNS query")
+                                    # Refresh discovery_ips in case link-local route
+                                    # was added between wizard start and now.
+                                    _provoke_ips = []
+                                    if getattr(self, '_linklocal_route_active', False):
+                                        _provoke_ips.append('169.254.100.1')
+                                    if wizard_iface_ip:
+                                        _provoke_ips.append(wizard_iface_ip)
+                                    try:
+                                        AxisMDNSDiscovery.discover(timeout=2, iface_ip=_provoke_ips)
+                                    except Exception:
+                                        pass
+                                    neighbor_ip = self.get_ip_from_neighbor_for_mac(
+                                        dhcp_found_mac, iface_alias=iface_alias)
+                                    if not neighbor_ip:
+                                        neighbor_ip = self.get_ip_from_neighbor_for_mac(dhcp_found_mac)
+                                    if neighbor_ip:
+                                        self.status_log(
+                                            f"  [diag] provoke worked — neighbor table now has {neighbor_ip}")
+                                if neighbor_ip:
+                                    if neighbor_ip.startswith('169.254.'):
+                                        self.add_linklocal_route()
+                                    if self.ping_camera(neighbor_ip, timeout_ms=1500):
+                                        camera_ip = neighbor_ip
+                                        pinned_mac = dhcp_found_mac
+                                        self.status_log(
+                                            f"Camera (neighbor table): {neighbor_ip}  MAC {dhcp_found_mac}")
+                                        break
+                                    else:
+                                        self.status_log(
+                                            f"  Neighbor table has {dhcp_found_mac} at {neighbor_ip} "
+                                            f"but ping failed — falling through")
+                                else:
+                                    self.status_log(
+                                        f"  [diag] still no neighbor entry for {dhcp_found_mac} after provoke — "
+                                        f"falling through to factory/mDNS/SSDP")
+                            except Exception as _e:
+                                self.status_log(f"  [diag] reverse-ARP error: {_e!r}")
+
                         if dhcp_found_mac and not camera_ip:
                             try:
                                 if self.ping_camera(factory_ip, timeout_ms=1000):
@@ -14220,9 +14854,60 @@ https://buymeacoffee.com/thelostping""")
                             except Exception:
                                 pass
 
+                        # v5.1.0b7 — L2 raw capture via scapy/npcap. Tried FIRST
+                        # because it bypasses Windows OS multicast routing
+                        # entirely. Catches SSDP NOTIFY, mDNS responses, and
+                        # Axis-OUI ARP/ANNOUNCE packets at the wire level.
                         if not camera_ip:
                             try:
-                                mdns_cams = AxisMDNSDiscovery.discover(timeout=2)
+                                _l2_iface_idx = (selected_iface or {}).get('index')
+                                self.status_log(
+                                    f"  [diag] L2 sniff starting (iface_idx={_l2_iface_idx})")
+                                l2_cams = AxisL2Discovery.discover(
+                                    timeout=4,
+                                    iface_ip=wizard_iface_ip,
+                                    iface_index=_l2_iface_idx)
+                                _l2_err = getattr(AxisL2Discovery, '_last_error', None)
+                                _l2_resolved = getattr(AxisL2Discovery, '_last_iface', None)
+                                self.status_log(
+                                    f"  [diag] L2 sniff returned {len(l2_cams)} hit(s) "
+                                    f"(iface={_l2_resolved!r}"
+                                    + (f", err={_l2_err}" if _l2_err else "")
+                                    + ")")
+                                for lc in l2_cams:
+                                    lc_ip = lc.get('ip', '')
+                                    lc_mac = lc.get('mac', '').upper().replace(':', '').replace('-', '')
+                                    if lc_mac and lc_mac in seen_macs:
+                                        continue
+                                    if not lc_ip:
+                                        continue
+                                    if lc_ip.startswith('169.254.'):
+                                        self.add_linklocal_route()
+                                    elif not self._ensure_route_to_camera(lc_ip):
+                                        continue
+                                    if self.ping_camera(lc_ip, timeout_ms=1000):
+                                        camera_ip = lc_ip
+                                        pinned_mac = lc.get('mac', '')
+                                        self.status_log(
+                                            f"Camera (L2 {lc.get('proto','?')}): {lc_ip}  MAC {pinned_mac}"
+                                            + (f"  {lc.get('model','')}" if lc.get('model') else ''))
+                                        break
+                                if camera_ip:
+                                    break
+                            except Exception as _l2e:
+                                self.status_log(f"  [diag] L2 sniff exception: {_l2e!r}")
+
+                        if not camera_ip:
+                            try:
+                                # v5.1.0b6 — refresh + use multi-IP list so we
+                                # join multicast on the link-local logical
+                                # subnet (where the cameras live) too.
+                                _disc_ips = []
+                                if getattr(self, '_linklocal_route_active', False):
+                                    _disc_ips.append('169.254.100.1')
+                                if wizard_iface_ip:
+                                    _disc_ips.append(wizard_iface_ip)
+                                mdns_cams = AxisMDNSDiscovery.discover(timeout=2, iface_ip=_disc_ips)
                                 for mc in mdns_cams:
                                     mc_ip = mc.get('ip', '')
                                     mc_mac = mc.get('mac', '').upper().replace(':', '').replace('-', '')
@@ -14243,6 +14928,58 @@ https://buymeacoffee.com/thelostping""")
                             except Exception:
                                 pass
 
+                        # v5.1.1 — SSDP/UPnP discovery (the protocol AXIS IP
+                        # Utility relies on most heavily). Axis cameras
+                        # announce themselves loudly via SSDP NOTIFY and
+                        # answer SSDP M-SEARCH, often before mDNS catches up.
+                        # IP-bound to the selected NIC so multi-NIC hosts
+                        # see link-local cameras on the right wire.
+                        if not camera_ip:
+                            try:
+                                # v5.1.0b6 — pass multi-IP list so we join SSDP
+                                # multicast on both link-local AND routable
+                                # subnets sharing the physical wire.
+                                _ssdp_ips = []
+                                if getattr(self, '_linklocal_route_active', False):
+                                    _ssdp_ips.append('169.254.100.1')
+                                if wizard_iface_ip:
+                                    _ssdp_ips.append(wizard_iface_ip)
+                                self.status_log(
+                                    f"  [diag] SSDP discover starting (iface_ips={_ssdp_ips})")
+                                ssdp_cams = AxisSSDPDiscovery.discover(
+                                    timeout=3, iface_ip=_ssdp_ips)
+                                _sl_bound = getattr(AxisSSDPDiscovery, '_last_bound_to_port', None)
+                                _sl_err = getattr(AxisSSDPDiscovery, '_last_bind_error', None)
+                                self.status_log(
+                                    f"  [diag] SSDP returned {len(ssdp_cams)} candidate(s) "
+                                    f"(bound_port_1900={_sl_bound}"
+                                    + (f", bind_err={_sl_err}" if _sl_err else "")
+                                    + ")")
+                                for sc in ssdp_cams:
+                                    sc_ip = sc.get('ip', '')
+                                    if not sc_ip:
+                                        continue
+                                    # SSDP gives us an IP — resolve MAC via ARP.
+                                    sc_mac = self.get_mac_from_arp(sc_ip) or ''
+                                    sc_mac_norm = sc_mac.upper().replace(':', '').replace('-', '')
+                                    if sc_mac_norm and sc_mac_norm in seen_macs:
+                                        continue
+                                    if sc_ip.startswith('169.254.'):
+                                        self.add_linklocal_route()
+                                    elif not self._ensure_route_to_camera(sc_ip):
+                                        continue
+                                    if self.ping_camera(sc_ip, timeout_ms=1000):
+                                        camera_ip = sc_ip
+                                        pinned_mac = sc_mac
+                                        self.status_log(
+                                            f"Camera (SSDP): {sc_ip}  "
+                                            f"{sc.get('model','?')}  via {sc.get('server','')[:40]}")
+                                        break
+                                if camera_ip:
+                                    break
+                            except Exception:
+                                pass
+
                     time.sleep(1)
                     # v4.4.8-beta9 — heartbeat (status_log so it shows in the
                     # step-by-step UI's log pane).
@@ -14256,7 +14993,8 @@ https://buymeacoffee.com/thelostping""")
                             _modes.append(f"factory IP {factory_ip}")
                         if discovery_mode in ('mdns', 'both'):
                             _modes.append("DHCP snoop + mDNS (link-local)")
-                        self.status_log(f"  ...still searching for {next_name} ({_elapsed}s) — checking: {', '.join(_modes)}. Plug in / reboot to trigger fresh DHCP DISCOVER.")
+                        _heartbeat_target = '(any unprogrammed camera in CSV)' if switch_loading_mode else next_name
+                        self.status_log(f"  ...still searching for {_heartbeat_target} ({_elapsed}s) — checking: {', '.join(_modes)}. Plug in / reboot to trigger fresh DHCP DISCOVER.")
                         _last_heartbeat = _now
 
                 if self.cancel_flag:
@@ -14341,6 +15079,45 @@ https://buymeacoffee.com/thelostping""")
                     continue
 
                 _ui(self.status_set_step, 'discover', 'ok', camera_ip)
+
+                # v5.1.0 — Switch Loading early MAC gate.
+                # Critical: this runs BEFORE any mutating action (no
+                # factory-reset, no auth changes, no network config). If the
+                # discovered camera's MAC isn't in the loaded CSV, it's a
+                # production camera that doesn't belong to this job and we
+                # leave it alone. Idempotent across re-runs because already-
+                # programmed CSV rows are absent from `remaining`.
+                if switch_loading_mode:
+                    norm_pinned = (pinned_mac or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                    sl_match_idx = None
+                    if norm_pinned:
+                        for sl_idx, sl_c in enumerate(remaining):
+                            sl_c_mac = (sl_c.get('mac', '') or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                            if sl_c_mac and sl_c_mac == norm_pinned:
+                                sl_match_idx = sl_idx
+                                break
+                    if sl_match_idx is None:
+                        # Unknown MAC — not in this job's CSV. Don't touch it.
+                        if norm_pinned:
+                            seen_macs.add(norm_pinned)
+                        self.status_log(
+                            f"  Skipping {pinned_mac or '(no MAC)'} at {camera_ip} — not in loaded CSV "
+                            f"({len(remaining)} of {len(cameras)} still to program)")
+                        self.arp_unpin(camera_ip)
+                        _ui(self.status_set_step, 'discover', 'active')
+                        time.sleep(1)
+                        continue
+                    # MAC matched — promote the cam from remaining and announce.
+                    next_cam = remaining[sl_match_idx]
+                    next_name = next_cam.get('name', '?')
+                    next_model = next_cam.get('model', '')
+                    programmed_count += 1
+                    self.status_log(
+                        f"  ✓ MAC {pinned_mac} matches CSV row '{next_name}' "
+                        f"(#{next_cam.get('number','?')}) — programming")
+                    _ui(self.status_set_camera, next_name,
+                        f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
+
                 _ui(self.status_set_banner, 'PROGRAMMING…',
                     f"{next_name}  →  working on it", '#2196F3')
 
@@ -14598,7 +15375,41 @@ https://buymeacoffee.com/thelostping""")
                 # ---- Match camera entry ----
                 cam = None
                 cam_idx = None
-                if actual_model:
+
+                # v5.1.0 — Switch Loading: MAC is the join key, not model.
+                # The early MAC gate above already confirmed the MAC is in the
+                # CSV; here we re-find the index to drive the rest of the loop.
+                # Model mismatch in this mode is logged but not fatal — the
+                # operator's CSV may carry a wrong/blank model and the MAC
+                # match is authoritative.
+                if switch_loading_mode:
+                    norm_pinned = (pinned_mac or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                    for idx, c in enumerate(remaining):
+                        c_mac_norm = (c.get('mac', '') or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                        if c_mac_norm and c_mac_norm == norm_pinned:
+                            cam = c
+                            cam_idx = idx
+                            break
+                    if not cam:
+                        # Shouldn't happen — early MAC gate should have caught it.
+                        # Defensive: re-discover this slot.
+                        self.status_log(
+                            f"  ⚠ Internal: MAC {pinned_mac} matched early gate but lost before model step — re-discovering")
+                        self.arp_unpin(camera_ip)
+                        camera_ip = None
+                        pinned_mac = None
+                        _ui(self.status_set_step, 'discover', 'active')
+                        time.sleep(1)
+                        continue
+                    # Model sanity-check (informational only in switch_loading)
+                    if actual_model and cam.get('model'):
+                        norm_actual = actual_model.upper().replace('AXIS-', '').replace('AXIS ', '').strip()
+                        norm_expected = cam['model'].upper().replace('AXIS-', '').replace('AXIS ', '').strip()
+                        if not (norm_expected in norm_actual or norm_actual in norm_expected):
+                            self.status_log(
+                                f"  ⚠ Model in CSV ({cam['model']}) doesn't match camera ({actual_model}) — "
+                                f"MAC matches so programming anyway; verify the CSV row is correct.")
+                elif actual_model:
                     norm_actual = actual_model.upper().replace('AXIS-', '').replace('AXIS ', '').strip()
                     for idx, c in enumerate(remaining):
                         c_model = c.get('model', '')
@@ -15064,6 +15875,47 @@ https://buymeacoffee.com/thelostping""")
                 _ui(self.status_set_step, 'capture', 'ok',
                     f"{serial} / {cam.get('mac', '?')}")
 
+                # v5.1.0 — Switch Loading post-program MAC confirmation.
+                # We programmed this row based on a MAC match at discovery.
+                # Now that the camera is at its new IP, re-fetch its MAC and
+                # verify it equals the CSV row's MAC. Catches the rare case
+                # where two simultaneous programmings could swap configs
+                # mid-flight, or where the post-program camera is somehow
+                # a different one than we expected.
+                if switch_loading_mode and 'verify_mac' in used_steps:
+                    _ui(self.status_set_step, 'verify_mac', 'active')
+                    expected_mac_norm = (cam.get('mac', '') or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                    seen_mac_raw = ''
+                    if camera_reachable:
+                        try:
+                            probe2 = self.protocol.probe_unrestricted(static_ip)
+                            seen_mac_raw = probe2.get('mac') or ''
+                        except Exception:
+                            seen_mac_raw = ''
+                        if not seen_mac_raw:
+                            seen_mac_raw = self.get_mac_from_arp(static_ip) or ''
+                    seen_mac_norm = seen_mac_raw.upper().replace(':', '').replace('-', '').replace('.', '')
+                    if not seen_mac_norm:
+                        self.status_log(
+                            f"⚠ verify_mac: could not read MAC at {static_ip} — "
+                            "treating as soft-fail (camera reachable but MAC not exposed by API/ARP).")
+                        errors.append('verify_mac_unreadable')
+                        _ui(self.status_set_step, 'verify_mac', 'fail', '(unreadable)')
+                    elif seen_mac_norm == expected_mac_norm:
+                        self.status_log(
+                            f"✓ verify_mac: camera at {static_ip} reports MAC {seen_mac_raw} — matches CSV row")
+                        _ui(self.status_set_step, 'verify_mac', 'ok', seen_mac_raw)
+                    else:
+                        self.status_log(
+                            f"✗ verify_mac: SLIP DETECTED at {static_ip}.\n"
+                            f"    expected MAC: {cam.get('mac', '?')}\n"
+                            f"    found    MAC: {seen_mac_raw}\n"
+                            f"    Programming this row's config landed on the wrong camera. "
+                            f"Likely cause: two cameras with the same factory IP racing the "
+                            f"set_network step. Investigate before shipping this row.")
+                        errors.append('mac_mismatch')
+                        _ui(self.status_set_step, 'verify_mac', 'fail', f'got {seen_mac_raw}')
+
                 self.camera_data.save()
                 _ui(self.refresh_camera_list)
 
@@ -15112,7 +15964,13 @@ https://buymeacoffee.com/thelostping""")
 
                 remaining.pop(cam_idx)
 
-                if remaining and not self.cancel_flag:
+                # v5.1.0 — In switch_loading mode, clear last_announced_name so
+                # the next outer-loop iteration refreshes the banner counts
+                # (programmed_count / remaining) for the next MAC we find.
+                if switch_loading_mode:
+                    last_announced_name = None
+
+                if remaining and not self.cancel_flag and not switch_loading_mode:
                     # v4.5.1-beta5: keep the SUCCESS banner up until the
                     # camera physically disappears from the network (ping
                     # at its programmed IP fails). Brian's ask 2026-05-05:
@@ -15120,6 +15978,10 @@ https://buymeacoffee.com/thelostping""")
                     # programmed camera disappear from the network. I
                     # unplugged > Plug in camera x". So the screen flips
                     # to PLUG IN exactly when the operator unplugs.
+                    #
+                    # v5.1.0: Switch Loading mode skips this — the operator
+                    # plugged ALL cameras in at once and we want to move to
+                    # the next discovered MAC immediately, no unplug step.
                     #
                     # 3s minimum hold for fast-unplug case (so the banner
                     # is at least seen even if you're already unplugging),
@@ -15915,6 +16777,66 @@ https://buymeacoffee.com/thelostping""")
                 _t.sleep(0.4)
         return None
     
+    def get_ip_from_neighbor_for_mac(self, mac, iface_alias=None):
+        """v5.1.0b4 — reverse ARP lookup: given a MAC, return the IP currently
+        associated with it in the Windows neighbor table. Optionally scoped to
+        a single interface by alias.
+
+        This is the "they're screaming, listen to who said it" path: when DHCP
+        snoop tells us a camera-vendor MAC is on the wire, the cameras have
+        almost always also sent ARP-ANNOUNCE / ARP-PROBE for their link-local
+        self-assigned IPs (RFC 3927). Those land in Get-NetNeighbor and let
+        us go MAC → IP without needing mDNS to come around in its own window.
+
+        Returns IP string or None. Filters out 0.0.0.0 / multicast / broadcast
+        / unreachable / incomplete entries."""
+        import subprocess
+        norm = (mac or '').upper().replace(':', '-').replace('.', '-')
+        if len(norm.replace('-', '')) != 12:
+            return None
+        # Build the PowerShell filter. Quote interface alias if given.
+        if iface_alias:
+            cmd = (f"Get-NetNeighbor -AddressFamily IPv4 "
+                   f"-InterfaceAlias '{iface_alias}' "
+                   f"-ErrorAction SilentlyContinue | "
+                   f"Where-Object {{ $_.LinkLayerAddress -eq '{norm}' -and "
+                   f"$_.State -ne 'Unreachable' }} | "
+                   f"Select-Object -ExpandProperty IPAddress")
+        else:
+            cmd = (f"Get-NetNeighbor -AddressFamily IPv4 "
+                   f"-ErrorAction SilentlyContinue | "
+                   f"Where-Object {{ $_.LinkLayerAddress -eq '{norm}' -and "
+                   f"$_.State -ne 'Unreachable' }} | "
+                   f"Select-Object -ExpandProperty IPAddress")
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', cmd],
+                capture_output=True, text=True, timeout=5,
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            if result.returncode != 0:
+                return None
+            for line in result.stdout.splitlines():
+                ip = line.strip()
+                if not ip:
+                    continue
+                # Filter out garbage: 0.0.0.0, multicast (224-239), broadcast
+                if ip == '0.0.0.0' or ip == '255.255.255.255':
+                    continue
+                try:
+                    first_octet = int(ip.split('.')[0])
+                    if 224 <= first_octet <= 239:
+                        continue
+                except (ValueError, IndexError):
+                    continue
+                return ip
+        except Exception:
+            pass
+        return None
+
     def arp_pin(self, ip, mac):
         """Pin ARP entry so all traffic to IP goes to specific MAC.
         Note: requires Run as Administrator on Windows for arp -s to work.
