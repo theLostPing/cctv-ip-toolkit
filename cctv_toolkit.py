@@ -64,7 +64,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "5.1.0"
+APP_VERSION = "5.1.1"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -12851,6 +12851,15 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "5.1.1": (
+            "What's new in v5.1.1",
+            [
+                "• THE TRAINING-DAY BUG, root-caused and fixed. The 'Link-local: FAILED — Run as Administrator' spam (2026-05-13 training session) was a misdiagnosis: the app was already elevated, and the real failure was Windows refusing to add 169.254.100.1 because it was still parked on a DIFFERENT interface — dock/USB re-enumeration shifts interface indexes between runs, and the pre-flight and wait-loop could disagree about which NIC to use. The one error message that would have said so was being discarded.",
+                "• Link-local setup is now self-healing: if the address is stranded on another interface it's evicted and re-added on the right one; a just-removed address in tentative state gets a settle-and-retry; and if PowerShell's New-NetIPAddress still refuses, the toolkit falls back to netsh (the same mechanism the subnet sweep already uses successfully on the same NIC).",
+                "• When link-local setup genuinely fails, the log now prints the REAL Windows error — 'Run as Administrator' is only claimed when the app actually isn't elevated.",
+                "• No camera-side changes. Programming, Switch Loading, and the wizard are untouched.",
+            ],
+        ),
         "5.1.0": (
             "What's new in v5.1.0",
             [
@@ -16944,45 +16953,100 @@ https://buymeacoffee.com/thelostping""")
 
         self._linklocal_route_active = False
 
-        # PowerShell New-NetIPAddress adds a secondary address cleanly.
-        # Unlike 'netsh add address', it does NOT convert DHCP to static.
+        # Training day 2026-05-13, root-caused 2026-07-11: the link-local IP
+        # can end up parked on a DIFFERENT interface than the one we're about
+        # to add to (dock/USB re-enumeration shifts InterfaceIndex between
+        # runs — the training logs show interface 9 in run 1 and interface 3
+        # in run 2 — and an earlier pre-flight pass may have added it via a
+        # different index). Windows refuses to hold the same unicast IP on
+        # two interfaces, so the add fails — and the old code reported that
+        # as "Run as Administrator", which was a lie (the app is
+        # manifest-elevated). Evict a stray copy before adding.
         try:
-            cmd = (f"New-NetIPAddress -InterfaceIndex {iface_idx} "
-                   f"-IPAddress '{self.LINKLOCAL_IP}' -PrefixLength 16 "
-                   f"-SkipAsSource $true -PolicyStore ActiveStore "
-                   f"-ErrorAction Stop")
-            result = subprocess.run(
-                ['powershell', '-NoProfile', '-Command', cmd],
+            r = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 f"(Get-NetIPAddress -IPAddress '{self.LINKLOCAL_IP}' "
+                 f"-ErrorAction SilentlyContinue).InterfaceIndex"],
                 capture_output=True, text=True, timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW)
-            if result.returncode == 0:
-                self._linklocal_route_active = True
-                self._linklocal_iface_idx = iface_idx
-                self.log(f"  Link-local: {self.LINKLOCAL_IP} on interface {iface_idx}")
+            stray_idxs = [s for s in (r.stdout or '').split() if s.isdigit()]
+            if stray_idxs and str(iface_idx) not in stray_idxs:
+                subprocess.run(
+                    ['powershell', '-NoProfile', '-Command',
+                     f"Remove-NetIPAddress -IPAddress '{self.LINKLOCAL_IP}' "
+                     f"-Confirm:$false -ErrorAction SilentlyContinue"],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+                self.log(f"  Link-local: {self.LINKLOCAL_IP} was parked on interface "
+                         f"{'/'.join(stray_idxs)} — evicted, re-adding on {iface_idx}")
                 time.sleep(1)
-                return True
-            # Address may already exist on this interface
-            if self._has_linklocal_route():
-                self._linklocal_route_active = True
-                self._linklocal_iface_idx = iface_idx
-                self.log(f"  Link-local: {self.LINKLOCAL_IP} already on interface {iface_idx}")
-                return True
-            # Training day 2026-05-13: this path used to swallow the real
-            # PowerShell error and blame elevation no matter what — the app
-            # is manifest-elevated, so "Run as Administrator" was a lie and
-            # the actual failure (captured in stderr) was invisible in the
-            # room. Surface the real reason.
-            err = (result.stderr or result.stdout or '').strip()
-            if err:
-                self.log(f"  Link-local: New-NetIPAddress failed: {err.splitlines()[0][:200]}")
+        except Exception:
+            pass
+
+        # PowerShell New-NetIPAddress adds a secondary address cleanly.
+        # Unlike 'netsh add address', it does NOT convert DHCP to static.
+        # Two attempts with a settle pause between them: a just-removed
+        # address can linger in tentative/DAD state for a moment and make
+        # the first re-add fail.
+        last_err = ''
+        for attempt in (1, 2):
+            try:
+                cmd = (f"New-NetIPAddress -InterfaceIndex {iface_idx} "
+                       f"-IPAddress '{self.LINKLOCAL_IP}' -PrefixLength 16 "
+                       f"-SkipAsSource $true -PolicyStore ActiveStore "
+                       f"-ErrorAction Stop")
+                result = subprocess.run(
+                    ['powershell', '-NoProfile', '-Command', cmd],
+                    capture_output=True, text=True, timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
+                if result.returncode == 0:
+                    self._linklocal_route_active = True
+                    self._linklocal_iface_idx = iface_idx
+                    self.log(f"  Link-local: {self.LINKLOCAL_IP} on interface {iface_idx}")
+                    time.sleep(1)
+                    return True
+                # Address may already exist on this interface
+                if self._has_linklocal_route():
+                    self._linklocal_route_active = True
+                    self._linklocal_iface_idx = iface_idx
+                    self.log(f"  Link-local: {self.LINKLOCAL_IP} already on interface {iface_idx}")
+                    return True
+                last_err = (result.stderr or result.stdout or '').strip()
+            except Exception as e:
+                last_err = str(e)
+            if attempt == 1:
+                time.sleep(2)
+        if last_err:
+            self.log(f"  Link-local: New-NetIPAddress failed: {last_err.splitlines()[0][:200]}")
+
+        # Last resort: netsh with store=active — the same mechanism the /24
+        # pre-flight sweep uses successfully on the same NIC, so if the
+        # PowerShell path is blocked (interface state, corporate policy),
+        # this one has a proven track record. Non-persistent, gone on reboot.
+        try:
+            r = subprocess.run(
+                ['netsh', 'interface', 'ipv4', 'add', 'address',
+                 f"name={iface_idx}", f"address={self.LINKLOCAL_IP}",
+                 "mask=255.255.0.0", "store=active"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            if r.returncode == 0 or 'already exists' in (r.stdout + r.stderr).lower():
+                time.sleep(1)
+                if self._has_linklocal_route():
+                    self._linklocal_route_active = True
+                    self._linklocal_iface_idx = iface_idx
+                    self.log(f"  Link-local: {self.LINKLOCAL_IP} on interface {iface_idx} (netsh fallback)")
+                    return True
+            nerr = (r.stderr or r.stdout or '').strip()
+            if nerr:
+                self.log(f"  Link-local: netsh fallback failed: {nerr.splitlines()[0][:200]}")
         except Exception as e:
-            self.log(f"  Link-local: PowerShell invocation error: {e}")
+            self.log(f"  Link-local: netsh fallback error: {e}")
 
         if not _is_admin_windows():
             self.log("  Link-local: FAILED — Run as Administrator")
         else:
-            self.log("  Link-local: FAILED (already elevated — see reason above; "
-                     "corporate policy can block New-NetIPAddress)")
+            self.log("  Link-local: FAILED (already elevated — real reason logged above)")
         return False
 
     def remove_linklocal_route(self):
