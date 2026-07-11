@@ -16967,10 +16967,22 @@ https://buymeacoffee.com/thelostping""")
                 self._linklocal_iface_idx = iface_idx
                 self.log(f"  Link-local: {self.LINKLOCAL_IP} already on interface {iface_idx}")
                 return True
-        except:
-            pass
+            # Training day 2026-05-13: this path used to swallow the real
+            # PowerShell error and blame elevation no matter what — the app
+            # is manifest-elevated, so "Run as Administrator" was a lie and
+            # the actual failure (captured in stderr) was invisible in the
+            # room. Surface the real reason.
+            err = (result.stderr or result.stdout or '').strip()
+            if err:
+                self.log(f"  Link-local: New-NetIPAddress failed: {err.splitlines()[0][:200]}")
+        except Exception as e:
+            self.log(f"  Link-local: PowerShell invocation error: {e}")
 
-        self.log("  Link-local: FAILED — Run as Administrator")
+        if not _is_admin_windows():
+            self.log("  Link-local: FAILED — Run as Administrator")
+        else:
+            self.log("  Link-local: FAILED (already elevated — see reason above; "
+                     "corporate policy can block New-NetIPAddress)")
         return False
 
     def remove_linklocal_route(self):
