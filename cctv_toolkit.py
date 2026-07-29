@@ -33,6 +33,13 @@ import threading
 import time
 import requests
 from requests.auth import HTTPDigestAuth
+# Cameras ship self-signed certs, so every HTTPS probe we make is verify=False.
+# Without this the console fills with InsecureRequestWarning on each one.
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
 import os
 import csv
 import json
@@ -64,7 +71,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "5.1.1"
+APP_VERSION = "5.2.0"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -285,7 +292,10 @@ _migrate_export_dir_to_redirected()
 TIMEOUT = 5
 
 # Bosch camera constants
-BOSCH_OUIS = [b'\x00\x07\x5f']
+# 00:07:5f is the one on every modern Bosch camera. 00:04:63 and 00:1b:86 are
+# older Bosch Security Systems blocks (the ex-Philips CSI range and the access
+# line) — harmless to keep listening for, and they cost nothing when absent.
+BOSCH_OUIS = [b'\x00\x07\x5f', b'\x00\x04\x63', b'\x00\x1b\x86']
 BOSCH_DEFAULT_IP = '192.168.0.1'
 BOSCH_DEFAULT_USER = 'service'
 RCP_CMD = {
@@ -361,25 +371,80 @@ def _is_admin_windows():
         return False
 
 
-def _netsh_add_ip(iface_index, ip, mask):
-    """Add a secondary IPv4 address to a NIC. Requires admin."""
+def _netsh_add_ip(iface_index, ip, mask, return_error=False):
+    """Add a TEMPORARY secondary IPv4 address to a NIC. Requires admin.
+
+    Uses New-NetIPAddress -PolicyStore ActiveStore, the same mechanism the
+    link-local path already relies on. The old implementation shelled
+    `netsh interface ipv4 add address` with no `store=` argument, which writes
+    to the PERSISTENT store — on a DHCP interface that silently converts the
+    NIC to static configuration and the stray address survives a reboot. A
+    tech could leave site with a previous customer's camera subnet still
+    bolted to their laptop and DHCP no longer working.
+
+    Returns True/False, or (ok, error_text) when return_error=True — callers
+    that report failures to the operator need the real reason, not a guess."""
     import subprocess
+    prefix = _mask_to_prefix_len(mask)
+    last_err = ''
+
+    try:
+        cmd = (f"New-NetIPAddress -InterfaceIndex {iface_index} "
+               f"-IPAddress '{ip}' -PrefixLength {prefix} "
+               f"-PolicyStore ActiveStore -SkipAsSource $true "
+               f"-ErrorAction Stop | Out-Null")
+        r = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', cmd],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if r.returncode == 0:
+            return (True, '') if return_error else True
+        blob = ((r.stderr or '') + (r.stdout or '')).strip()
+        if 'already exists' in blob.lower() or 'DuplicateObject' in blob:
+            return (True, '') if return_error else True
+        last_err = blob
+    except Exception as e:
+        last_err = str(e)
+
+    # Fallback: netsh, but pinned to the ACTIVE store so it still can't write
+    # a permanent address onto the operator's adapter.
     try:
         r = subprocess.run(
             ['netsh', 'interface', 'ipv4', 'add', 'address',
              f"name={iface_index}",  # by InterfaceIndex
              f"address={ip}",
-             f"mask={mask}"],
+             f"mask={mask}",
+             "store=active"],
             capture_output=True, text=True, timeout=10,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         # netsh sometimes returns 1 for "address already exists" — check stderr text
         if r.returncode == 0:
-            return True
+            return (True, '') if return_error else True
         if 'already exists' in (r.stdout + r.stderr).lower():
-            return True  # idempotent — already there is success
-        return False
+            return (True, '') if return_error else True  # idempotent
+        nerr = ((r.stderr or '') + (r.stdout or '')).strip()
+        if nerr:
+            last_err = nerr
+    except Exception as e:
+        if not last_err:
+            last_err = str(e)
+
+    if not last_err:
+        last_err = 'unknown error'
+    if not _is_admin_windows():
+        last_err += ' (toolkit is NOT running elevated)'
+    return (False, last_err) if return_error else False
+
+
+def _mask_to_prefix_len(mask):
+    """'255.255.255.0' → 24. Falls back to 24 on anything unparseable."""
+    try:
+        octets = [int(x) for x in str(mask).split('.')]
+        if len(octets) != 4 or any(o < 0 or o > 255 for o in octets):
+            return 24
+        return sum(bin(o).count('1') for o in octets)
     except Exception:
-        return False
+        return 24
 
 
 def _netsh_remove_ip(iface_index, ip):
@@ -388,14 +453,26 @@ def _netsh_remove_ip(iface_index, ip):
     try:
         r = subprocess.run(
             ['netsh', 'interface', 'ipv4', 'delete', 'address',
-             f"name={iface_index}", f"address={ip}"],
+             f"name={iface_index}", f"address={ip}", "store=active"],
             capture_output=True, text=True, timeout=10,
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         if r.returncode == 0:
             return True
         if 'not found' in (r.stdout + r.stderr).lower() or 'not configured' in (r.stdout + r.stderr).lower():
             return True  # already gone — success
-        return False
+    except Exception:
+        pass
+    # Belt and braces: the address may have been written to the persistent
+    # store by a pre-v5.2 build, or parked on a different interface after a
+    # dock re-enumeration shifted the index. Remove it wherever it lives.
+    try:
+        cmd = (f"Remove-NetIPAddress -IPAddress '{ip}' -Confirm:$false "
+               f"-ErrorAction SilentlyContinue")
+        subprocess.run(
+            ['powershell', '-NoProfile', '-Command', cmd],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return True
     except Exception:
         return False
 
@@ -523,7 +600,9 @@ DEFAULT_FIND_ANYWHERE_SUBNETS = (
     '10.0.0', '10.0.1', '192.168.0', '192.168.1', '192.168.50', '172.16.0',
 )
 # Axis OUI prefixes — dash-formatted to match Get-NetNeighbor output.
-AXIS_OUI_PREFIXES = ('B8-A4-4F', '00-40-8C', 'AC-CC-8E')
+# Kept only as a last-resort default; every live caller now passes the active
+# protocol's MAC_OUIS instead, so a Bosch/Hanwha job harvests its own vendor.
+AXIS_OUI_PREFIXES = ('B8-A4-4F', '00-40-8C', 'AC-CC-8E', 'E8-27-25')
 
 
 def _normalize_mac(mac):
@@ -650,12 +729,20 @@ def _tcp_probe_sweep(subnet_base, ports=(80, 443), timeout_s=0.4,
     return hits
 
 
-def _arp_matches_in_subnet(subnet_base, mac_oui_prefixes=AXIS_OUI_PREFIXES):
+def _arp_matches_in_subnet(subnet_base, mac_oui_prefixes=None, oui_bytes=None):
     """Read the ARP table, return entries whose IP is in subnet_base.x AND
-    whose MAC starts with any of the OUI prefixes."""
+    whose MAC belongs to the camera vendor we're looking for.
+
+    Pass `oui_bytes` — the active protocol's MAC_OUIS — so a Bosch or Hanwha
+    job harvests its own vendor. The old dash-string `mac_oui_prefixes` form is
+    still accepted for callers that have prefixes but no protocol handy.
+    Before v5.2 this defaulted to Axis, so every sweep in every brand mode
+    could only ever "find" Axis cameras and silently dropped the others."""
     out = []
     seen_macs = set()
-    oui_set = tuple(p.upper() for p in mac_oui_prefixes)
+    if oui_bytes is None and mac_oui_prefixes is None:
+        mac_oui_prefixes = AXIS_OUI_PREFIXES
+    oui_set = tuple(p.upper() for p in (mac_oui_prefixes or ()))
     for entry in _arp_table():
         ip = entry.get('ip', '')
         mac = entry.get('mac', '')
@@ -663,7 +750,10 @@ def _arp_matches_in_subnet(subnet_base, mac_oui_prefixes=AXIS_OUI_PREFIXES):
             continue
         if not ip.startswith(subnet_base + '.'):
             continue
-        if not any(mac.startswith(prefix) for prefix in oui_set):
+        if oui_bytes is not None:
+            if not _mac_oui_allowed(mac, oui_bytes):
+                continue
+        elif not any(mac.startswith(prefix) for prefix in oui_set):
             continue
         if mac in seen_macs:
             continue
@@ -1136,169 +1226,11 @@ class AdditionalUsersDataManager:
         return self.users
 
 
-# ============================================================================
-# AXIS CAMERA DISCOVERY (UDP Port 19540)
-# ============================================================================
-class AxisDiscovery:
-    """
-    Discovers Axis cameras on the network using the proprietary
-    Axis discovery protocol (same as AXIS IP Utility).
-    Sends a broadcast on UDP port 19540 and cameras respond with their info.
-    """
-    DISCOVERY_PORT = 19540
-    DISCOVERY_MAGIC = b'\x00\x01\x00\x00'  # Axis discovery request
-    
-    @staticmethod
-    def get_local_ips():
-        """Get all local IP addresses to broadcast from"""
-        local_ips = []
-        try:
-            # Get all network interfaces
-            hostname = socket.gethostname()
-            local_ips = socket.gethostbyname_ex(hostname)[2]
-        except:
-            pass
-        # Filter out localhost
-        local_ips = [ip for ip in local_ips if not ip.startswith('127.')]
-        if not local_ips:
-            local_ips = ['0.0.0.0']
-        return local_ips
-    
-    @staticmethod
-    def discover(timeout=5, callback=None, iface_ip=None):
-        """
-        Discover Axis cameras on the network.
-        Returns list of dicts with camera info.
-        callback(camera_dict) is called for each camera found (optional).
-
-        v5.1.1: `iface_ip` binds the broadcast send socket to a specific NIC.
-        On multi-NIC hosts the OS otherwise routes 255.255.255.255 out the
-        default-route interface only.
-        """
-        cameras = []
-        seen_macs = set()
-
-        try:
-            # Create UDP socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.settimeout(0.5)  # Short timeout for recv
-            # v5.1.1: bind to specific NIC if given so 255.255.255.255 goes
-            # out that interface rather than the system default route.
-            sock.bind(((iface_ip or ''), 0))
-            
-            # Send discovery broadcast
-            broadcast_addr = ('255.255.255.255', AxisDiscovery.DISCOVERY_PORT)
-            
-            # Axis discovery packet - simple broadcast
-            # The actual Axis protocol uses a specific packet format
-            discovery_packet = AxisDiscovery.DISCOVERY_MAGIC + b'\x00' * 60
-            
-            sock.sendto(discovery_packet, broadcast_addr)
-            
-            # Also try sending to common subnet broadcasts
-            for local_ip in AxisDiscovery.get_local_ips():
-                try:
-                    parts = local_ip.split('.')
-                    subnet_broadcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
-                    sock.sendto(discovery_packet, (subnet_broadcast, AxisDiscovery.DISCOVERY_PORT))
-                except:
-                    pass
-            
-            # Listen for responses
-            end_time = datetime.now().timestamp() + timeout
-            while datetime.now().timestamp() < end_time:
-                try:
-                    data, addr = sock.recvfrom(1024)
-                    if len(data) > 20:
-                        camera = AxisDiscovery.parse_response(data, addr[0])
-                        if camera and camera.get('mac') not in seen_macs:
-                            seen_macs.add(camera.get('mac'))
-                            cameras.append(camera)
-                            if callback:
-                                callback(camera)
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    continue
-            
-            sock.close()
-        except Exception as e:
-            print(f"Discovery error: {e}")
-        
-        return cameras
-    
-    @staticmethod
-    def parse_response(data, source_ip):
-        """Parse Axis discovery response packet"""
-        try:
-            # Axis response format varies by firmware, but generally contains:
-            # - MAC address (6 bytes, often at offset 4-9)
-            # - IP address (4 bytes)
-            # - Model name (string)
-            # - Serial number (string)
-            
-            camera = {
-                'ip': source_ip,
-                'mac': '',
-                'model': '',
-                'serial': '',
-                'name': ''
-            }
-            
-            # Try to extract MAC address (look for 6 consecutive bytes that look like MAC)
-            for i in range(len(data) - 5):
-                # Check if this could be a MAC (non-zero, not all same)
-                mac_bytes = data[i:i+6]
-                if mac_bytes[0:3] == b'\x00\x40\x8c' or mac_bytes[0:3] == b'\xac\xcc\x8e' or mac_bytes[0:3] == b'\xb8\xa4\x4f':
-                    # Common Axis MAC prefixes
-                    camera['mac'] = ':'.join(f'{b:02X}' for b in mac_bytes)
-                    break
-            
-            # Try to extract readable strings (model, serial)
-            # Look for null-terminated strings in the packet
-            text_parts = []
-            current = b''
-            for byte in data:
-                if 32 <= byte <= 126:  # Printable ASCII
-                    current += bytes([byte])
-                else:
-                    if len(current) >= 3:
-                        text_parts.append(current.decode('ascii', errors='ignore'))
-                    current = b''
-            if len(current) >= 3:
-                text_parts.append(current.decode('ascii', errors='ignore'))
-            
-            # Try to identify model and serial from text parts
-            for part in text_parts:
-                part = part.strip()
-                if not part:
-                    continue
-                # Skip mDNS hostnames (axis-<mac>.local) — those are NOT models
-                if part.lower().endswith('.local') or part.lower().startswith('axis-'):
-                    continue
-                # Axis models often start with letters like P, M, Q, etc.
-                # Match real product strings like "AXIS P3268-LV", not the
-                # bare hostname pattern "axis-b8a44f8bf3bb".
-                if re.match(r'^[PMQVFA]\d{4}', part) or part.upper().startswith('AXIS '):
-                    camera['model'] = part
-                # Serial numbers are often MAC-like or all caps/numbers
-                elif re.match(r'^[A-F0-9]{12}$', part) or re.match(r'^ACCC[A-F0-9]{8}$', part):
-                    camera['serial'] = part
-                    if not camera['mac']:
-                        # Convert serial to MAC format
-                        camera['mac'] = ':'.join(part[i:i+2] for i in range(0, 12, 2))
-            
-            # Name = axis-serial (default hostname) or IP fallback
-            if camera['serial']:
-                camera['name'] = f"axis-{camera['serial'].lower()}"
-            else:
-                camera['name'] = source_ip
-            
-            return camera
-        except Exception as e:
-            return {'ip': source_ip, 'mac': '', 'model': 'Unknown', 'serial': '', 'name': source_ip}
+# AxisDiscovery (UDP 19540, the AXIS IP Utility protocol) lived here.
+# Nothing in the app ever called it - every discovery path uses DHCP
+# snooping, mDNS, SSDP or L2 instead. It carried its own fourth copy of
+# the Axis OUI table, so it was a standing invitation to 'fix' discovery
+# in a class that never runs. Removed in v5.2 (~160 lines).
 
 
 # ============================================================================
@@ -1316,8 +1248,8 @@ class AxisDHCPDiscovery:
     DHCP_CLIENT_PORT = 68
     DHCP_MAGIC = b'\x63\x82\x53\x63'
 
-    # Known Axis MAC OUI prefixes
-    AXIS_OUIS = [b'\x00\x40\x8c', b'\xac\xcc\x8e', b'\xb8\xa4\x4f']
+    # Known Axis MAC OUI prefixes (e8:27:25 is Axis's 2023 block)
+    AXIS_OUIS = [b'\x00\x40\x8c', b'\xac\xcc\x8e', b'\xb8\xa4\x4f', b'\xe8\x27\x25']
 
     @staticmethod
     def discover(timeout=5, callback=None):
@@ -1375,9 +1307,10 @@ class AxisDHCPDiscovery:
         mac_bytes = data[28:34]
         mac = ':'.join(f'{b:02X}' for b in mac_bytes)
 
-        # Check if it's an Axis or Bosch MAC
+        # Which camera vendor owns this MAC?
         is_axis_mac = any(mac_bytes[:3] == oui for oui in AxisDHCPDiscovery.AXIS_OUIS)
         is_bosch_mac = any(mac_bytes[:3] == oui for oui in BOSCH_OUIS)
+        is_hanwha_mac = any(mac_bytes[:3] == oui for oui in HANWHA_OUIS)
 
         # Check for DHCP magic cookie at offset 236
         if data[236:240] != AxisDHCPDiscovery.DHCP_MAGIC:
@@ -1409,14 +1342,27 @@ class AxisDHCPDiscovery:
                 vendor = oval.decode('ascii', errors='ignore')
             i += 2 + olen
 
-        # Only care about DISCOVER (type 1) from Axis or Bosch cameras
+        # Only care about DISCOVER (type 1) from a camera we recognize
+        hl = hostname.lower()
+        vl = vendor.lower()
+        says_axis = 'axis' in hl or 'axis' in vl
+        says_bosch = 'bosch' in hl or 'bosch' in vl
+        says_hanwha = any(s in hl or s in vl for s in ('hanwha', 'wisenet', 'samsung'))
         if msg_type != 1:
             return None
-        if not is_axis_mac and not is_bosch_mac and 'axis' not in hostname.lower() and 'AXIS' not in vendor:
+        if not (is_axis_mac or is_bosch_mac or is_hanwha_mac
+                or says_axis or says_bosch or says_hanwha):
             return None
 
-        # Determine brand
-        brand = 'bosch' if is_bosch_mac else 'axis'
+        # Determine brand. OUI wins; vendor/hostname strings are the fallback.
+        # Never default an unrecognized device to Axis — that mislabeling is
+        # what made every unknown broadcaster look like an Axis camera.
+        if is_bosch_mac or (says_bosch and not is_axis_mac):
+            brand = 'bosch'
+        elif is_hanwha_mac or (says_hanwha and not is_axis_mac):
+            brand = 'hanwha'
+        else:
+            brand = 'axis'
 
         # Parse vendor string: "AXIS,Dome Camera,P3268-LV,12.3.56"
         model = ''
@@ -1434,7 +1380,7 @@ class AxisDHCPDiscovery:
         # since DHCP DISCOVER comes from 0.0.0.0.
         # The actual IP will be found via mDNS A record after route is added.
 
-        name_prefix = 'bosch' if brand == 'bosch' else 'axis'
+        name_prefix = brand
         return {
             'ip': '',  # Camera has no routable IP yet — we'll find it
             'mac': mac,
@@ -1456,9 +1402,10 @@ class BoschRCP:
     Bosch cameras expose /rcp.xml for reading and writing configuration."""
 
     @staticmethod
-    def rcp_read(ip, cmd_hex, rcp_type='P_STRING', auth=None, timeout=3):
+    def rcp_read(ip, cmd_hex, rcp_type='P_STRING', auth=None, timeout=3, scheme='http'):
         """Read a value from a Bosch camera via RCP-over-HTTP.
         rcp_type: P_STRING, T_DWORD, T_OCTET
+        scheme: 'http' or 'https' — newer firmware can be HTTPS-only.
         Returns parsed value string, or None on error."""
         try:
             params = {
@@ -1468,9 +1415,11 @@ class BoschRCP:
                 'num': '1',
             }
             kwargs = {'timeout': timeout}
+            if scheme == 'https':
+                kwargs['verify'] = False
             if auth:
                 kwargs['auth'] = HTTPDigestAuth(auth[0], auth[1])
-            r = requests.get(f'http://{ip}/rcp.xml', params=params, **kwargs)
+            r = requests.get(f'{scheme}://{ip}/rcp.xml', params=params, **kwargs)
             if r.status_code != 200:
                 return None
             text = r.text
@@ -1515,15 +1464,76 @@ class BoschRCP:
             return False
 
     @staticmethod
+    def probe_rcp(ip, timeout=2):
+        """Positive Bosch identification that survives a locked-down camera.
+
+        /config.js (the model source used below) is only readable once the
+        camera has an initial password — a factory-fresh unit 303-redirects
+        every page to /setpwd.htm, so config.js comes back as the password
+        setup form with no device data in it. /rcp.xml keeps answering
+        unauthenticated the whole time, and a well-formed <rcp> reply is
+        something only a Bosch emits, so identification never has to depend on
+        config.js. Individual registers may still return <err> on a locked
+        camera; that's fine, the shape of the reply is the fingerprint.
+
+        Returns {'scheme', 'hardware'?, 'firmware'?} or None if not a Bosch.
+        Verified 2026-07-28 against a factory-state camera that returned
+        hw F000B643 / sw 23500784 with no credentials."""
+        for scheme in ('http', 'https'):
+            kwargs = {'timeout': timeout}
+            if scheme == 'https':
+                kwargs['verify'] = False
+            try:
+                r = requests.get(
+                    f'{scheme}://{ip}/rcp.xml',
+                    params={'command': f"0x{RCP_CMD['hw_ver']:04x}",
+                            'type': 'P_STRING', 'direction': 'READ', 'num': '1'},
+                    **kwargs)
+            except Exception:
+                continue
+            if '<rcp>' not in r.text:
+                continue
+            out = {'scheme': scheme}
+            m = re.search(r'<result>\s*<str>([^<]*)</str>', r.text)
+            if m and m.group(1).strip():
+                out['hardware'] = m.group(1).strip()
+            sw = BoschRCP.rcp_read(ip, RCP_CMD['sw_ver'], 'P_STRING',
+                                   timeout=timeout, scheme=scheme)
+            if sw:
+                out['firmware'] = sw
+            return out
+        return None
+
+    @staticmethod
+    def needs_initial_password(ip, timeout=2):
+        """True when the camera is still in factory 'set a password' mode.
+        Bosch redirects the whole web UI to /setpwd.htm until that's done."""
+        for scheme in ('http', 'https'):
+            kwargs = {'timeout': timeout}
+            if scheme == 'https':
+                kwargs['verify'] = False
+            try:
+                r = requests.get(f'{scheme}://{ip}/', **kwargs)
+            except Exception:
+                continue
+            if 'setpwd' in r.url.lower() or 'setpwd' in r.text.lower()[:4000]:
+                return True
+            return False
+        return False
+
+    @staticmethod
     def get_device_info(ip, timeout=3):
         """Get Bosch camera model/firmware/hardware from /config.js.
         Returns dict with 'model', 'firmware', 'hardware' or None.
-        Older Bosch cameras may not have CTN (model) but will have HI/SW/Unit."""
+        Older Bosch cameras may not have CTN (model) but will have HI/SW/Unit.
+
+        Falls back to the RCP fingerprint when config.js is unreadable, so a
+        factory-fresh or HTTPS-only camera still identifies as a Bosch."""
+        info = {}
         try:
             r = requests.get(f'http://{ip}/config.js', timeout=timeout)
             if r.status_code != 200:
-                return None
-            info = {}
+                return BoschRCP._info_from_rcp(ip, timeout)
 
             for line in r.text.split('\n'):
                 line = line.strip().rstrip(';')
@@ -1549,28 +1559,50 @@ class BoschRCP:
                     # Older cameras: use Unit or hardware as model fallback
                     info['model'] = info.get('unit', info.get('hardware', 'Bosch Camera'))
                 return info
-            return None
+            # config.js answered 200 but carried no device data — that's the
+            # /setpwd.htm redirect on a factory-fresh camera. Ask RCP instead.
+            return BoschRCP._info_from_rcp(ip, timeout)
         except Exception:
-            return None
+            return BoschRCP._info_from_rcp(ip, timeout)
 
     @staticmethod
-    def get_network_config(ip, timeout=3):
+    def _info_from_rcp(ip, timeout=3):
+        """Model/firmware via the RCP fingerprint, for cameras whose config.js
+        is unreadable. Returns None when the device isn't a Bosch at all."""
+        probe = BoschRCP.probe_rcp(ip, timeout=min(timeout, 2))
+        if not probe:
+            return None
+        info = {'_scheme': probe.get('scheme', 'http')}
+        if probe.get('hardware'):
+            info['hardware'] = probe['hardware']
+        if probe.get('firmware'):
+            info['firmware'] = probe['firmware']
+        if BoschRCP.needs_initial_password(ip, timeout=min(timeout, 2)):
+            info['needs_initial_password'] = True
+            info['model'] = 'Bosch Camera (needs initial password)'
+        else:
+            info['model'] = f"Bosch Camera ({probe['hardware']})" if probe.get('hardware') \
+                else 'Bosch Camera'
+        return info
+
+    @staticmethod
+    def get_network_config(ip, timeout=3, scheme='http'):
         """Read network config from Bosch camera via RCP (no auth required).
         Returns dict with ip, subnet, gateway, dhcp, mac or empty dict."""
         config = {}
-        val = BoschRCP.rcp_read(ip, RCP_CMD['ip'], 'P_STRING', timeout=timeout)
+        val = BoschRCP.rcp_read(ip, RCP_CMD['ip'], 'P_STRING', timeout=timeout, scheme=scheme)
         if val:
             config['ip'] = val
-        val = BoschRCP.rcp_read(ip, RCP_CMD['subnet'], 'P_STRING', timeout=timeout)
+        val = BoschRCP.rcp_read(ip, RCP_CMD['subnet'], 'P_STRING', timeout=timeout, scheme=scheme)
         if val:
             config['subnet'] = val
-        val = BoschRCP.rcp_read(ip, RCP_CMD['gateway'], 'P_STRING', timeout=timeout)
+        val = BoschRCP.rcp_read(ip, RCP_CMD['gateway'], 'P_STRING', timeout=timeout, scheme=scheme)
         if val:
             config['gateway'] = val
-        val = BoschRCP.rcp_read(ip, RCP_CMD['dhcp'], 'T_DWORD', timeout=timeout)
+        val = BoschRCP.rcp_read(ip, RCP_CMD['dhcp'], 'T_DWORD', timeout=timeout, scheme=scheme)
         if val is not None:
             config['dhcp'] = 'Yes' if val == 1 else 'No'
-        val = BoschRCP.rcp_read(ip, RCP_CMD['mac'], 'T_OCTET', timeout=timeout)
+        val = BoschRCP.rcp_read(ip, RCP_CMD['mac'], 'T_OCTET', timeout=timeout, scheme=scheme)
         if val:
             # MAC comes as "00 07 5f 9c 9e 75 " — normalize to colon-separated
             parts = val.split()
@@ -2822,21 +2854,51 @@ class BoschProtocol(CameraProtocol):
     DEFAULT_PASSWORD = 'service'    # Bosch ships with service/service. Yes really.
     FACTORY_IP = '192.168.0.1'      # which is also the gateway IP on most home
                                     # networks — fun for tech support calls
-    MAC_OUIS = [b'\x00\x07\x5f']    # Robert Bosch GmbH OUI; basically all their cams
+    MAC_OUIS = BOSCH_OUIS           # Robert Bosch GmbH blocks — see BOSCH_OUIS
+
+    def _resolve_current_auth(self, ip, target_password, existing_pwd=None):
+        """Work out which credential this camera answers to right now.
+
+        Bosch's "current password" is not one fixed value. Legacy units ship
+        service with a BLANK password; firmware 6.32+ ships passwordless and
+        forces a password on first login; a camera we already programmed wants
+        the project password; and a camera the operator knows the password for
+        wants that. Assuming 'service'/'service' meant re-running the wizard on
+        an already-programmed camera always failed at step 1.
+
+        test_password is a cheap authed READ, so probing costs little and can't
+        trip the lockout that write attempts can."""
+        candidates = []
+        for pwd in (existing_pwd, '', 'service', self.DEFAULT_PASSWORD, target_password):
+            if pwd is not None and pwd not in candidates:
+                candidates.append(pwd)
+        for pwd in candidates:
+            try:
+                if self.test_password(ip, BOSCH_DEFAULT_USER, pwd):
+                    return (BOSCH_DEFAULT_USER, pwd)
+            except Exception:
+                continue
+        # Nothing authenticated. On a factory-fresh camera the password
+        # registers are writable unauthenticated, so a blank credential is the
+        # best remaining guess — better than refusing to try.
+        return (BOSCH_DEFAULT_USER, existing_pwd if existing_pwd else '')
 
     def create_initial_user(self, ip, password, existing_pwd=None):
-        # Bosch ignores existing_pwd — RCP+ writes blast through regardless.
         # Change all three password tiers in one shot. Walking high->low so if
         # the service write fails (the only one that's REALLY bad), we bail
         # before partially-resetting the lower-priv ones. Return False only on
         # service failure — failing on user/live is annoying but not blocking.
-        auth = (BOSCH_DEFAULT_USER, 'service')
+        auth = self._resolve_current_auth(ip, password, existing_pwd)
         ok = True
         for num, name in [(3, 'service'), (2, 'user'), (1, 'live')]:
             if not BoschRCP.rcp_write(ip, RCP_CMD['password'], 'P_STRING',
                                        password, auth, num=num):
                 if num == 3:
                     ok = False
+        # Verify rather than trust the ack — a wrong-typed RCP write returns
+        # OK without changing anything (see the note above this class).
+        if ok and not self.test_password(ip, BOSCH_DEFAULT_USER, password):
+            ok = False
         return ok
 
     def set_network(self, ip, password, new_ip, subnet, gateway):
@@ -2856,7 +2918,18 @@ class BoschProtocol(CameraProtocol):
         # DHCP off — note T_DWORD typing here, the dhcp command doesn't take a
         # P_STRING despite "0"/"1" looking like strings. Tried that. RCP acks
         # it but does nothing.
-        BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_DWORD', '0', auth)
+        #
+        # This result used to be discarded. If the write failed, set_network
+        # still reported success and the camera stayed on DHCP — so it took
+        # the static IP right up until the next lease renewal or power cycle,
+        # then "forgot" it. Check the ack AND read the value back, because a
+        # wrong-typed write acks OK without writing anything.
+        if not BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_DWORD', '0', auth):
+            ok = False
+        else:
+            readback = BoschRCP.rcp_read(ip, RCP_CMD['dhcp'], 'T_DWORD', auth=auth)
+            if readback is not None and readback != 0:
+                ok = False
         # IP last — see above for why
         if not BoschRCP.rcp_write(ip, RCP_CMD['ip'], 'P_STRING', new_ip, auth):
             ok = False
@@ -2879,16 +2952,35 @@ class BoschProtocol(CameraProtocol):
             return True
         if BoschRCP.rcp_write(ip, RCP_CMD['reboot'], 'T_DWORD', '1', auth, timeout=10):
             return True
+        # HTTP fallback. Only treat a dropped connection as success if the
+        # camera was actually reachable a moment ago — otherwise an offline or
+        # unplugged camera "reboots" successfully and the wizard sails past a
+        # step that never happened.
+        was_reachable = self._http_alive(ip)
         try:
-            r = requests.get(f'http://{ip}/reset', timeout=5)
+            r = requests.get(f'http://{ip}/reset', timeout=5,
+                             auth=HTTPDigestAuth(BOSCH_DEFAULT_USER, password))
             if r.status_code == 200:
                 return True
+            if r.status_code == 401:
+                return False
         except requests.exceptions.ConnectionError:
-            # Camera dropped while booting — call it good
-            return True
+            # Camera dropped while booting — only good news if it was there.
+            return was_reachable
         except:
             pass
         return False
+
+    @staticmethod
+    def _http_alive(ip, timeout=2):
+        """True if anything answers HTTP here right now. Used to tell 'the
+        camera rebooted and dropped the connection' apart from 'the camera was
+        never reachable in the first place'."""
+        try:
+            requests.get(f'http://{ip}/', timeout=timeout)
+            return True
+        except Exception:
+            return False
 
     def set_dhcp(self, ip, password, enable=True):
         # Same T_DWORD typing gotcha as set_network — do not pass strings here.
@@ -2984,12 +3076,18 @@ class BoschProtocol(CameraProtocol):
         auth = (BOSCH_DEFAULT_USER, password)
         if BoschRCP.rcp_write(ip, RCP_CMD['factory_reset'], 'T_DWORD', '1', auth, timeout=10):
             return True
+        # Same reachability guard as reboot(): claiming a camera was wiped when
+        # it was simply unplugged is the worst false positive in the toolkit.
+        was_reachable = self._http_alive(ip)
         try:
-            r = requests.get(f'http://{ip}/reset', timeout=5)
+            r = requests.get(f'http://{ip}/reset', timeout=5,
+                             auth=HTTPDigestAuth(BOSCH_DEFAULT_USER, password))
             if r.status_code == 200:
                 return True
+            if r.status_code == 401:
+                return False
         except requests.exceptions.ConnectionError:
-            return True  # boot dropped the connection -> success
+            return was_reachable  # boot dropped the connection -> success
         except:
             pass
         return False
@@ -3004,10 +3102,14 @@ class BoschProtocol(CameraProtocol):
         gateway = cam['gateway']
         subnet = cam['subnet']
         set_hostname = options.get('set_hostname', False) if options else False
+        # Forward the operator's known password. Axis already does this; Bosch
+        # dropped it, so a camera that was half-programmed (or that the tech
+        # has the password for) could never get past the first step.
+        existing_pwd = options.get('existing_pwd') if options else None
 
         steps = [
             ("Setting password via RCP",
-             lambda: self.create_initial_user(ip, password)),
+             lambda: self.create_initial_user(ip, password, existing_pwd=existing_pwd)),
             ("Setting network via RCP",
              lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
             ("Rebooting camera",
@@ -3028,13 +3130,22 @@ class BoschProtocol(CameraProtocol):
         # camera currently has set, not just our defaults.
         info = BoschRCP.get_device_info(ip, timeout=timeout)
         if info:
-            net = BoschRCP.get_network_config(ip, timeout=timeout)
+            scheme = info.get('_scheme', 'http')
+            net = BoschRCP.get_network_config(ip, timeout=timeout, scheme=scheme)
             cam = {
                 'ip': ip,
                 'model': info.get('model', ''),
                 'serial': '',
                 'brand': 'bosch',
             }
+            if info.get('needs_initial_password'):
+                # Factory-fresh: the web UI is parked on /setpwd.htm and the
+                # MAC register is auth-gated, so this row will be thin. Say so
+                # rather than dropping the camera — this is the state a tech is
+                # most likely to be holding.
+                cam['needs_initial_password'] = True
+            if info.get('firmware'):
+                cam['firmware'] = info['firmware']
             if net.get('mac'):
                 cam['mac'] = net['mac']
                 # Use bare MAC as serial to keep it stable across reboots.
@@ -5694,11 +5805,13 @@ class ProgramWizardDialog(tk.Toplevel):
     Returns a result dict with password + all options, or None on cancel."""
 
     def __init__(self, parent, brand_name, factory_ip='192.168.0.90',
-                 camera_count=0, additional_users_count=0):
+                 camera_count=0, additional_users_count=0, brand_key='axis'):
         super().__init__(parent)
         self.title(f"Program {brand_name} Cameras — Setup Wizard")
         self.result = None
         self.brand_name = brand_name
+        # Display names drift ('Hanwha' vs 'Hanwha / Wisenet'); the key doesn't.
+        self.brand_key = brand_key
         self.camera_count = camera_count
         self.additional_users_count = additional_users_count
         self.transient(parent)
@@ -5710,8 +5823,11 @@ class ProgramWizardDialog(tk.Toplevel):
         self.password_confirm_var = tk.StringVar()
         self.discovery_var = tk.StringVar(value='both')
         self.factory_ip_var = tk.StringVar(value=factory_ip)
-        # Default hostname-set to ON 2026-05-03 (per Brian beta-run feedback)
-        self.hostname_var = tk.BooleanVar(value=False)
+        # Default hostname-set to ON 2026-05-03 (per Brian beta-run feedback).
+        # The comment said ON but the value said False for three releases, so
+        # the beta complaint it was meant to fix — cameras finishing with an
+        # empty Hostname column — kept happening.
+        self.hostname_var = tk.BooleanVar(value=True)
         self.additional_users_var = tk.BooleanVar(value=False)
         # v4.3 #10: by default the wizard creates an ONVIF root user (required
         # by set_network's ONVIF SOAP) AND deletes it after programming so the
@@ -5846,6 +5962,13 @@ class ProgramWizardDialog(tk.Toplevel):
     # ------------------------------------------------------------------
     # Step builders
     # ------------------------------------------------------------------
+    def _admin_account_name(self):
+        """The admin account this brand actually ships: Axis root, Bosch
+        service, Hanwha admin. Several screens used to hardcode 'root', which
+        sent a Bosch tech hunting for an account his camera doesn't have."""
+        return {'axis': 'root', 'bosch': 'service',
+                'hanwha': 'admin'}.get(getattr(self, 'brand_key', 'axis'), 'root')
+
     def _new_step(self, title, subtitle):
         f = ttk.Frame(self.body)
         self.steps.append({'frame': f, 'title': title, 'subtitle': subtitle})
@@ -5884,15 +6007,21 @@ class ProgramWizardDialog(tk.Toplevel):
             anchor='w', pady=(20, 4))
         if not hasattr(self, 'admin_user_var'):
             self.admin_user_var = tk.StringVar(value='root')
+        # Keyed on BRAND_KEY, not the display name. The old map keyed on
+        # 'Hanwha / Wisenet' while HanwhaProtocol.BRAND_NAME is just 'Hanwha',
+        # so a Hanwha job fell through to Axis's 'root'.
+        from_brand = {'axis': 'root', 'bosch': 'service',
+                      'hanwha': 'admin'}.get(self.brand_key, 'root')
         try:
-            # Default to the active brand's DEFAULT_USER (passed in via brand_name)
-            from_brand = {'Axis': 'root', 'Bosch': 'service', 'Hanwha / Wisenet': 'admin'}.get(self.brand_name, 'root')
             self.admin_user_var.set(from_brand)
         except Exception:
             pass
         user_entry = ttk.Entry(f, textvariable=self.admin_user_var, width=20, font=('Helvetica', 11))
         user_entry.pack(anchor='w', ipady=4)
-        ttk.Label(f, text=f"Brand default: see Help. Override only if your install uses a non-default admin name.",
+        # Say what the default actually IS. "see Help" was a dead end at the
+        # exact moment the operator needs the answer.
+        ttk.Label(f, text=f"{self.brand_name} default: {from_brand}. "
+                          f"Override only if your install uses a non-default admin name.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(2, 0))
 
         # Password
@@ -5928,9 +6057,11 @@ class ProgramWizardDialog(tk.Toplevel):
         f = self._new_step("Step 3 of 6 — How to find cameras",
                            "Pick how the toolkit should discover the camera when you plug it in.")
 
-        # Interface is declared at the top of the main window (session-level).
-        # The wizard inherits it — no per-wizard override.
-        ttk.Label(f, text="Interface and DHCP server are set at the top of the main window.",
+        # Interface is declared once in the Setup flow (session-level). The
+        # wizard inherits it — no per-wizard override. This label used to say
+        # "at the top of the main window", pointing at a bar that hasn't been
+        # displayed since v5.0.
+        ttk.Label(f, text="Network adapter and DHCP server are set in Setup — Steps 2 and 3.",
                   foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(15, 0))
 
         ttk.Label(f, text="Discovery method:", font=('Helvetica', 10, 'bold')).pack(
@@ -6100,7 +6231,7 @@ class ProgramWizardDialog(tk.Toplevel):
         ttk.Label(f, text="Should the wizard factory-default each camera before programming it?",
                   font=('Helvetica', 11, 'bold')).pack(anchor='w', pady=(20, 6))
         ttk.Label(f,
-            text="If YES: the wizard will use the camera's existing root password to issue a factory_reset, wait for the camera to come back to factory state, THEN program it. Use this for cameras you're re-provisioning from a previous site (have an old password and old config).\n\nIf NO: the wizard assumes each camera is already factory-clean (brand-new out of the box, or you've already physically held the paperclip-reset button).",
+            text=f"If YES: the wizard will use the camera's existing {self._admin_account_name()} password to issue a factory reset, wait for the camera to come back to factory state, THEN program it. Use this for cameras you're re-provisioning from a previous site (have an old password and old config).\n\nIf NO: the wizard assumes each camera is already factory-clean (brand-new out of the box, or you've already physically held the paperclip-reset button).",
             foreground='gray', font=('Helvetica', 9), wraplength=820, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
 
         row = ttk.Frame(f); row.pack(anchor='w', pady=(0, 14))
@@ -6114,7 +6245,9 @@ class ProgramWizardDialog(tk.Toplevel):
         # Existing-password field, only relevant when Yes
         self._factory_first_pwd_row = ttk.Frame(f)
         self._factory_first_pwd_row.pack(anchor='w', pady=(8, 0))
-        ttk.Label(self._factory_first_pwd_row, text="Existing root password:",
+        # Name the account this brand actually has — Bosch has no 'root'.
+        ttk.Label(self._factory_first_pwd_row,
+                  text=f"Existing {self._admin_account_name()} password:",
                   font=('Helvetica', 10)).pack(side=tk.LEFT)
         self._factory_first_pwd_entry = ttk.Entry(self._factory_first_pwd_row,
                                                   textvariable=self.existing_root_pwd_var,
@@ -6288,7 +6421,8 @@ class ProgramWizardDialog(tk.Toplevel):
             if self.factory_first_var.get() and not self.existing_root_pwd_var.get():
                 messagebox.showwarning(
                     "Required",
-                    "Existing root password is required to factory-default a used camera.",
+                    f"The existing {self._admin_account_name()} password is required to "
+                    f"factory-default a used camera.",
                     parent=self)
                 return
 
@@ -6391,7 +6525,11 @@ class BrandSelectionDialog(tk.Toplevel):
 
         ttk.Label(frame, text="Select Camera Brand",
                  font=('Helvetica', 16, 'bold')).pack(pady=(0, 5))
-        ttk.Label(frame, text="All operations will use this brand's protocol.\nSwitch brands anytime from the brand bar.",
+        # Was "switch anytime from the brand bar" — that bar hasn't been
+        # displayed since v5.0, so the one instruction users got for changing
+        # brand pointed at nothing.
+        ttk.Label(frame, text="All operations will use this brand's protocol.\n"
+                              "You can change it later in Setup — Step 1.",
                  font=('Helvetica', 10), foreground='gray', justify=tk.CENTER).pack(pady=(0, 15))
 
         self.brand_var = tk.StringVar(value=current_brand)
@@ -6405,8 +6543,10 @@ class BrandSelectionDialog(tk.Toplevel):
         for key, name, desc in brands:
             btn_frame = ttk.Frame(frame)
             btn_frame.pack(fill=tk.X, pady=4)
-            rb = ttk.Radiobutton(btn_frame, text=name, variable=self.brand_var, value=key,
-                                style='Toolbutton')
+            # Plain radiobuttons, not style='Toolbutton' — the toolbutton style
+            # made the selected brand nearly indistinguishable, so an operator
+            # could close this dialog with no idea which brand was active.
+            rb = ttk.Radiobutton(btn_frame, text=name, variable=self.brand_var, value=key)
             rb.pack(side=tk.LEFT, padx=(10, 0))
             ttk.Label(btn_frame, text=desc, foreground='gray',
                      font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(15, 0))
@@ -6420,8 +6560,23 @@ class BrandSelectionDialog(tk.Toplevel):
         ok_btn.pack(side=tk.LEFT, padx=5)
 
         self.bind("<Return>", lambda e: self.ok())
-        self.protocol("WM_DELETE_WINDOW", self.ok)
+        # Closing with X commits whatever is highlighted, which on first run is
+        # Axis — so dismissing this dialog silently started an Axis session.
+        # Make X an explicit confirm of the visible selection.
+        self.protocol("WM_DELETE_WINDOW", self._confirm_close)
         self.wait_window(self)
+
+    def _confirm_close(self):
+        chosen = dict(
+            axis='Axis', bosch='Bosch', hanwha='Hanwha / Wisenet'
+        ).get(self.brand_var.get(), self.brand_var.get())
+        if messagebox.askyesno(
+                "Use this brand?",
+                f"Start the session in {chosen} mode?\n\n"
+                f"Discovery and programming will use {chosen}'s protocol. "
+                f"You can change it later in Setup — Step 1.",
+                parent=self):
+            self.ok()
 
     def ok(self):
         self.result = self.brand_var.get()
@@ -7039,6 +7194,7 @@ class CCTVToolkitApp:
         is_stable_format = bool(re.match(r'^\d+\.\d+\.\d+$', title_v))
         if not is_stable_format:
             title_v = f"{title_v} ⚠ BETA"
+        self._title_version = title_v
         self.root.title(f"CCTV IP Toolkit v{title_v} - Brian Preston")
         self.root.geometry("1200x800")
         self.root.minsize(1000, 700)
@@ -7143,6 +7299,7 @@ class CCTVToolkitApp:
         # Create UI
         self.create_menu()
         self.create_main_ui()
+        self._update_window_title()
 
         # v4.5.3 — startup banner so the operator can confirm at a glance
         # which build is running, and where exports are landing. Goes to the
@@ -7373,9 +7530,16 @@ class CCTVToolkitApp:
         # v5.0 b2 — was '🏠 Home' but 'home' implies a separate home screen
         # which doesn't exist; Setup IS the home. 'Back to wizard' reads
         # correctly per Brian's feedback.
-        tk.Button(header, text="← Back to wizard", bg='#37474F', fg='white',
-                  font=('Helvetica', 9, 'bold'), relief=tk.FLAT, padx=12, cursor='hand2',
-                  command=_go_setup).pack(side=tk.RIGHT, padx=(0, 10), pady=6)
+        # v5.2 — this is now the ONLY way back. The per-tab headers used to
+        # draw a second copy of this same button, so every power-user screen
+        # offered two identical exits in two different places. Green because it
+        # inherited the job of the more prominent one.
+        self.back_to_wizard_btn = tk.Button(
+            header, text="← Back to wizard", bg='#4CAF50', fg='white',
+            font=('Helvetica', 9, 'bold'), relief=tk.FLAT, padx=14, cursor='hand2',
+            activebackground='#43A047', activeforeground='white',
+            command=_go_setup)
+        self.back_to_wizard_btn.pack(side=tk.RIGHT, padx=(0, 10), pady=6)
 
         # Tools menubutton — secondary screens
         tools_mb = tk.Menubutton(header, text='Tools ▾', bg='#37474F', fg='white',
@@ -7399,6 +7563,7 @@ class CCTVToolkitApp:
         tools_menu.add_command(label="📊 Log & Results",
                                command=lambda: _select_tab(self.log_tab))
         tools_mb.pack(side=tk.RIGHT, padx=0, pady=6)
+        self._tools_mb = tools_mb
 
         # Hide ttk.Notebook tab strip — the user never sees tabs in v5.0.
         # Navigation is via the Setup stepper and the Home/Tools header.
@@ -7519,6 +7684,23 @@ class CCTVToolkitApp:
         # v5.0 — Setup is the default landing tab. The intent: new operators
         # see the linear flow, not the tab grid.
         self.notebook.select(self.setup_tab)
+
+        # Hide the exit button while the operator is already on Setup —
+        # "Back to wizard" pointing at the page you're looking at is noise.
+        def _sync_back_button(_evt=None):
+            try:
+                on_setup = self.notebook.select() == str(self.setup_tab)
+                if on_setup:
+                    self.back_to_wizard_btn.pack_forget()
+                elif not self.back_to_wizard_btn.winfo_ismapped():
+                    # before=Tools keeps it in its original slot on the far
+                    # right; a bare re-pack would land it left of the menu.
+                    self.back_to_wizard_btn.pack(side=tk.RIGHT, padx=(0, 10), pady=6,
+                                                 before=self._tools_mb)
+            except Exception:
+                pass
+        self.notebook.bind('<<NotebookTabChanged>>', _sync_back_button, add='+')
+        _sync_back_button()
 
     # ========================================================================
     # v5.0 — Setup tab: linear guided flow
@@ -7819,8 +8001,15 @@ class CCTVToolkitApp:
     def _setup_render_dhcp(self, body):
         ttk.Label(body, text="Run the bundled DHCP server?",
                   font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
+        # The MAC filter follows the selected brand, so this text has to as
+        # well — it used to say "Axis-vendor" in every mode, which read as
+        # "the DHCP path is Axis-only" to anyone doing a Bosch job.
         ttk.Label(body,
-            text="Turn this ON when the programming switch has no DHCP server. The bundled server hands a single fixed lease IP (default 192.168.0.50) to whatever Axis-vendor camera plugs in. The toolkit's MAC filter ignores non-camera devices so a managed PoE switch on the segment can't steal the lease.",
+            text=(f"Turn this ON when the programming switch has no DHCP server. The bundled "
+                  f"server hands a single fixed lease IP (default 192.168.0.50) to whatever "
+                  f"{self.protocol.BRAND_NAME}-vendor camera plugs in. The toolkit's MAC filter "
+                  f"ignores non-camera devices so a managed PoE switch on the segment can't "
+                  f"steal the lease."),
             foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
         row = ttk.Frame(body)
         row.pack(anchor='w', pady=(4, 0))
@@ -7894,6 +8083,69 @@ class CCTVToolkitApp:
         canvas.bind('<Destroy>', lambda _e: canvas.unbind_all('<MouseWheel>'))
         return inner
 
+    def _operations_registry(self):
+        """Single source of truth for the operations the app offers.
+
+        Setup Step 5 renders these grouped as a list; the Operations tab
+        renders the same set as a colored grid. They used to be two
+        hand-maintained lists that had already drifted apart — the same
+        handler carried different names on each screen ("Batch Test" vs
+        "Batch Password Test", "Grab Snapshots" vs "Capture Images"), and two
+        operations existed on only one of them, so an operator following the
+        Setup flow could never find Validate Password at all.
+
+        Returns (group, label, blurb, handler_or_None, tile_color) tuples.
+        A missing handler renders disabled rather than crashing."""
+        def h(name):
+            return getattr(self, name, None)
+        return [
+            ('Prep', "🔑  Users & Passwords",
+             "Make sure your password list is loaded (and any extra user accounts are "
+             "configured) before programming.",
+             lambda: self.notebook.select(self.passwords_tab), '#607D8B'),
+
+            ('Programming', "🟢  Program New Cameras",
+             "Step-by-step programming wizard with admin/password confirm, optional "
+             "factory-default-first, and review screen.",
+             h('start_program_wizard'), '#4CAF50'),
+            ('Programming', "⚡  Switch Loading",
+             "Plug ALL cameras into the switch at once — the toolkit programs each in "
+             "whatever order it's discovered, matching cameras to CSV rows by MAC. "
+             "Requires every CSV row to have a MAC.",
+             h('start_switch_loading_wizard'), '#FF6F00'),
+            ('Programming', "🔄  Update / Change Settings",
+             "Push IP / hostname / DHCP-toggle changes to cameras that are ALREADY "
+             "programmed.",
+             h('start_update_wizard'), '#2196F3'),
+            ('Programming', "🔐  Change Password",
+             "Rotate the admin password on already-programmed cameras.",
+             h('start_change_password_wizard'), '#F44336'),
+
+            ('Verify', "✅  Confirm Programming",
+             "Walk the camera list, verify each is at its assigned IP with correct "
+             "hostname / users / network config.",
+             h('start_confirm_wizard'), '#00ACC1'),
+            ('Verify', "📡  Test / Ping",
+             "Quick reachability check — ping every camera at its assigned IP and "
+             "export the results.",
+             h('start_ping_wizard'), '#FF9800'),
+            ('Verify', "✓  Validate Password",
+             "Test ONE password against ALL cameras in the list.",
+             h('start_validate_wizard'), '#607D8B'),
+            ('Verify', "🧪  Batch Password Test",
+             "Test MULTIPLE passwords to find unknown camera credentials.",
+             h('start_batch_test_wizard'), '#795548'),
+
+            ('Capture / Reset', "📷  Grab Snapshots",
+             "Capture and save a still image from each camera. Used for install "
+             "documentation.",
+             h('start_capture_wizard'), '#9C27B0'),
+            ('Capture / Reset', "⚠   Factory Default",
+             "Wipe one or more cameras back to factory state (prompts for IP and the "
+             "existing password).",
+             h('start_factory_default_wizard'), '#E91E63'),
+        ]
+
     def _setup_render_operations(self, body):
         # v5.0.1 — wrap operations content in a scrollable frame. At 1920x1080
         # with 150% DPI scaling the four ops groups overrun the visible window,
@@ -7910,46 +8162,13 @@ class CCTVToolkitApp:
         # button now resolves to the proper handler (e.g. update_wizard
         # not the classic programmer). Disabled state ONLY when the
         # underlying method genuinely doesn't exist on the app.
-        ops_grouped = [
-            ('Prep', [
-                ("🔑  Users & Passwords",
-                 "Make sure your password list is loaded (and any extra user accounts are configured) before programming.",
-                 lambda: self.notebook.select(self.passwords_tab)),
-            ]),
-            ('Programming', [
-                ("🟢  Program New Cameras",
-                 "Step-by-step programming wizard with admin/password confirm, optional factory-default-first, and review screen.",
-                 getattr(self, 'start_program_wizard', None)),
-                ("⚡  Switch Loading (v5.1.0)",
-                 "Plug ALL cameras into the switch at once — toolkit programs each one in whatever order it's discovered, matching cameras to CSV rows by MAC. Requires every CSV row to have a MAC.",
-                 getattr(self, 'start_switch_loading_wizard', None)),
-                ("🔄  Update / Change Settings",
-                 "Push IP / hostname / DHCP-toggle changes to cameras that are ALREADY programmed.",
-                 getattr(self, 'start_update_wizard', None)),
-                ("🔐  Change Password",
-                 "Rotate the root password on already-programmed cameras.",
-                 getattr(self, 'start_change_password_wizard', None)),
-            ]),
-            ('Verify', [
-                ("✅  Confirm Programming",
-                 "Walk the camera list, verify each is at its assigned IP with correct hostname / users / network config.",
-                 getattr(self, 'start_confirm_wizard', None)),
-                ("📡  Test / Ping",
-                 "Quick reachability check — ping every camera at its assigned IP.",
-                 getattr(self, 'start_ping_wizard', None)),
-                ("🧪  Batch Test",
-                 "Comprehensive deep-test of every camera (HTTP, ONVIF, image capture).",
-                 getattr(self, 'start_batch_test_wizard', None)),
-            ]),
-            ('Capture / Reset', [
-                ("📷  Grab Snapshots",
-                 "Capture and save a still image from each camera. Used for install documentation.",
-                 getattr(self, 'start_capture_wizard', None)),
-                ("⚠   Factory Default",
-                 "Wipe one or more cameras back to factory state.",
-                 getattr(self, 'start_factory_default_wizard', None)),
-            ]),
-        ]
+        # Grouped view of the shared registry — same set, same names as the
+        # Operations tab, because both read from one list now.
+        ops_grouped = []
+        for group, label, blurb, cmd, _color in self._operations_registry():
+            if not ops_grouped or ops_grouped[-1][0] != group:
+                ops_grouped.append((group, []))
+            ops_grouped[-1][1].append((label, blurb, cmd))
         for group_name, group_ops in ops_grouped:
             ttk.Label(body, text=group_name, font=('Helvetica', 10, 'bold'),
                       foreground='#555').pack(anchor='w', pady=(10, 4))
@@ -7978,6 +8197,16 @@ class CCTVToolkitApp:
         ttk.Button(body, text="🟢 Open Programming Status tab", width=36,
                    command=lambda: self.notebook.select(self.status_tab)).pack(anchor='w')
 
+    def _update_window_title(self):
+        """Keep the active brand in the title bar. A session running in the
+        wrong brand used to be invisible until discovery results looked odd."""
+        try:
+            v = getattr(self, '_title_version', APP_VERSION)
+            self.root.title(f"CCTV IP Toolkit v{v}  —  {self.protocol.BRAND_NAME} mode"
+                            f"  -  Brian Preston")
+        except Exception:
+            pass
+
     def _on_brand_change(self):
         """Handle brand radio button change."""
         new_brand = self.brand_var.get()
@@ -7987,6 +8216,7 @@ class CCTVToolkitApp:
         self.protocol.log_callback = self.log
         self.protocol.cancel_check = lambda: self.cancel_flag
         self.settings.set('general', 'brand', new_brand)
+        self._update_window_title()
         self.factory_ip_label.config(
             text=f"Factory IP: {self.protocol.FACTORY_IP}  |  User: {self.protocol.DEFAULT_USER}")
         # Clear discovered list (different brand = different cameras)
@@ -8449,19 +8679,17 @@ class CCTVToolkitApp:
         _center_on_parent(dlg, self.root, 0, 0)
 
     def _build_tab_header(self, parent, title, subtitle=None, title_size=16):
-        """v5.0 b5 — standardized top-of-tab header. Top-left is always a green
-        '← Back to wizard' button so every tab has the same exit affordance
-        Brian asked for, followed by the screen title and an optional subtitle.
-        Used by Camera List / Users & Passwords / Discovered / Operations."""
+        """Standardized top-of-tab header: screen title plus optional subtitle.
+
+        This used to draw its own green '← Back to wizard' button, which meant
+        every one of these screens showed that button TWICE — once here at the
+        top-left and again in the app header at the top-right. One exit
+        affordance, always in the same place, is the whole point; the app
+        header owns it now."""
         header = ttk.Frame(parent)
         header.pack(fill=tk.X, pady=(0, 10))
-        tk.Button(header, text="← Back to wizard",
-                  font=('Helvetica', 10, 'bold'),
-                  bg='#4CAF50', fg='white', relief=tk.RAISED, padx=14, pady=4,
-                  cursor='hand2',
-                  command=lambda: self.notebook.select(self.setup_tab)).pack(side=tk.LEFT)
-        ttk.Label(header, text=f"  {title}",
-                  font=('Helvetica', title_size, 'bold')).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(header, text=f"{title}",
+                  font=('Helvetica', title_size, 'bold')).pack(side=tk.LEFT)
         if subtitle:
             ttk.Label(header, text=f"  •  {subtitle}",
                       font=('Helvetica', 10), foreground='gray').pack(side=tk.LEFT, padx=(10, 0))
@@ -8672,13 +8900,23 @@ class CCTVToolkitApp:
         new_count = 0
         mismatch_count = 0
         linklocal_count = 0
+        other_brand_count = 0
+        active_brand = self.protocol.BRAND_KEY
         for cam in self.discovered_cameras:
+            # Only show cameras of the brand this session is programming. The
+            # list used to be unfiltered, so a Bosch job displayed every Axis
+            # camera on the LAN with no way to tell which row was the target.
+            cam_brand = cam.get('brand', '')
+            if cam_brand and cam_brand != active_brand:
+                other_brand_count += 1
+                continue
+
             # Check MAC against camera list first, then serial, then IP
             cam_mac = cam.get('mac', '').upper().replace(':', '').replace('-', '').strip()
             cam_serial = cam.get('serial', '')
             cam_ip = cam.get('ip', '').strip()
             is_linklocal = cam_ip.startswith('169.254.')
-            
+
             if is_linklocal:
                 linklocal_count += 1
             
@@ -8704,11 +8942,17 @@ class CCTVToolkitApp:
                 if is_linklocal:
                     on_list = '🔧 UNPROGRAMMED'  # Link-local = factory default
                     tag = 'linklocal'
+                elif cam.get('needs_initial_password'):
+                    # Factory-fresh Bosch: web UI parked on the set-password
+                    # page. Nothing is wrong with it — it just hasn't been
+                    # commissioned yet, which is exactly what we want to say.
+                    on_list = '🔧 NEEDS PASSWORD SET'
+                    tag = 'linklocal'
                 else:
                     on_list = ''
                     tag = 'new_cam'
                 new_count += 1
-            
+
             # Show link-local marker in IP column
             display_ip = cam_ip
             if is_linklocal:
@@ -8726,9 +8970,9 @@ class CCTVToolkitApp:
                 cam.get('dhcp', ''),
                 on_list
             ), tags=(tag,))
-        total = len(self.discovered_cameras)
+        total = len(self.discovered_cameras) - other_brand_count
         on = total - new_count - mismatch_count
-        parts = [f"{total} discovered"]
+        parts = [f"{total} {self.protocol.BRAND_NAME} discovered"]
         if linklocal_count:
             parts.append(f"{linklocal_count} link-local")
         if new_count:
@@ -8737,6 +8981,8 @@ class CCTVToolkitApp:
             parts.append(f"{mismatch_count} changed")
         if on:
             parts.append(f"{on} match")
+        if other_brand_count:
+            parts.append(f"{other_brand_count} other-brand hidden")
         self.discovered_status.set("  •  ".join(parts))
         # Grey out Copy All New button if nothing new
         if new_count == 0:
@@ -9065,31 +9311,13 @@ class CCTVToolkitApp:
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.BOTH, expand=True)
         
-        operations = [
-            ("🔧 Program New Cameras", "Step-by-step wizard with live\nchecklist (recommended)",
-             self.start_program_wizard, "#4CAF50"),
-            ("⚡ Switch Loading", "Plug ALL cameras in at once →\ntoolkit matches each by MAC (v5.1.0)",
-             self.start_switch_loading_wizard, "#FF6F00"),
-            ("✅ Confirm Programming", "Audit each camera in the list:\nIP / auth / DHCP-off match expected",
-             self.start_confirm_wizard, "#00ACC1"),
-            ("♻️ Factory Default", "Wipe a camera back to factory state\n(prompts for IP + existing password)",
-             self.start_factory_default_wizard, "#E91E63"),
-            ("🔄 Update Cameras", "Push changes (IP, hostname, DHCP)\nfrom Camera List to cameras",
-             self.start_update_wizard, "#2196F3"),
-            ("📷 Capture Images", "Download snapshot images from\nall cameras in the list",
-             self.start_capture_wizard, "#9C27B0"),
-            ("📡 Ping Test", "Check connectivity to all cameras\nand export results to CSV",
-             self.start_ping_wizard, "#FF9800"),
-            ("✓ Validate Password", "Test ONE password against\nALL cameras in the list",
-             self.start_validate_wizard, "#607D8B"),
-            ("🔑 Change Passwords", "Change password on all cameras\n(requires current password)",
-             self.start_change_password_wizard, "#F44336"),
-            ("🔍 Batch Password Test", "Test MULTIPLE passwords to find\nunknown camera credentials",
-             self.start_batch_test_wizard, "#795548"),
-            ("🛠️ Classic Programmer", "Original combined-options dialog\n(fallback if new wizard misbehaves)",
-             self.start_program_wizard_classic, "#9E9E9E"),
-        ]
-        
+        # Same registry the Setup flow renders, so the two screens can never
+        # again offer different operations under different names. The Prep
+        # entry is a navigation shortcut, not an operation — skip it here.
+        operations = [(label, blurb, cmd, color)
+                      for group, label, blurb, cmd, color in self._operations_registry()
+                      if group != 'Prep']
+
         for i, (text, desc, cmd, color) in enumerate(operations):
             row, col = divmod(i, 3)
             
@@ -9097,11 +9325,14 @@ class CCTVToolkitApp:
             btn_container.grid(row=row, column=col, padx=10, pady=10, sticky='nsew')
             
             btn = tk.Button(btn_container, text=text, font=('Helvetica', 12, 'bold'),
-                          width=25, height=2, command=cmd, bg='#f0f0f0', relief=tk.RAISED)
+                          width=25, height=2, command=cmd, bg='#f0f0f0', relief=tk.RAISED,
+                          state=('normal' if cmd else 'disabled'))
             btn.pack(pady=(0, 5))
-            
-            ttk.Label(btn_container, text=desc, font=('Helvetica', 9), 
-                     foreground='gray', justify=tk.CENTER).pack()
+
+            # wraplength so the shared (longer) descriptions don't stretch the
+            # grid columns out of shape
+            ttk.Label(btn_container, text=desc, font=('Helvetica', 9),
+                     foreground='gray', justify=tk.CENTER, wraplength=250).pack()
         
         for i in range(3):
             btn_frame.columnconfigure(i, weight=1)
@@ -9618,9 +9849,13 @@ class CCTVToolkitApp:
                             except Exception: pass
                         _tcp_probe_sweep(sn, on_progress=_prog, cancel_flag=cancel_token)
 
-                        # Harvest.
+                        # Harvest. Filter by the ACTIVE brand's OUIs — this
+                        # used to default to Axis in every mode, so a Bosch
+                        # camera was swept, seen in ARP, then discarded as a
+                        # non-match and its routing alias torn down.
                         time.sleep(0.5)  # let ARP cache settle
-                        matches = _arp_matches_in_subnet(sn)
+                        matches = _arp_matches_in_subnet(
+                            sn, oui_bytes=getattr(self.protocol, 'MAC_OUIS', None))
                         if matches:
                             for m in matches:
                                 # Fingerprint quickly (no-auth basicdeviceinfo).
@@ -9647,7 +9882,8 @@ class CCTVToolkitApp:
                             if alias_ip:
                                 _netsh_remove_ip(iface_idx, alias_ip)
                                 added_aliases = [a for a in added_aliases if a[1] != alias_ip]
-                                self.log(f"  [{sn}.x] no Axis MACs — alias {alias_ip} removed")
+                                self.log(f"  [{sn}.x] no {self.protocol.BRAND_NAME} MACs — "
+                                         f"alias {alias_ip} removed")
 
                     # Final summary.
                     n_found = len(tree.get_children())
@@ -10054,7 +10290,9 @@ class CCTVToolkitApp:
                 time.sleep(0.5)
             _tcp_probe_sweep(sn)
             time.sleep(0.5)
-            matches = _arp_matches_in_subnet(sn)
+            # Brand-filtered: see the note at the Find Anywhere harvest.
+            matches = _arp_matches_in_subnet(
+                sn, oui_bytes=getattr(self.protocol, 'MAC_OUIS', None))
             # v4.4.8-beta10 — drop matches whose MAC was already located by the
             # smart pass; otherwise we'd prompt the operator twice.
             matches = [m for m in matches if (m.get('mac', '') or '').upper().replace(':', '').replace('-', '') not in seen_macs_smart]
@@ -11007,45 +11245,67 @@ class CCTVToolkitApp:
         # =====================================================================
         discovered_cameras = {}  # key=MAC_no_colons → camera dict
 
+        # Everything in Phase 1 is brand-filtered. Before v5.2 it wasn't: a
+        # Bosch job ran the Axis DHCP snoop and the Axis-only mDNS query, so
+        # the Discovered tab filled with Axis cameras and a Bosch could never
+        # appear in it at all.
+        brand = self.protocol.BRAND_KEY
+
         # 1a. DHCP snooping — fastest method: cameras broadcast DHCP DISCOVER
         #     with hostname, model, MAC. Works on any subnet (Layer 2 broadcast).
+        #     The snoop is vendor-neutral; results carry a 'brand' tag we honor.
         if not quiet:
             self.log("  Phase 1a: DHCP snooping (listening for camera broadcasts)...")
         try:
             dhcp_results = AxisDHCPDiscovery.discover(timeout=4)
+            skipped = 0
             for cam in dhcp_results:
+                if cam.get('brand') and cam['brand'] != brand:
+                    skipped += 1
+                    continue
                 key = cam.get('mac', '').upper().replace(':', '')
                 if key:
                     discovered_cameras[key] = cam
                     if not quiet:
                         self.log(f"    [DHCP] {cam.get('model', '?')} | MAC: {cam.get('mac', '')} | {cam.get('hostname', '')}")
+            if skipped and not quiet:
+                self.log(f"    ({skipped} other-brand camera(s) ignored — this is a "
+                         f"{self.protocol.BRAND_NAME} session)")
         except Exception as e:
             if not quiet:
                 self.log(f"    DHCP snooping failed: {e}")
 
-        # 1b. mDNS — finds cameras with IPs (including 169.254.x.x link-local)
-        if not quiet:
-            self.log("  Phase 1b: mDNS discovery...")
-        try:
-            mdns_results = AxisMDNSDiscovery.discover(timeout=3)
-            for cam in mdns_results:
-                key = cam.get('mac', '').upper().replace(':', '') or cam.get('ip', '')
-                if key:
-                    if key in discovered_cameras:
-                        # Merge mDNS data into DHCP result (mDNS has IP)
-                        existing = discovered_cameras[key]
-                        for field in ['ip', 'ipv6', 'model', 'hostname']:
-                            if cam.get(field) and not existing.get(field):
-                                existing[field] = cam[field]
-                    else:
-                        discovered_cameras[key] = cam
-                    if not quiet:
-                        self.log(f"    [mDNS] {cam.get('model', '?')} @ {cam.get('ip', '?')} (SN: {cam.get('serial', '')})")
-            if not quiet and not mdns_results:
-                self.log("    No cameras found via mDNS")
-        except Exception as e:
+        # 1b. mDNS — finds cameras with IPs (including 169.254.x.x link-local).
+        #     Axis-only by construction: the service types it queries are
+        #     _axis-video/_vapix-*, which no other vendor answers. Running it
+        #     in Bosch or Hanwha mode can only ever return the wrong brand.
+        if brand == 'axis':
             if not quiet:
-                self.log(f"    mDNS failed: {e}")
+                self.log("  Phase 1b: mDNS discovery...")
+            try:
+                mdns_results = AxisMDNSDiscovery.discover(timeout=3)
+                for cam in mdns_results:
+                    key = cam.get('mac', '').upper().replace(':', '') or cam.get('ip', '')
+                    if key:
+                        cam.setdefault('brand', 'axis')
+                        if key in discovered_cameras:
+                            # Merge mDNS data into DHCP result (mDNS has IP)
+                            existing = discovered_cameras[key]
+                            for field in ['ip', 'ipv6', 'model', 'hostname']:
+                                if cam.get(field) and not existing.get(field):
+                                    existing[field] = cam[field]
+                        else:
+                            discovered_cameras[key] = cam
+                        if not quiet:
+                            self.log(f"    [mDNS] {cam.get('model', '?')} @ {cam.get('ip', '?')} (SN: {cam.get('serial', '')})")
+                if not quiet and not mdns_results:
+                    self.log("    No cameras found via mDNS")
+            except Exception as e:
+                if not quiet:
+                    self.log(f"    mDNS failed: {e}")
+        elif not quiet:
+            self.log(f"  Phase 1b: mDNS skipped — {self.protocol.BRAND_NAME} cameras don't "
+                     f"answer the Axis mDNS services. Using the direct scan instead.")
 
         if not quiet and not discovered_cameras:
             self.log("    No cameras found in Phase 1")
@@ -11115,7 +11375,16 @@ class CCTVToolkitApp:
             ips = list(set(ips))
         else:
             ips = [f"{parts[0]}.{parts[1]}.{parts[2]}.{i}" for i in range(1, 255)]
-        
+
+        # Always probe the selected brand's factory address, whatever subnet
+        # we're on. The UI advertises "Factory IP: x.x.x.x" but before v5.2 that
+        # address was only ever scanned when the laptop happened to sit on a
+        # /16 or on 192.168.0.x — so a factory Bosch at 192.168.0.1 was
+        # invisible on a normal /24 jobsite network.
+        factory_ip = getattr(self.protocol, 'FACTORY_IP', '')
+        if factory_ip and factory_ip not in ips:
+            ips.append(factory_ip)
+
         # Add any IPs discovered via mDNS (including link-local 169.254.x.x)
         # so we can try to get network config from them
         for key, cam in discovered_cameras.items():
@@ -11329,14 +11598,21 @@ class CCTVToolkitApp:
                 subnet = cam.get('subnet', '')
                 model = cam.get('model', '')
                 
+                # A 401 is the only thing that actually means "needs a
+                # password". A blank gateway/subnet just means the camera has
+                # none set — normal on a factory unit — and treating that as an
+                # auth problem sent the operator hunting for a password no one
+                # was asking for.
                 missing = []
-                if not gateway:
-                    missing.append("gateway")
-                if not subnet:
-                    missing.append("subnet")
                 if model == '(Auth Required)':
                     missing.append("model/serial")
-                
+
+                incomplete = []
+                if not gateway:
+                    incomplete.append("gateway")
+                if not subnet:
+                    incomplete.append("subnet")
+
                 # Mark link-local cameras specially
                 is_linklocal = cam.get('ip', '').startswith('169.254.')
                 linklocal_marker = " [LINK-LOCAL]" if is_linklocal else ""
@@ -11346,7 +11622,8 @@ class CCTVToolkitApp:
                             + (f" | {cam.get('hostname', '')}" if cam.get('hostname') else "")
                             + (f" | SN: {cam.get('serial', '')}" if cam.get('serial') else "")
                             + (f" | GW: {gateway}" if gateway else "")
-                            + (f" | (needs auth for {', '.join(missing)})" if missing and not is_linklocal else ""))
+                            + (f" | (needs auth for {', '.join(missing)})" if missing and not is_linklocal else "")
+                            + (f" | (no {', '.join(incomplete)} set)" if incomplete and not missing and not is_linklocal else ""))
                 
                 # Also enrich any matching cameras already in the list
                 cam_mac_norm = cam.get('mac', '').upper().replace(':', '').replace('-', '').strip()
@@ -11421,11 +11698,17 @@ class CCTVToolkitApp:
     
     def show_discovered_password_bar(self, cameras_needing_auth):
         """Show a bar on the Discovered tab to enter password for network info"""
-        
+
         # Clear any existing bar content
         for w in self.discovered_password_bar.winfo_children():
             w.destroy()
-        
+
+        # The retry below authenticates as root against axis-cgi, so the bar
+        # can only ever resolve an Axis camera. Offering it in Bosch or Hanwha
+        # mode asks the operator for a password that cannot possibly work.
+        if self.protocol.BRAND_KEY != 'axis':
+            return
+
         bar = tk.Frame(self.discovered_password_bar, bg='#FFF3CD', relief='solid', bd=1)
         bar.pack(fill=tk.X, pady=(0, 5))
         
@@ -11578,11 +11861,11 @@ class CCTVToolkitApp:
         pwd_entry.focus_set()
     
     def discover_cameras(self):
-        """Discover Axis cameras on the network via IP scan"""
+        """Discover cameras of the selected brand on the network via IP scan"""
         self.scan_ip_range()
-    
+
     def scan_ip_range(self):
-        """Scan a range of IPs for Axis cameras with parallel scanning"""
+        """Scan a range of IPs for cameras of the SELECTED brand, in parallel"""
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
         # Get local network info
@@ -11601,7 +11884,7 @@ class CCTVToolkitApp:
         frame = ttk.Frame(outer, padding="15")
         frame.pack(fill=tk.BOTH, expand=True)
         
-        ttk.Label(frame, text="📡 Scan Network for Axis Cameras", 
+        ttk.Label(frame, text=f"📡 Scan Network for {self.protocol.BRAND_NAME} Cameras",
                  font=('Helvetica', 14, 'bold')).pack(anchor=tk.W)
         
         # Network info display
@@ -11787,59 +12070,25 @@ class CCTVToolkitApp:
         scanned_count = [0]
         
         def get_camera_info(ip):
-            """Get as much info as possible from a camera without auth"""
+            """Ask the SELECTED brand whether there's a camera at this IP.
+
+            This used to probe Axis CGI endpoints directly, which meant the
+            one discovery action the operator invokes on purpose could only
+            ever find Axis cameras — in Bosch mode it returned a list of the
+            wrong brand and the Bosch device on the wire never appeared."""
             if cancel_flag[0]:
                 return None
-                
-            cam = {'ip': ip, 'name': ip}
-            
-            # Try basicdeviceinfo via getAllUnrestrictedProperties — works
-            # without auth on factory AND configured cameras
             try:
-                r = requests.post(f"http://{ip}/axis-cgi/basicdeviceinfo.cgi",
-                    json={"apiVersion": "1.0", "method": "getAllUnrestrictedProperties"},
-                    timeout=1.5)
-                if r.status_code == 200:
-                    data = r.json()
-                    if 'data' in data and 'propertyList' in data['data']:
-                        props = data['data']['propertyList']
-                        cam['model'] = props.get('ProdFullName', props.get('ProdShortName', ''))
-                        cam['serial'] = props.get('SerialNumber', '')
-                        if cam['serial'] and len(cam['serial']) == 12:
-                            cam['mac'] = ':'.join(cam['serial'][i:i+2] for i in range(0, 12, 2))
-                        return cam
-            except:
-                pass
-            
-            # Fallback: try param.cgi Brand group
-            try:
-                r = requests.get(f"http://{ip}/axis-cgi/param.cgi",
-                    params={"action": "list", "group": "Brand"},
-                    timeout=1.5)
-                if r.status_code == 200:
-                    for line in r.text.split('\n'):
-                        if 'Brand.ProdFullName=' in line:
-                            cam['model'] = line.split('=')[1].strip()
-                        elif 'Brand.ProdShortName=' in line and not cam.get('model'):
-                            cam['model'] = line.split('=')[1].strip()
-                    # Name stays as-is (set elsewhere from serial)
-                    return cam
-                elif r.status_code == 401:
-                    cam['model'] = '(Auth Required)'
-                    return cam
-            except:
-                pass
-            
-            # Last resort: check if it responds at all to Axis endpoints
-            try:
-                r = requests.get(f"http://{ip}/axis-cgi/jpg/image.cgi", timeout=1)
-                if r.status_code == 401:
-                    cam['model'] = '(Auth Required)'
-                    return cam
-            except:
-                pass
-            
-            return None
+                cam = self.protocol.get_discovery_info(ip, timeout=2)
+            except Exception:
+                return None
+            if not cam:
+                return None
+            cam.setdefault('ip', ip)
+            cam.setdefault('brand', self.protocol.BRAND_KEY)
+            if not cam.get('name'):
+                cam['name'] = cam.get('hostname') or ip
+            return cam
         
         def do_scan():
             with ThreadPoolExecutor(max_workers=num_threads) as executor:
@@ -12851,6 +13100,27 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "5.2.0": (
+            "What's new in v5.2.0",
+            [
+                "• HEADLINE: picking a camera brand now actually changes what the toolkit looks for. Before this, choosing Bosch or Hanwha only changed how cameras got programmed — the search itself always hunted for Axis. That's why a Bosch job kept filling the Discovered list with Axis cameras while the camera you were holding never showed up.",
+                "• Brand-new Bosch cameras are found now. A Bosch straight out of the box parks its whole web page on 'set a password first', which the toolkit used to read as 'not a camera' and throw away. It now recognises the camera anyway and shows it as 'needs password set'.",
+                "• The Discovered list only shows the brand you picked. Anything else is counted at the bottom as 'other-brand hidden' instead of cluttering the list.",
+                "• The brand you're working in is now shown in the window title bar, so a session running in the wrong mode is obvious straight away.",
+                "• 'Scan Network' searches for the brand you selected. It used to only ever be able to find Axis cameras, whatever the setting said.",
+                "• Bosch programming is more honest about what worked. It no longer reports a reboot or a factory reset as successful when the camera was simply unreachable, and it double-checks that DHCP really did switch off — a silent failure there is what made staged cameras 'forget' their static IP after a power cycle.",
+                "• Bosch cameras that already have a password can be re-run through the wizard. It used to assume every Bosch answered to service/service and gave up at the first step otherwise.",
+                "• Fixed: the wizard could quietly die part-way through and leave the checklist frozen on screen with no error, if you used 'factory default first' and the reset failed.",
+                "• Fixed: adding a temporary address to your network adapter could switch that adapter off DHCP permanently, and the address survived a reboot. It's now temporary for real, and clean-up removes it wherever it ended up.",
+                "• Fixed: after a factory reset the toolkit waited at the Axis default address no matter which brand you chose, so a Bosch reset always 'timed out' after two minutes.",
+                "• The 'Back to wizard' button appeared twice on the same screen. There's one now, always in the same place, and it's hidden on the Setup screen where it did nothing.",
+                "• The Setup screen and the Operations screen offered different lists of jobs with different names for the same thing — 'Validate Password' couldn't be reached from Setup at all. Both now come from one list.",
+                "• Screens no longer ask a Bosch or Hanwha user for a 'root' password, and no longer point at a toolbar that hasn't existed since v5.0. Where a message used to suggest a fix you couldn't perform, it now offers to take you to the right screen.",
+                "• 'Wrong camera model' now lets you skip that one camera and carry on. Answering 'No' used to abandon the entire run, including cameras you hadn't got to yet.",
+                "• Set-hostname is ticked by default, which is what it always claimed to do.",
+                "• Removed about 300 lines of code that nothing could reach, including an older confirm screen that would have asked for a password and then ignored your answer.",
+            ],
+        ),
         "5.1.1": (
             "What's new in v5.1.1",
             [
@@ -14179,13 +14449,10 @@ https://buymeacoffee.com/thelostping""")
     # ========================================================================
     # NEW PROGRAMMING FLOW (step-by-step wizard + live status view)
     # ========================================================================
-    def start_program_wizard_with_confirm(self):
-        """v5.0 b4 — folded into the main wizard. The pre-flight confirm
-        is now Step 2 (Credentials) of the programming wizard itself, so
-        operators see one flow instead of two. Kept as a thin shim that
-        forwards to start_program_wizard for any older bindings."""
-        self.start_program_wizard()
-        return
+    # start_program_wizard_with_confirm() lived here as a shim forwarding to
+    # start_program_wizard. Nothing called it — the confirm step became Step 2
+    # of the wizard itself in v5.0 b4 — so it went in v5.2 along with the
+    # deprecated confirm dialog it used to pair with.
 
     def switch_loading_available(self):
         """v5.1.0 — Switch Loading is only offered when every loaded camera
@@ -14233,137 +14500,12 @@ https://buymeacoffee.com/thelostping""")
         self._switch_loading_pending = True
         self.start_program_wizard()
 
-    def _start_program_wizard_with_confirm_DEPRECATED(self):
-        """v5.0 b3 — pre-flight confirm dialog before launching the
-        step-by-step programming wizard. Brian's ask: 'Program new cameras
-        should confirm the admin user, then the confirmed programming
-        password. Extra users? Yes/No.' This is the operator's last chance
-        to verify the three highest-stakes inputs before programming starts.
-        After confirm, calls into start_program_wizard which has the full
-        step-by-step flow."""
-        # Re-entry guard FIRST so the confirm dialog doesn't sit open while
-        # an old run is still alive in another thread.
-        if getattr(self, '_wizard_running', False):
-            messagebox.showwarning(
-                "A programming run is already active",
-                "Click Cancel on the active run first, or wait for it to finish.",
-                parent=self.root)
-            return
-        cameras = self.validate_cameras_for_programming()
-        if not cameras:
-            return
-
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Confirm before programming")
-        dlg.transient(self.root)
-        dlg.grab_set()
-        dlg.resizable(False, False)
-        _center_on_parent(dlg, self.root, 540, 360)
-
-        body = ttk.Frame(dlg, padding=20)
-        body.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(body, text=f"Program {len(cameras)} {self.protocol.BRAND_NAME} camera(s)",
-                  font=('Helvetica', 13, 'bold')).pack(anchor='w', pady=(0, 4))
-        ttk.Label(body,
-                  text="Confirm the three high-stakes inputs before the wizard fires.",
-                  foreground='gray', font=('Helvetica', 9)).pack(anchor='w', pady=(0, 14))
-
-        # Admin user
-        user_row = ttk.Frame(body); user_row.pack(fill=tk.X, pady=4)
-        ttk.Label(user_row, text="Admin user:", width=18,
-                  font=('Helvetica', 10)).pack(side=tk.LEFT)
-        user_var = tk.StringVar(value=self.protocol.DEFAULT_USER or 'root')
-        ttk.Entry(user_row, textvariable=user_var, width=20,
-                  font=('Helvetica', 10)).pack(side=tk.LEFT)
-        ttk.Label(user_row, text=f"(brand default: {self.protocol.DEFAULT_USER})",
-                  foreground='gray', font=('Helvetica', 8)).pack(side=tk.LEFT, padx=(8, 0))
-
-        # Password + confirm
-        pwd1_row = ttk.Frame(body); pwd1_row.pack(fill=tk.X, pady=4)
-        ttk.Label(pwd1_row, text="Programming password:", width=18,
-                  font=('Helvetica', 10)).pack(side=tk.LEFT)
-        pwd1_var = tk.StringVar(value='')
-        pwd1_entry = ttk.Entry(pwd1_row, textvariable=pwd1_var, width=24, show='•',
-                               font=('Helvetica', 10))
-        pwd1_entry.pack(side=tk.LEFT)
-
-        pwd2_row = ttk.Frame(body); pwd2_row.pack(fill=tk.X, pady=4)
-        ttk.Label(pwd2_row, text="Confirm password:", width=18,
-                  font=('Helvetica', 10)).pack(side=tk.LEFT)
-        pwd2_var = tk.StringVar(value='')
-        ttk.Entry(pwd2_row, textvariable=pwd2_var, width=24, show='•',
-                  font=('Helvetica', 10)).pack(side=tk.LEFT)
-
-        # Extra users yes/no
-        extras_count = 0
-        try:
-            extras_count = len(self.additional_users_data.get_all())
-        except Exception:
-            pass
-        extras_row = ttk.Frame(body); extras_row.pack(fill=tk.X, pady=(12, 4))
-        ttk.Label(extras_row, text="Add extra users?", width=18,
-                  font=('Helvetica', 10)).pack(side=tk.LEFT)
-        extras_var = tk.BooleanVar(value=False)
-        if extras_count > 0:
-            ttk.Radiobutton(extras_row, text=f"Yes ({extras_count} configured)",
-                            variable=extras_var, value=True).pack(side=tk.LEFT, padx=(0, 8))
-            ttk.Radiobutton(extras_row, text="No",
-                            variable=extras_var, value=False).pack(side=tk.LEFT)
-        else:
-            ttk.Label(extras_row,
-                      text="(no extra users configured — use Users & Passwords to add)",
-                      foreground='gray', font=('Helvetica', 9)).pack(side=tk.LEFT)
-
-        # Buttons
-        btns = ttk.Frame(body); btns.pack(fill=tk.X, pady=(20, 0))
-        result = {'ok': False, 'user': '', 'pwd': '', 'extras': False}
-        def _ok():
-            u = user_var.get().strip()
-            p1 = pwd1_var.get()
-            p2 = pwd2_var.get()
-            if not u:
-                messagebox.showwarning("Required", "Admin user is required.", parent=dlg)
-                return
-            if not p1:
-                messagebox.showwarning("Required", "Programming password is required.", parent=dlg)
-                return
-            if p1 != p2:
-                messagebox.showerror("Mismatch", "The two password fields don't match.", parent=dlg)
-                pwd1_entry.focus_set()
-                return
-            result['ok'] = True
-            result['user'] = u
-            result['pwd'] = p1
-            result['extras'] = bool(extras_var.get())
-            dlg.destroy()
-        def _cancel():
-            dlg.destroy()
-        ttk.Button(btns, text="Cancel", command=_cancel).pack(side=tk.RIGHT, padx=(8, 0))
-        ok_btn = tk.Button(btns, text="✓ Start Programming",
-                           bg='#4CAF50', fg='white', font=('Helvetica', 10, 'bold'),
-                           padx=14, pady=6, relief=tk.RAISED, cursor='hand2',
-                           command=_ok)
-        ok_btn.pack(side=tk.RIGHT)
-        dlg.bind('<Return>', lambda e: _ok())
-        dlg.bind('<Escape>', lambda e: _cancel())
-        pwd1_entry.focus_set()
-        dlg.wait_window(dlg)
-
-        if not result['ok']:
-            return
-
-        # Stash the confirmed values into the protocol's defaults so the
-        # subsequent ProgramWizardDialog inside start_program_wizard picks
-        # them up. Then hand off to the real wizard.
-        try:
-            self.protocol.DEFAULT_USER = result['user']
-        except Exception:
-            pass
-        # Pre-seed the wizard dialog's password and extra-users by stashing
-        # on the app for the wizard to read at construction time.
-        self._preconfirmed_password = result['pwd']
-        self._preconfirmed_add_extra_users = result['extras']
-        self.start_program_wizard()
+    # _start_program_wizard_with_confirm_DEPRECATED() lived here: a full
+    # confirm dialog that stashed _preconfirmed_password /
+    # _preconfirmed_add_extra_users for the wizard to read. Nothing ever
+    # read them and nothing ever called it, so re-wiring it would have
+    # asked the operator to confirm a password and then silently ignored
+    # the answer. Removed in v5.2 (~130 lines).
 
     def start_program_wizard(self):
         """Step-by-step programming flow with live checklist UI."""
@@ -14397,6 +14539,7 @@ https://buymeacoffee.com/thelostping""")
         # Show wizard
         wiz = ProgramWizardDialog(self.root,
             brand_name=self.protocol.BRAND_NAME,
+            brand_key=self.protocol.BRAND_KEY,
             factory_ip=self.protocol.FACTORY_IP,
             camera_count=len(cameras),
             additional_users_count=len(self.additional_users_data.get_all()))
@@ -14441,19 +14584,28 @@ https://buymeacoffee.com/thelostping""")
         # would silently time out). Refuse to start the run rather than
         # silently "skipping" multi-home and burning a factory reset.
         if opts.get('auto_multihome') and not selected_iface:
-            messagebox.showerror(
-                "Cannot start — INTERFACE not selected",
-                "Auto multi-home is enabled, but no specific interface is\n"
-                "selected in the top bar of the main window.\n\n"
-                "Without a specific interface, the toolkit cannot add the\n"
-                "per-subnet host IPs needed to reach cameras after they move\n"
-                "to their target IPs — programming would appear to succeed\n"
-                "but post-program verification would time out.\n\n"
-                "Fix one of these and try again:\n"
-                "  •  Pick a specific INTERFACE in the top bar (not 'Auto-detect'), OR\n"
-                "  •  Re-open the wizard and uncheck 'Auto multi-home' on Step 3.",
+            # This message used to offer two fixes, both impossible: there is
+            # no "top bar" (it's unpacked since v5.0) and no Auto multi-home
+            # checkbox on Step 3 (removed in v5.0 b4). The operator bounced
+            # wizard → error → wizard with nothing they could actually do.
+            # Point at the control that exists, and offer to go there.
+            go = messagebox.askyesno(
+                "Cannot start — no network interface picked",
+                "Switch Loading needs to know WHICH network adapter your\n"
+                "cameras are plugged into. Right now it's set to Auto-detect.\n\n"
+                "Without a specific adapter the toolkit can't add the extra\n"
+                "addresses it needs to reach cameras after they move to their\n"
+                "new IPs — programming would look like it worked, then fail\n"
+                "the check afterwards.\n\n"
+                "Go to Setup → Step 2 (Interface) and pick your adapter now?",
                 parent=self.root)
-            self.log("Programming aborted — auto multi-home enabled without a specific interface selected.")
+            self.log("Programming aborted — Switch Loading needs a specific interface (Setup Step 2).")
+            if go:
+                try:
+                    self.notebook.select(self.setup_tab)
+                    self._setup_goto(1)  # Step 2 — Interface
+                except Exception:
+                    pass
             return
 
         if self.session_dhcp_server and self.session_dhcp_confirmed:
@@ -14604,6 +14756,12 @@ https://buymeacoffee.com/thelostping""")
             while remaining and not self.cancel_flag:
                 pinned_mac = None
                 camera_ip = None
+                # Initialized here, not just before the programming steps far
+                # below: the factory-default-first block appends to `errors`
+                # while still inside discovery. Binding it late raised
+                # UnboundLocalError, which killed this worker thread with no
+                # visible message and froze the status checklist mid-run.
+                errors = []
 
                 if switch_loading_mode:
                     # v5.1.0: Switch Loading — don't pre-announce a specific cam;
@@ -15219,7 +15377,7 @@ https://buymeacoffee.com/thelostping""")
                                 self.status_log(
                                     f"  ⚠         until the LED blinks amber, then release). The wizard")
                                 self.status_log(
-                                    f"  ⚠         will pick it up at 192.168.0.90 once it's back.")
+                                    f"  ⚠         will pick it up at {self.protocol.FACTORY_IP} once it's back.")
                                 self.status_log(
                                     f"  ⚠ Pausing 30s before re-checking — paperclip now.")
                                 # Quiet wait. Don't bounce back to outer loop;
@@ -15267,7 +15425,10 @@ https://buymeacoffee.com/thelostping""")
                         rendezvous_ips = []
                         if self._bundled_dhcp and dhcp_lease_ip:
                             rendezvous_ips.append(dhcp_lease_ip)
-                        rendezvous_ips.extend([old_ip, '192.168.0.90'])
+                        # The brand's own factory address, not Axis's. Polling
+                        # 192.168.0.90 during a Bosch run meant the camera
+                        # never "came back" and the slot always bailed at 120s.
+                        rendezvous_ips.extend([old_ip, factory_ip, self.protocol.FACTORY_IP])
                         while time.time() < deadline and not self.cancel_flag:
                             for try_ip in rendezvous_ips:
                                 if not try_ip:
@@ -15444,9 +15605,15 @@ https://buymeacoffee.com/thelostping""")
                         self.arp_unpin(camera_ip)
                         consecutive_skips += 1
 
-                        result = [None]
+                        # Three-way, not yes/no. "No" used to mean "abort the
+                        # whole run", so the natural answer to "this isn't a
+                        # camera I want" threw away every camera still queued.
+                        #   Yes    = try again (re-probe this slot)
+                        #   No     = leave this camera alone, keep going
+                        #   Cancel = stop the whole run
+                        result = ['__pending__']
                         skip_count = consecutive_skips
-                        models_needed = sorted(set(c.get('model', '(any)') for c in remaining))
+                        mismatch_mac = (pinned_mac or '').upper().replace(':', '').replace('-', '')
                         def show_mismatch():
                             msg = (f"Wrong camera model detected!\n\n"
                                    f"Connected: {actual_model}\n\n"
@@ -15458,14 +15625,26 @@ https://buymeacoffee.com/thelostping""")
                             for m, count in sorted(model_counts.items()):
                                 msg += f"  • {m}  ×{count}\n"
                             msg += (f"\n({skip_count} mismatch{'es' if skip_count != 1 else ''} so far)\n\n"
-                                    "Try again?")
-                            result[0] = messagebox.askyesno("Wrong Camera Model", msg)
+                                    "Yes = try this camera again\n"
+                                    "No = leave this one alone and keep going\n"
+                                    "Cancel = stop the whole run")
+                            result[0] = messagebox.askyesnocancel("Wrong Camera Model", msg)
                         self.root.after(0, show_mismatch)
-                        while result[0] is None and not self.cancel_flag:
+                        while result[0] == '__pending__' and not self.cancel_flag:
                             time.sleep(0.1)
-                        if not result[0]:
+                        if result[0] is None:
+                            # Cancel (button or window close) — stop everything.
                             self.cancel_flag = True
                             break
+                        if result[0] is False:
+                            # Ignore this camera: remember its MAC so discovery
+                            # stops re-offering it, then carry on with the rest.
+                            if mismatch_mac:
+                                seen_macs.add(mismatch_mac)
+                            self.status_log(f"  → Ignoring {actual_model} — leave it plugged in or "
+                                            f"remove it; moving on to the next camera.")
+                            time.sleep(1)
+                            continue
                         time.sleep(2)
                         continue
                 else:
@@ -15590,7 +15769,7 @@ https://buymeacoffee.com/thelostping""")
                                 target_mac_norm = (pinned_mac or '').upper().replace(':', '').replace('-', '')
                                 rescue_ip = None
                                 rescue_deadline = time.time() + 120
-                                rendezvous = [old_ip, '192.168.0.90']
+                                rendezvous = [old_ip, factory_ip, self.protocol.FACTORY_IP]
                                 while time.time() < rescue_deadline and not self.cancel_flag:
                                     for try_ip in rendezvous:
                                         if not try_ip:
@@ -16106,7 +16285,7 @@ https://buymeacoffee.com/thelostping""")
             return
         ip = ip.strip()
         password = simpledialog.askstring("Factory Default",
-            f"Existing root password for {ip}:", show='*', parent=self.root)
+            f"Existing {self.protocol.DEFAULT_USER} password for {ip}:", show='*', parent=self.root)
         if password is None:
             return
         if not messagebox.askyesno("Factory Default — confirm",
@@ -16140,7 +16319,9 @@ https://buymeacoffee.com/thelostping""")
                 if self.cancel_flag:
                     self.log("Cancelled by user.")
                     break
-                for try_ip in (ip, '192.168.0.90'):
+                # The selected brand's factory address, not Axis's hardcoded
+                # one — a reset Bosch returns to 192.168.0.1.
+                for try_ip in (ip, self.protocol.FACTORY_IP):
                     if self.ping_camera(try_ip, timeout_ms=1000):
                         p = self.protocol.probe_unrestricted(try_ip)
                         p_mac = (p.get('mac') or '').upper().replace(':', '').replace('-', '')
