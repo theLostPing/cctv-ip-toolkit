@@ -593,6 +593,47 @@ def _have_route_to(target_ip):
     return None
 
 
+def _iface_ipv4_state(iface_index):
+    """v5.2.1 — one NIC's own IPv4 addresses in EVERY AddressState, plus its
+    link status. _have_route_to() only counts 'Preferred' addresses, and
+    Windows parks a static IP as 'Tentative' while the port has no link, so on
+    its own it reports an unplugged cable as "different subnet".
+    Returns {'up': True/False/None (unknown), 'addrs': [{ip, prefix_len, state}]}."""
+    import subprocess
+    out = {'up': None, 'addrs': []}
+    try:
+        idx = int(iface_index)
+    except (TypeError, ValueError):
+        return out
+    cmd = (f"$a = Get-NetAdapter -InterfaceIndex {idx} -ErrorAction SilentlyContinue; "
+           f"$ips = @(Get-NetIPAddress -InterfaceIndex {idx} -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+           "Select-Object IPAddress,PrefixLength,@{n='State';e={[string]$_.AddressState}}); "
+           "[pscustomobject]@{Status=[string]$a.Status; Ips=$ips} | ConvertTo-Json -Compress -Depth 3")
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', cmd],
+            capture_output=True, text=True, timeout=8,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        if result.returncode != 0 or not result.stdout.strip():
+            return out
+        data = json.loads(result.stdout)
+    except Exception:
+        return out
+    status = (data.get('Status') or '').strip()
+    if status:
+        out['up'] = (status == 'Up')
+    ips = data.get('Ips') or []
+    if isinstance(ips, dict):
+        ips = [ips]
+    for d in ips:
+        ip = d.get('IPAddress')
+        if ip and not ip.startswith('169.254.'):
+            out['addrs'].append({'ip': ip,
+                                 'prefix_len': int(d.get('PrefixLength') or 0),
+                                 'state': d.get('State') or ''})
+    return out
+
+
 # v4.4.8 — Find Camera Anywhere defaults.
 # Common /24 ranges where reused cameras tend to live. Covers ~90% of
 # real-world "tech plugs in a camera from a prior customer site" scenarios.
@@ -7919,7 +7960,36 @@ class CCTVToolkitApp:
             ttk.Label(frame, text=f"ℹ Auto-detect selected — the toolkit will pick whichever NIC has a route to the factory IP ({factory_ip}) at run-time.",
                       foreground='#666', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w')
             return
-        route = _have_route_to(factory_ip)
+        # v5.2.1 — judge the selected NIC by its own addresses in any state
+        # first. An unplugged port used to read as "different subnet" and
+        # offer an alias that goes Tentative too, so every click just offered
+        # the next candidate IP.
+        name = (iface.get('label') or '').rsplit(' (', 1)[0] or 'this port'
+        state = _iface_ipv4_state(iface.get('index'))
+        covering = next((a for a in state['addrs']
+                         if _ip_in_same_subnet(factory_ip, a['ip'], a['prefix_len'])), None)
+        if state['up'] is False:
+            ttk.Label(frame, text=f"⚠ No link on {name} — nothing is plugged into that port, or the switch / PoE is off.",
+                      foreground='#E65100', font=('Helvetica', 10, 'bold'),
+                      wraplength=900, justify=tk.LEFT).pack(anchor='w')
+            if covering:
+                detail = (f"The address is fine: {covering['ip']}/{covering['prefix_len']} already covers "
+                          f"the factory IP {factory_ip}, so no extra IP is needed.")
+            else:
+                detail = (f"This port's address isn't on the factory subnet either. Once it has link, "
+                          f"this step will offer a temporary {factory_ip.rsplit('.', 1)[0]}.x address.")
+            ttk.Label(frame, text=f"{detail}\nPlug the camera switch into this port, then hit ↻ Refresh.",
+                      foreground='#555', font=('Helvetica', 9),
+                      wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(4, 0))
+            return
+        if covering and covering['state'] != 'Preferred':
+            hint = (f" Another device on this switch is already using {covering['ip']} — change this NIC's address."
+                    if covering['state'] == 'Duplicate' else " Give it a few seconds, then hit ↻ Refresh.")
+            ttk.Label(frame, text=f"⚠ {covering['ip']} on {name} isn't active yet (Windows says: {covering['state']}).{hint}",
+                      foreground='#E65100', font=('Helvetica', 10, 'bold'),
+                      wraplength=900, justify=tk.LEFT).pack(anchor='w')
+            return
+        route = covering or _have_route_to(factory_ip)
         if route:
             ttk.Label(frame, text=f"✓ Reachable — this interface can talk to the factory IP {factory_ip} directly.",
                       foreground='#1B5E20', font=('Helvetica', 10, 'bold')).pack(anchor='w')
