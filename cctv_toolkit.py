@@ -383,7 +383,14 @@ def _netsh_add_ip(iface_index, ip, mask, return_error=False):
     bolted to their laptop and DHCP no longer working.
 
     Returns True/False, or (ok, error_text) when return_error=True — callers
-    that report failures to the operator need the real reason, not a guess."""
+    that report failures to the operator need the real reason, not a guess.
+
+    v5.2.1 — NO -SkipAsSource here. That flag bars Windows from sending FROM
+    the address, so traffic to the camera left from the NIC's other address
+    and a factory camera can't answer that. Proven on Boss 2026-09-28: alias
+    192.168.77.99/24 beside 192.168.192.1/20, Find-NetRoute to .77.1 picked
+    source 192.168.192.1 with the flag and 192.168.77.99 without. (The
+    link-local path keeps its flag — field-proven since v4.2.5.)"""
     import subprocess
     prefix = _mask_to_prefix_len(mask)
     last_err = ''
@@ -391,7 +398,7 @@ def _netsh_add_ip(iface_index, ip, mask, return_error=False):
     try:
         cmd = (f"New-NetIPAddress -InterfaceIndex {iface_index} "
                f"-IPAddress '{ip}' -PrefixLength {prefix} "
-               f"-PolicyStore ActiveStore -SkipAsSource $true "
+               f"-PolicyStore ActiveStore "
                f"-ErrorAction Stop | Out-Null")
         r = subprocess.run(
             ['powershell', '-NoProfile', '-Command', cmd],
@@ -631,7 +638,57 @@ def _iface_ipv4_state(iface_index):
             out['addrs'].append({'ip': ip,
                                  'prefix_len': int(d.get('PrefixLength') or 0),
                                  'state': d.get('State') or ''})
+    # Active addresses first, so a caller's "first covering address" is the
+    # usable one when a NIC holds two on the same subnet.
+    out['addrs'].sort(key=lambda a: a['state'] != 'Preferred')
     return out
+
+
+def _confirm_alias(iface_index, ip, target_ip, timeout_s=8.0):
+    """v5.2.1 — prove an alias the toolkit just added is really usable: on
+    THIS interface, activated by Windows (Preferred), and the address Windows
+    will send from when talking to target_ip. _netsh_add_ip() alone can't say
+    that — it counts "already exists" as success even when the address sits
+    on another NIC. Polls until Preferred or timeout (Windows runs a duplicate
+    check on a new address first). Blocking; call it off the Tk thread.
+    Returns {'ok', 'state', 'iface', 'source', 'elapsed'}."""
+    import subprocess
+    try:
+        want_idx = int(iface_index)
+    except (TypeError, ValueError):
+        want_idx = None
+    cmd = (f"$a = @(Get-NetIPAddress -IPAddress '{ip}' -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
+           "Select-Object InterfaceIndex,@{n='State';e={[string]$_.AddressState}}); "
+           f"$r = Find-NetRoute -RemoteIPAddress '{target_ip}' -ErrorAction SilentlyContinue | "
+           "Where-Object { $_.IPAddress } | Select-Object -First 1; "
+           "[pscustomobject]@{Addr=$a; Src=[string]$r.IPAddress} | ConvertTo-Json -Compress -Depth 3")
+    res = {'ok': False, 'state': '', 'iface': None, 'source': '', 'elapsed': 0.0}
+    t0 = time.time()
+    while True:
+        try:
+            r = subprocess.run(['powershell', '-NoProfile', '-Command', cmd],
+                               capture_output=True, text=True, timeout=10,
+                               creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            data = json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
+        except Exception:
+            data = {}
+        addrs = data.get('Addr') or []
+        if isinstance(addrs, dict):
+            addrs = [addrs]
+        mine = next((a for a in addrs if want_idx is not None
+                     and int(a.get('InterfaceIndex') or 0) == want_idx), None)
+        pick = mine or (addrs[0] if addrs else None)
+        res['state'] = (pick or {}).get('State') or ''
+        res['iface'] = int(pick.get('InterfaceIndex') or 0) if pick else None
+        res['source'] = (data.get('Src') or '').strip()
+        res['elapsed'] = round(time.time() - t0, 1)
+        # Stop as soon as the answer can't improve: live, a clash, or gone.
+        if mine and res['state'] == 'Preferred':
+            res['ok'] = (res['source'] == ip)
+            return res
+        if res['state'] == 'Duplicate' or res['elapsed'] >= timeout_s:
+            return res
+        time.sleep(0.7)
 
 
 # v4.4.8 — Find Camera Anywhere defaults.
@@ -1251,6 +1308,18 @@ class AdditionalUsersDataManager:
             if u['username'].lower() == username.lower():
                 return False
         self.users.append({'username': username, 'password': password, 'role': role})
+        self.save()
+        return True
+
+    def update(self, index, username, password, role='Operator'):
+        """v5.2.1 — edit one user in place (double-click on the list). Same
+        duplicate rule as add(), ignoring the row being edited."""
+        if not username or not (0 <= index < len(self.users)):
+            return False
+        for i, u in enumerate(self.users):
+            if i != index and u['username'].lower() == username.lower():
+                return False
+        self.users[index] = {'username': username, 'password': password, 'role': role}
         self.save()
         return True
 
@@ -7565,22 +7634,10 @@ class CCTVToolkitApp:
         tk.Label(header, text=version_tag, bg='#263238', fg='#90A4AE',
                  font=('Helvetica', 9)).pack(side=tk.LEFT, padx=(8, 0), pady=8)
 
-        def _go_setup():
-            try: self.notebook.select(self.setup_tab)
-            except Exception: pass
-        # v5.0 b2 — was '🏠 Home' but 'home' implies a separate home screen
-        # which doesn't exist; Setup IS the home. 'Back to wizard' reads
-        # correctly per Brian's feedback.
-        # v5.2 — this is now the ONLY way back. The per-tab headers used to
-        # draw a second copy of this same button, so every power-user screen
-        # offered two identical exits in two different places. Green because it
-        # inherited the job of the more prominent one.
-        self.back_to_wizard_btn = tk.Button(
-            header, text="← Back to wizard", bg='#4CAF50', fg='white',
-            font=('Helvetica', 9, 'bold'), relief=tk.FLAT, padx=14, cursor='hand2',
-            activebackground='#43A047', activeforeground='white',
-            command=_go_setup)
-        self.back_to_wizard_btn.pack(side=tk.RIGHT, padx=(0, 10), pady=6)
+        # v5.2.1 — '← Back to wizard' moved out of this header into a bottom
+        # bar on every Tools page (_add_tab_footer), in the slot Setup's
+        # 'Next →' uses. Brian: "I feel like the back to wizard needs to be in
+        # the bottom right. All the same style of layout".
 
         # Tools menubutton — secondary screens
         tools_mb = tk.Menubutton(header, text='Tools ▾', bg='#37474F', fg='white',
@@ -7693,11 +7750,13 @@ class CCTVToolkitApp:
         # Tab: Camera List
         self.cameras_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.cameras_tab, text="📋 Camera List")
+        self._add_tab_footer(self.cameras_tab)
         self.create_cameras_tab()
 
         # Tab: Discovered Cameras
         self.discovered_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.discovered_tab, text="📡 Discovered")
+        self._add_tab_footer(self.discovered_tab)
         self.create_discovered_tab()
 
         # Tab: Users & Passwords (renamed from "Passwords" in v5.0 to reflect
@@ -7705,43 +7764,82 @@ class CCTVToolkitApp:
         # programming AND the saved password list used for auth attempts).
         self.passwords_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.passwords_tab, text="🔑 Users & Passwords")
+        self._add_tab_footer(self.passwords_tab)
         self.create_passwords_tab()
 
         # Tab: Operations
         self.operations_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.operations_tab, text="⚡ Operations")
+        self._add_tab_footer(self.operations_tab)
         self.create_operations_tab()
 
         # Tab: Programming Status (live checklist for new wizard)
         self.status_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.status_tab, text="🟢 Programming Status")
+        self._add_tab_footer(self.status_tab)
         self.create_status_tab()
 
         # Tab: Log/Results
         self.log_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.log_tab, text="📊 Log & Results")
+        self._add_tab_footer(self.log_tab)
         self.create_log_tab()
 
         # v5.0 — Setup is the default landing tab. The intent: new operators
         # see the linear flow, not the tab grid.
         self.notebook.select(self.setup_tab)
 
-        # Hide the exit button while the operator is already on Setup —
-        # "Back to wizard" pointing at the page you're looking at is noise.
-        def _sync_back_button(_evt=None):
+        # v5.2.1 — ONE live status view, shown in whichever place is on
+        # screen: Setup Step 6 or Tools → Programming Status.
+        def _remount_status(_evt=None):
             try:
-                on_setup = self.notebook.select() == str(self.setup_tab)
-                if on_setup:
-                    self.back_to_wizard_btn.pack_forget()
-                elif not self.back_to_wizard_btn.winfo_ismapped():
-                    # before=Tools keeps it in its original slot on the far
-                    # right; a bare re-pack would land it left of the menu.
-                    self.back_to_wizard_btn.pack(side=tk.RIGHT, padx=(0, 10), pady=6,
-                                                 before=self._tools_mb)
+                sel = self.notebook.select()
+                if sel == str(self.status_tab):
+                    self._mount_status_view(self.status_tab)
+                elif (sel == str(self.setup_tab)
+                      and self._setup_step == len(self._setup_steps_meta) - 1):
+                    holder = getattr(self, '_setup_status_holder', None)
+                    if holder is not None and holder.winfo_exists():
+                        self._mount_status_view(holder)
             except Exception:
                 pass
-        self.notebook.bind('<<NotebookTabChanged>>', _sync_back_button, add='+')
-        _sync_back_button()
+        self.notebook.bind('<<NotebookTabChanged>>', _remount_status, add='+')
+
+    def _go_to_wizard(self):
+        try:
+            self.notebook.select(self.setup_tab)
+        except Exception:
+            pass
+
+    def _add_tab_footer(self, tab):
+        """v5.2.1 — the wizard's bottom bar on a Tools page: '← Back to wizard'
+        in the exact slot Setup's 'Next →' sits in (same size, colour, font,
+        15px in from the right, 10px up). Must be packed BEFORE the tab's own
+        content so that content's fill/expand only gets the space above it."""
+        bar = ttk.Frame(tab, padding=(15, 10, 15, 10))
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Button(bar, text='← Back to wizard', width=18,
+                  bg='#4CAF50', fg='white', font=('Helvetica', 10, 'bold'),
+                  relief=tk.RAISED, cursor='hand2',
+                  activebackground='#43A047', activeforeground='white',
+                  command=self._go_to_wizard).pack(side=tk.RIGHT)
+        return bar
+
+    def _mount_status_view(self, container):
+        """v5.2.1 — show the live status view (banner, checklist, log) inside
+        `container`. The view is a child of root, so Tk lets it be packed into
+        any frame (pack -in); it's re-homed rather than rebuilt, so the worker
+        thread's updates land wherever the operator is looking."""
+        v = getattr(self, '_status_view', None)
+        if v is None or container is None:
+            return
+        try:
+            v.pack_forget()
+            v.configure(padding=15 if container is self.status_tab else (0, 4, 0, 0))
+            v.pack(in_=container, fill=tk.BOTH, expand=True)
+            v.lift()
+        except tk.TclError:
+            pass
 
     # ========================================================================
     # v5.0 — Setup tab: linear guided flow
@@ -7879,11 +7977,17 @@ class CCTVToolkitApp:
         self._setup_progress_lbl.configure(text=f"Step {num} of {len(self._setup_steps_meta)}")
         # Nav state
         self._setup_back_btn.configure(state='normal' if idx > 0 else 'disabled')
+        # v5.2.1 — no Next on the last step (was a greyed '— last step —'
+        # button that did nothing).
         if idx == len(self._setup_steps_meta) - 1:
-            self._setup_next_btn.configure(state='disabled', text='— last step —')
+            self._setup_next_btn.pack_forget()
         else:
             self._setup_next_btn.configure(state='normal', text='Next →')
-        # Render body
+            if not self._setup_next_btn.winfo_manager():
+                self._setup_next_btn.pack(side=tk.RIGHT, before=self._setup_progress_lbl)
+        # Render body. Park the shared status view on its own tab first —
+        # Step 6's holder is about to be destroyed along with the rest.
+        self._mount_status_view(getattr(self, 'status_tab', None))
         for w in self._setup_body.winfo_children():
             w.destroy()
         # v5.0 b2 — Brand first per Brian's reorder
@@ -7935,6 +8039,7 @@ class CCTVToolkitApp:
         """v5.0.1 — wraps _on_session_iface_change so Step 2's reachability
         hint refreshes whenever the operator picks a different interface."""
         self._on_session_iface_change(event)
+        self._step2_alias_verdict = None
         self._render_subnet_check()
 
     def _render_subnet_check(self):
@@ -7960,12 +8065,32 @@ class CCTVToolkitApp:
             ttk.Label(frame, text=f"ℹ Auto-detect selected — the toolkit will pick whichever NIC has a route to the factory IP ({factory_ip}) at run-time.",
                       foreground='#666', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w')
             return
+        name = (iface.get('label') or '').rsplit(' (', 1)[0] or 'this port'
+        # v5.2.1 — the alias button's verdict, kept until the operator changes
+        # interface. While the check runs, show only that (no second button).
+        verdict = getattr(self, '_step2_alias_verdict', None)
+        if verdict and (verdict['factory_ip'] != factory_ip
+                        or str(verdict['iface_index']) != str(iface.get('index'))):
+            verdict = self._step2_alias_verdict = None
+        if verdict and verdict.get('pending'):
+            ttk.Label(frame, text=f"⏳ Adding {verdict['ip']}/24 to {name} — confirming with Windows that it's in…",
+                      foreground='#1565C0', font=('Helvetica', 10, 'bold'),
+                      wraplength=900, justify=tk.LEFT).pack(anchor='w')
+            return
         # v5.2.1 — judge the selected NIC by its own addresses in any state
         # first. An unplugged port used to read as "different subnet" and
         # offer an alias that goes Tentative too, so every click just offered
         # the next candidate IP.
-        name = (iface.get('label') or '').rsplit(' (', 1)[0] or 'this port'
         state = _iface_ipv4_state(iface.get('index'))
+        if verdict and verdict['ok'] and not any(a['ip'] == verdict['ip'] for a in state['addrs']):
+            verdict = self._step2_alias_verdict = None  # cleaned up since — stale
+        if verdict and state['up'] is not False:
+            ttk.Label(frame, text=verdict['headline'], foreground=verdict['color'],
+                      font=('Helvetica', 10, 'bold'), wraplength=900, justify=tk.LEFT).pack(anchor='w')
+            ttk.Label(frame, text=verdict['detail'], foreground='#555', font=('Helvetica', 9),
+                      wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(2, 10))
+            if verdict['ok']:
+                return
         covering = next((a for a in state['addrs']
                          if _ip_in_same_subnet(factory_ip, a['ip'], a['prefix_len'])), None)
         if state['up'] is False:
@@ -7982,7 +8107,12 @@ class CCTVToolkitApp:
                       foreground='#555', font=('Helvetica', 9),
                       wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(4, 0))
             return
+        # A failed alias verdict above already says what's wrong; the generic
+        # lines below would contradict it ("✓ Reachable" under "✗ ...").
+        verdict_failed = bool(verdict) and not verdict['ok'] and state['up'] is not False
         if covering and covering['state'] != 'Preferred':
+            if verdict_failed:
+                return
             hint = (f" Another device on this switch is already using {covering['ip']} — change this NIC's address."
                     if covering['state'] == 'Duplicate' else " Give it a few seconds, then hit ↻ Refresh.")
             ttk.Label(frame, text=f"⚠ {covering['ip']} on {name} isn't active yet (Windows says: {covering['state']}).{hint}",
@@ -7991,14 +8121,19 @@ class CCTVToolkitApp:
             return
         route = covering or _have_route_to(factory_ip)
         if route:
-            ttk.Label(frame, text=f"✓ Reachable — this interface can talk to the factory IP {factory_ip} directly.",
-                      foreground='#1B5E20', font=('Helvetica', 10, 'bold')).pack(anchor='w')
+            if not verdict_failed:
+                ttk.Label(frame, text=f"✓ Reachable — this interface can talk to the factory IP {factory_ip} directly.",
+                          foreground='#1B5E20', font=('Helvetica', 10, 'bold')).pack(anchor='w')
             return
         parts = factory_ip.split('.')
         subnet_base = '.'.join(parts[:3]) if len(parts) == 4 else ''
         # .89 is in the candidate list per Brian's "make 0.89 a thing" request;
         # _pick_free_host_ip walks in order and takes the first unused entry.
-        candidates = (99, 98, 97, 89, 250, 249, 200, 150, 100, 50)
+        # Addresses Windows already refused as duplicates this session are
+        # skipped even when the device holding them ignores ping.
+        refused = getattr(self, '_step2_refused_ips', set())
+        candidates = tuple(n for n in (99, 98, 97, 89, 250, 249, 200, 150, 100, 50)
+                           if f"{subnet_base}.{n}" not in refused)
         chosen = _pick_free_host_ip(subnet_base, '255.255.255.0', candidates=candidates) if subnet_base else None
         ttk.Label(frame, text=f"⚠ {iface.get('ip', '?')} can't reach the factory IP {factory_ip} — different subnet.",
                   foreground='#C62828', font=('Helvetica', 10, 'bold'),
@@ -8018,12 +8153,15 @@ class CCTVToolkitApp:
         tk.Button(frame, text=f"➕ Add {chosen}/24 alias",
                   font=('Helvetica', 10, 'bold'), bg='#FFA000', fg='white',
                   relief=tk.RAISED, padx=12, pady=4, cursor='hand2',
-                  command=lambda: self._add_factory_subnet_alias(factory_ip)).pack(anchor='w')
+                  command=lambda c=chosen: self._add_factory_subnet_alias(factory_ip, c)).pack(anchor='w')
 
-    def _add_factory_subnet_alias(self, factory_ip):
+    def _add_factory_subnet_alias(self, factory_ip, chosen=None):
         """v5.0.1 — Step 2 'Add alias' button. Adds a same-subnet IP to the
         selected NIC via netsh, registers it in multihome_state.json so the
-        existing teardown machinery cleans it up, then re-renders the hint."""
+        existing teardown machinery cleans it up, then re-renders the hint.
+        v5.2.1 — adds the address the button SHOWED (was re-picked here, so
+        the label could say .99 and .98 went on), then proves it's in via
+        _confirm_alias() on a worker thread and shows the verdict in Step 2."""
         iface = self._resolve_session_iface()
         if not iface:
             messagebox.showwarning("Pick an interface",
@@ -8041,17 +8179,18 @@ class CCTVToolkitApp:
         if len(parts) != 4:
             return
         subnet_base = '.'.join(parts[:3])
-        chosen = _pick_free_host_ip(subnet_base, '255.255.255.0',
-                                    candidates=(99, 98, 97, 89, 250, 249, 200, 150, 100, 50))
+        if not chosen:
+            chosen = _pick_free_host_ip(subnet_base, '255.255.255.0',
+                                        candidates=(99, 98, 97, 89, 250, 249, 200, 150, 100, 50))
         if not chosen:
             messagebox.showinfo("No free host IP",
                                 f"All candidate IPs in {subnet_base}.x are already in use.",
                                 parent=self.root)
             return
-        if not _netsh_add_ip(iface_idx, chosen, '255.255.255.0'):
+        ok, err = _netsh_add_ip(iface_idx, chosen, '255.255.255.0', return_error=True)
+        if not ok:
             messagebox.showerror("Add alias failed",
-                                 f"netsh add {chosen}/24 to interface {iface_idx} failed. "
-                                 "Check that the toolkit is running as admin.",
+                                 f"Windows refused to add {chosen}/24 to interface {iface_idx}:\n\n{err}",
                                  parent=self.root)
             self._render_subnet_check()
             return
@@ -8062,10 +8201,61 @@ class CCTVToolkitApp:
                          '_for_target': factory_ip})
         _save_multihome_state(existing)
         try:
-            self.log(f"Step 2: added subnet alias {chosen}/24 on iface {iface_idx} for factory IP {factory_ip}")
+            self.log(f"Step 2: added subnet alias {chosen}/24 on iface {iface_idx} for factory IP {factory_ip} — confirming")
         except Exception:
             pass
-        time.sleep(1.0)  # let the OS wire up the address before re-checking
+        self._step2_alias_verdict = {'pending': True, 'ok': False, 'ip': chosen,
+                                     'factory_ip': factory_ip, 'iface_index': iface_idx}
+        self._render_subnet_check()
+
+        def _worker():
+            res = _confirm_alias(iface_idx, chosen, factory_ip)
+            self.root.after(0, lambda: self._finish_alias_confirm(factory_ip, iface, chosen, res))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_alias_confirm(self, factory_ip, iface, ip, res):
+        """v5.2.1 — turn _confirm_alias()'s result into the Step 2 verdict
+        banner + a log line. A duplicate is removed on the spot so the button
+        can offer the next free address."""
+        name = (iface.get('label') or '').rsplit(' (', 1)[0] or 'this port'
+        idx = iface.get('index')
+        ok, state, secs = res['ok'], res['state'], res['elapsed']
+        if ok:
+            head = f"✓ Confirmed: {ip}/24 is on {name} and active."
+            detail = (f"Windows will talk to the factory IP {factory_ip} from {ip} (checked in {secs}s). "
+                      f"It's removed automatically at wizard end and on app close.")
+            color = '#1B5E20'
+        elif state == 'Duplicate':
+            _netsh_remove_ip(idx, ip)
+            _save_multihome_state([e for e in (_load_multihome_state() or []) if e.get('ip') != ip])
+            head = f"✗ Another device on this switch already has {ip} — Windows refused it."
+            detail = "Removed it. Use the button below to add a different free address."
+            color = '#C62828'
+        elif res['iface'] is None:
+            head = f"✗ Windows said the add worked, but {ip} isn't on any port."
+            detail = "Hit ↻ Refresh and try again. If it repeats, the log has the add command's output."
+            color = '#C62828'
+        elif str(res['iface']) != str(idx):
+            head = f"✗ {ip} landed on interface #{res['iface']}, not {name}."
+            detail = ("A dock or USB adapter re-plug can renumber ports. Hit ↻ Refresh, "
+                      "pick the camera port again, then re-add.")
+            color = '#C62828'
+        elif state != 'Preferred':
+            head = f"⚠ {ip} is on {name}, but Windows still hasn't activated it after {secs}s (state: {state or 'unknown'})."
+            detail = "That usually means the port has no link. Check the cable / switch power, then hit ↻ Refresh."
+            color = '#E65100'
+        else:
+            head = f"✗ {ip} is on {name} and active, but Windows would talk to {factory_ip} from {res['source'] or 'no address'}."
+            detail = ("The camera won't answer that. Another port may also be on this subnet — unplug or "
+                      "disable it, then hit ↻ Refresh.")
+            color = '#C62828'
+        self._step2_alias_verdict = {'pending': False, 'ok': ok, 'ip': ip, 'factory_ip': factory_ip,
+                                     'iface_index': idx, 'headline': head, 'detail': detail, 'color': color}
+        try:
+            self.log(f"Step 2: alias {ip}/24 on iface {idx} — {'CONFIRMED' if ok else 'NOT confirmed'} "
+                     f"(state={state or '-'}, on_iface={res['iface']}, source={res['source'] or '-'}, {secs}s)")
+        except Exception:
+            pass
         self._render_subnet_check()
 
     def _setup_render_dhcp(self, body):
@@ -8259,13 +8449,12 @@ class CCTVToolkitApp:
                           wraplength=520, justify=tk.LEFT).pack(side=tk.LEFT, padx=(12, 0))
 
     def _setup_render_status(self, body):
-        ttk.Label(body, text="Live programming progress",
-                  font=('Helvetica', 12, 'bold')).pack(anchor='w', pady=(10, 8))
-        ttk.Label(body,
-            text="The Programming Status tab shows the step-by-step checklist while a wizard run is active. Click below to jump there.",
-            foreground='gray', font=('Helvetica', 9), wraplength=900, justify=tk.LEFT).pack(anchor='w', pady=(0, 12))
-        ttk.Button(body, text="🟢 Open Programming Status tab", width=36,
-                   command=lambda: self.notebook.select(self.status_tab)).pack(anchor='w')
+        # v5.2.1 — Step 6 IS the live status screen (banner, checklist, log),
+        # not a page with a button that jumped to it.
+        holder = ttk.Frame(body)
+        holder.pack(fill=tk.BOTH, expand=True)
+        self._setup_status_holder = holder
+        self._mount_status_view(holder)
 
     def _update_window_title(self):
         """Keep the active brand in the title bar. A session running in the
@@ -9231,7 +9420,8 @@ class CCTVToolkitApp:
 
         ttk.Label(users_controls, text="Username:").pack(side=tk.LEFT, padx=(0, 3))
         self.new_user_name_var = tk.StringVar()
-        ttk.Entry(users_controls, textvariable=self.new_user_name_var, width=14).pack(side=tk.LEFT, padx=(0, 8))
+        self._user_name_entry = ttk.Entry(users_controls, textvariable=self.new_user_name_var, width=14)
+        self._user_name_entry.pack(side=tk.LEFT, padx=(0, 8))
 
         ttk.Label(users_controls, text="Password:").pack(side=tk.LEFT, padx=(0, 3))
         self.new_user_pwd_var = tk.StringVar()
@@ -9243,7 +9433,12 @@ class CCTVToolkitApp:
                                   values=AdditionalUsersDataManager.ROLES, state='readonly', width=12)
         role_combo.pack(side=tk.LEFT, padx=(0, 8))
 
-        ttk.Button(users_controls, text="Add User", command=self.add_additional_user).pack(side=tk.LEFT, padx=3)
+        self._add_user_btn = ttk.Button(users_controls, text="Add User", command=self.add_additional_user)
+        self._add_user_btn.pack(side=tk.LEFT, padx=3)
+        # v5.2.1 — shown only while a double-clicked user is loaded for editing.
+        self._cancel_user_edit_btn = ttk.Button(users_controls, text="Cancel Edit",
+                                                command=self._cancel_additional_user_edit)
+        self._editing_user_idx = None
         ttk.Button(users_controls, text="Delete Selected", command=self.delete_additional_user).pack(side=tk.LEFT, padx=3)
         ttk.Button(users_controls, text="Clear All", command=self.clear_additional_users).pack(side=tk.LEFT, padx=3)
 
@@ -9267,6 +9462,9 @@ class CCTVToolkitApp:
         self.users_tree.configure(yscrollcommand=users_scroll.set)
         self.users_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         users_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        # v5.2.1 — double-click a user to load it into the row below and edit.
+        self.users_tree.bind('<Double-1>', self._edit_additional_user)
+        users_frame.bind_all('<Escape>', lambda e: self._cancel_additional_user_edit(), add='+')
 
         self.refresh_additional_users_list()
 
@@ -9509,21 +9707,26 @@ class CCTVToolkitApp:
     ]
 
     def create_status_tab(self):
-        """Live programming status: banner, checklist, log."""
-        frame = ttk.Frame(self.status_tab, padding="15")
-        frame.pack(fill=tk.BOTH, expand=True)
+        """Live programming status: banner, checklist, log.
+        v5.2.1 — parented to root, not the tab, so _mount_status_view() can
+        show this same view in Setup Step 6 as well as here."""
+        frame = ttk.Frame(self.root, padding="15")
+        self._status_view = frame
+        frame.pack(in_=self.status_tab, fill=tk.BOTH, expand=True)
 
         # ---- Big banner ----
         # v4.5.1-beta2: bumped fonts so the wizard banner is legible
         # from across the room. Brian's training-room ask 2026-05-05.
         self._status_banner_frame = tk.Frame(frame, bg='#9E9E9E', padx=20, pady=22)
         self._status_banner_frame.pack(fill=tk.X)
+        # v5.2.1 — idle said "READY", which read as "ready for a camera".
+        # Nothing is running here; a run shows PLUG IN CAMERA when it wants one.
         self._status_banner_label = tk.Label(self._status_banner_frame,
-            text="READY", bg='#9E9E9E', fg='white',
+            text="NOT RUNNING", bg='#9E9E9E', fg='white',
             font=('Helvetica', 42, 'bold'))
         self._status_banner_label.pack()
         self._status_banner_sub = tk.Label(self._status_banner_frame,
-            text="Start a programming run from the Operations tab.",
+            text="Nothing is being programmed. Pick an operation in Step 5 to start.",
             bg='#9E9E9E', fg='white', font=('Helvetica', 18, 'bold'))
         self._status_banner_sub.pack(pady=(6, 0))
 
@@ -12615,6 +12818,38 @@ class CCTVToolkitApp:
             self.users_tree.insert('', tk.END, values=(u['username'], u['password'], u['role']))
         self.additional_users_status.set(f"{len(users)} additional user{'s' if len(users) != 1 else ''}")
 
+    def _edit_additional_user(self, event):
+        """v5.2.1 — double-click: load that user into the Username / Password /
+        Role row; 'Add User' becomes 'Save Changes' until saved or cancelled."""
+        row = self.users_tree.identify_row(event.y)
+        if not row:
+            return
+        idx = self.users_tree.index(row)
+        users = self.additional_users_data.get_all()
+        if not (0 <= idx < len(users)):
+            return
+        u = users[idx]
+        self._editing_user_idx = idx
+        self.new_user_name_var.set(u['username'])
+        self.new_user_pwd_var.set(u['password'])
+        self.new_user_role_var.set(u['role'])
+        self._add_user_btn.configure(text="Save Changes")
+        if not self._cancel_user_edit_btn.winfo_manager():
+            self._cancel_user_edit_btn.pack(side=tk.LEFT, padx=3, after=self._add_user_btn)
+        self.additional_users_status.set(f"Editing '{u['username']}' — Save Changes, or Esc to cancel")
+        self._user_name_entry.focus_set()
+        self._user_name_entry.select_range(0, tk.END)
+
+    def _cancel_additional_user_edit(self):
+        if getattr(self, '_editing_user_idx', None) is None:
+            return
+        self._editing_user_idx = None
+        self.new_user_name_var.set("")
+        self.new_user_pwd_var.set("")
+        self._add_user_btn.configure(text="Add User")
+        self._cancel_user_edit_btn.pack_forget()
+        self.refresh_additional_users_list()
+
     def add_additional_user(self):
         name = self.new_user_name_var.get().strip()
         pwd = self.new_user_pwd_var.get().strip()
@@ -12624,6 +12859,15 @@ class CCTVToolkitApp:
             return
         if not pwd:
             messagebox.showwarning("Required", "Password is required.")
+            return
+        idx = getattr(self, '_editing_user_idx', None)
+        if idx is not None:
+            old = self.additional_users_data.get_all()[idx]['username']
+            if self.additional_users_data.update(idx, name, pwd, role):
+                self._cancel_additional_user_edit()
+                self.log(f"Updated additional user: {old} -> {name} ({role})")
+            else:
+                messagebox.showwarning("Duplicate", f"Another user is already named '{name}'.")
             return
         if self.additional_users_data.add(name, pwd, role):
             self.new_user_name_var.set("")
@@ -12637,11 +12881,13 @@ class CCTVToolkitApp:
         selected = self.users_tree.selection()
         if selected:
             idx = self.users_tree.index(selected[0])
+            self._cancel_additional_user_edit()  # row indexes are about to shift
             self.additional_users_data.delete(idx)
             self.refresh_additional_users_list()
 
     def clear_additional_users(self):
         if messagebox.askyesno("Confirm", "Delete ALL additional users?"):
+            self._cancel_additional_user_edit()
             self.additional_users_data.clear()
             self.refresh_additional_users_list()
 
@@ -14742,8 +14988,10 @@ https://buymeacoffee.com/thelostping""")
             # we matched the cam by MAC at the start, so it's mode-gated.
             used_steps.append('verify_mac')
 
-        # Switch to status tab and prep the UI
-        self.notebook.select(self.status_tab)
+        # Show the live status (Setup Step 6 — the wizard's own status step)
+        # and prep the UI
+        self.notebook.select(self.setup_tab)
+        self._setup_goto(len(self._setup_steps_meta) - 1)
         self.cancel_flag = False
         self.enable_cancel(True)
         self.status_enable_cancel(True)
