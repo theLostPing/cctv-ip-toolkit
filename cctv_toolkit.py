@@ -3007,9 +3007,18 @@ class BoschProtocol(CameraProtocol):
                     ok = False
         # Verify rather than trust the ack — a wrong-typed RCP write returns
         # OK without changing anything (see the note above this class).
-        if ok and not self.test_password(ip, BOSCH_DEFAULT_USER, password):
-            ok = False
-        return ok
+        # v5.2.1 — and verify the RESULT, with a few seconds' grace, instead of
+        # the write's reply: the camera applies a new password asynchronously.
+        # 2026-09-28 a factory Bosch logged "✗ Setting password failed" on a
+        # password that had in fact taken (the next writes authenticated with
+        # it five seconds later).
+        deadline = time.time() + 10
+        while True:
+            if self.test_password(ip, BOSCH_DEFAULT_USER, password):
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(1)
 
     def set_network(self, ip, password, new_ip, subnet, gateway):
         # Same ordering principle as Axis: do everything that DOESN'T move the
@@ -3217,20 +3226,29 @@ class BoschProtocol(CameraProtocol):
         # has the password for) could never get past the first step.
         existing_pwd = options.get('existing_pwd') if options else None
 
+        # v5.2.1 — the wizard splits steps into auth/network phases by keyword
+        # in the label ('network', 'ip', 'gateway', 'dhcp'). "Rebooting camera"
+        # matched none, so it ran in the AUTH phase — BEFORE set_network — and
+        # the new IP was written after the only reboot and never applied
+        # (Boss 2026-09-28: camera stayed on 10.0.0.47). The label now keeps it
+        # in the network phase, after set_network. Unit name is written at the
+        # CURRENT address (it used static_ip, which doesn't exist yet).
         steps = [
             ("Setting password via RCP",
              lambda: self.create_initial_user(ip, password, existing_pwd=existing_pwd)),
-            ("Setting network via RCP",
-             lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
-            ("Rebooting camera",
-             lambda: self.reboot(ip, password)),
         ]
         if set_hostname:
             cam_number = cam.get('number', '1')
             serial = cam.get('serial', 'unknown')
             hostname = f"{cam_number}-bosch-{serial.lower()}"
             steps.append(("Setting unit name",
-                lambda: self.set_hostname(static_ip, password, hostname)))
+                lambda: self.set_hostname(ip, password, hostname)))
+        steps += [
+            ("Setting network via RCP",
+             lambda: self.set_network(ip, password, static_ip, subnet, gateway)),
+            ("Rebooting camera to apply the network settings",
+             lambda: self.reboot(ip, password)),
+        ]
         return steps
 
     def get_discovery_info(self, ip, timeout=2):
@@ -10617,8 +10635,13 @@ class CCTVToolkitApp:
             # factory-reset prompt and an 800-password walk it could never
             # pass (2026-09-28). Bosch has its own factory signal.
             if brand_key != 'axis':
+                # Also "ours": a Bosch that already takes THIS job's password
+                # (a run that stopped part-way) — program it, don't reset it.
                 try:
-                    fresh = brand_key == 'bosch' and BoschRCP.needs_initial_password(f['ip'])
+                    fresh = brand_key == 'bosch' and (
+                        BoschRCP.needs_initial_password(f['ip'])
+                        or (opts.get('password') and self.protocol.test_password(
+                            f['ip'], BOSCH_DEFAULT_USER, opts['password'])))
                 except Exception:
                     fresh = False
                 (already_clean if fresh else truly_used).append(f)
@@ -14541,7 +14564,11 @@ https://buymeacoffee.com/thelostping""")
                     brand_prefix = self.protocol.BRAND_KEY
                     cam_number = cam.get('number', str(programmed_count))
                     s = cam.get('serial', 'unknown')
-                    if s and s != 'UNKNOWN':
+                    # v5.2.1 — Bosch hides its serial on a locked camera; the MAC
+                    # we pinned is the same identifier Axis uses ("1-bosch-unknown").
+                    if (not s or s.upper() == 'UNKNOWN') and pinned_mac:
+                        s = pinned_mac.replace(':', '').replace('-', '')
+                    if s and s.upper() != 'UNKNOWN':
                         hostname = f"{cam_number}-{brand_prefix}-{s.lower()}"
                     else:
                         hostname = f"{cam_number}-{brand_prefix}-unknown"
@@ -14953,6 +14980,29 @@ https://buymeacoffee.com/thelostping""")
             opts['interface'] = session_iface
         else:
             selected_iface = opts.get('interface')
+
+        # v5.2.1 — confirming a camera at its NEW address needs a route to that
+        # subnet, and auto multi-home was only switched on for Switch Loading.
+        # A normal run programming onto a subnet this PC isn't on (Boss
+        # 10.0.7.11 -> 10.206.195.x, 2026-09-28) could only time out at
+        # "Waiting for camera at <new IP>". Switch it on whenever a target
+        # subnet is unreachable — _offer_multihome still asks first.
+        if not opts.get('auto_multihome'):
+            try:
+                if any(not _have_route_to(s['gateway']) for s in _unique_camera_subnets(cameras)):
+                    opts['auto_multihome'] = True
+            except Exception:
+                pass
+        # ...and on Auto-detect, use the port Auto-detect picks instead of
+        # tripping the hard gate below.
+        if opts.get('auto_multihome') and not selected_iface:
+            _idx = self._get_interface_index()
+            _st = _iface_ipv4_state(_idx) if _idx else {'up': None, 'addrs': []}
+            _ip0 = next((a['ip'] for a in _st['addrs'] if a['state'] == 'Preferred'), '')
+            if _st['up'] and _ip0:
+                selected_iface = {'index': _idx, 'ip': _ip0,
+                                  'label': f"auto-detected port #{_idx} ({_ip0})"}
+                opts['interface'] = selected_iface
 
         # HARD GATE — Auto multi-home requires a specific interface. Without
         # one, set_network would write the camera's new IP and then have no
@@ -16289,7 +16339,11 @@ https://buymeacoffee.com/thelostping""")
                     brand_prefix = self.protocol.BRAND_KEY
                     cam_number = cam.get('number', str(programmed_count))
                     s = cam.get('serial', 'unknown')
-                    if s and s != 'UNKNOWN':
+                    # v5.2.1 — Bosch hides its serial on a locked camera; the MAC
+                    # we pinned is the same identifier Axis uses ("1-bosch-unknown").
+                    if (not s or s.upper() == 'UNKNOWN') and pinned_mac:
+                        s = pinned_mac.replace(':', '').replace('-', '')
+                    if s and s.upper() != 'UNKNOWN':
                         hostname = f"{cam_number}-{brand_prefix}-{s.lower()}"
                     else:
                         hostname = f"{cam_number}-{brand_prefix}-unknown"
