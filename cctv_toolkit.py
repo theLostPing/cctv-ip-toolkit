@@ -10610,7 +10610,19 @@ class CCTVToolkitApp:
         # the wizard's auth-fallback handles them.
         already_clean = []
         truly_used = []
+        brand_key = getattr(self.protocol, 'BRAND_KEY', 'axis')
         for f in found:
+            # v5.2.1 — the probes below are axis-cgi only, so every Bosch
+            # counted as "previously configured": a factory-fresh Bosch got a
+            # factory-reset prompt and an 800-password walk it could never
+            # pass (2026-09-28). Bosch has its own factory signal.
+            if brand_key != 'axis':
+                try:
+                    fresh = brand_key == 'bosch' and BoschRCP.needs_initial_password(f['ip'])
+                except Exception:
+                    fresh = False
+                (already_clean if fresh else truly_used).append(f)
+                continue
             try:
                 r1 = requests.post(
                     f"http://{f['ip']}/axis-cgi/basicdeviceinfo.cgi",
@@ -10632,6 +10644,11 @@ class CCTVToolkitApp:
             self.log(f"Pre-flight: {len(already_clean)} camera(s) already factory-clean — no reset prompt needed:")
             for f in already_clean:
                 self.log(f"  ✓ {f['ip']}  MAC {f['mac']}  ({f.get('model', '?')})  — will be programmed as fresh")
+            # v5.2.1 — hand these straight to the wait loop. A non-Axis camera
+            # on a DHCP lease (Bosch on the office LAN) is invisible to every
+            # wait-loop path unless it reboots, so it waited forever in view.
+            if brand_key != 'axis':
+                self._preflight_clean_cams = list(already_clean)
         found = truly_used
 
         if not found:
@@ -10670,6 +10687,10 @@ class CCTVToolkitApp:
             if f.get('working_pwd') is not None:
                 working_pwd = f['working_pwd']
                 self.log(f"  {f['ip']}: reusing pwd from smart-pass auth")
+            elif brand_key != 'axis':
+                # v5.2.1 — the saved-password walk speaks axis-cgi only.
+                self.log(f"  {f['ip']}: saved-password check is Axis-only — asking you")
+                working_pwd = None
             else:
                 self.log(f"  {f['ip']}: walking saved passwords for auth…")
                 working_pwd = self._find_working_password(f['ip'], known_mac=f.get('mac'))
@@ -15017,6 +15038,7 @@ https://buymeacoffee.com/thelostping""")
         self.notebook.select(self.setup_tab)
         self._setup_goto(len(self._setup_steps_meta) - 1)
         self._brand_verdicts = {}  # fresh per run (see _wrong_brand)
+        self._preflight_clean_cams = []
         self.cancel_flag = False
         self.enable_cancel(True)
         self.status_enable_cancel(True)
@@ -15154,6 +15176,24 @@ https://buymeacoffee.com/thelostping""")
                 _wait_start = time.time()
                 _last_heartbeat = _wait_start
                 while not self.cancel_flag:
+                    # v5.2.1 — a factory-clean camera the pre-flight sweep
+                    # already found goes first (see _preflight_clean_cams).
+                    _handoff = None
+                    for pc in list(getattr(self, '_preflight_clean_cams', None) or []):
+                        pc_mac = (pc.get('mac') or '').upper().replace(':', '').replace('-', '')
+                        if pc_mac and pc_mac in seen_macs:
+                            continue
+                        if self._wrong_brand(pc.get('mac', ''), pc.get('ip', '')):
+                            continue
+                        if pc.get('ip') and self.ping_camera(pc['ip'], timeout_ms=1000):
+                            _handoff = pc
+                            break
+                    if _handoff:
+                        self._preflight_clean_cams.remove(_handoff)
+                        camera_ip = _handoff['ip']
+                        pinned_mac = _handoff.get('mac', '')
+                        self.status_log(f"Camera (pre-flight sweep): {camera_ip}  MAC {pinned_mac}")
+                        break
                     # v4.6.0b8 — FASTEST path: the bundled DHCP server itself
                     # is the authoritative source of "camera just grabbed the
                     # lease". `lease_active` flips True the instant the
