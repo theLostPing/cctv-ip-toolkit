@@ -71,7 +71,7 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "5.2.0"
+APP_VERSION = "5.2.1"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -13421,6 +13421,19 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "5.2.1": (
+            "What's new in v5.2.1",
+            [
+                "• Bosch and Hanwha jobs no longer grab Axis gear (like an Axis speaker) as the camera.",
+                "• The temporary address the toolkit adds can now actually reach the camera.",
+                "• After adding it, Step 2 checks it really works and tells you.",
+                "• Step 2 says when a port has no cable, instead of 'different subnet'.",
+                "• Step 6 shows the live programming progress right in the wizard.",
+                "• 'Back to wizard' is now at the bottom right of every tools page.",
+                "• When nothing is running, the status says NOT RUNNING instead of READY.",
+                "• Double-click an extra user to edit it.",
+            ],
+        ),
         "5.2.0": (
             "What's new in v5.2.0",
             [
@@ -13717,7 +13730,9 @@ Email: axisprogrammer@thelostping.net
         """Show the release notes for a specific version (default: current APP_VERSION).
         Called automatically on first launch of a new version; also available from Help menu."""
         v = version or APP_VERSION
-        entry = self.WHATS_NEW.get(v)
+        # Beta builds run as e.g. "5.2.1b1.997e304" — fall back to "5.2.1".
+        entry = (self.WHATS_NEW.get(v)
+                 or self.WHATS_NEW.get('.'.join(str(n) for n in self._version_tuple(v))))
         if not entry:
             messagebox.showinfo("What's New",
                                 f"No local release notes for v{v}.\n\nFull changelog on GitHub:\n{GITHUB_RELEASES_PAGE}")
