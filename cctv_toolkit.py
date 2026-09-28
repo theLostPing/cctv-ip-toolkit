@@ -32,7 +32,7 @@ from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
 import threading
 import time
 import requests
-from requests.auth import HTTPDigestAuth
+from requests.auth import HTTPDigestAuth, HTTPBasicAuth
 # Cameras ship self-signed certs, so every HTTPS probe we make is verify=False.
 # Without this the console fills with InsecureRequestWarning on each one.
 try:
@@ -1508,66 +1508,109 @@ class AxisDHCPDiscovery:
 # BOSCH RCP-OVER-HTTP HELPER
 # ============================================================================
 class BoschRCP:
-    """Static helper for Bosch RCP (Remote Control Protocol) over HTTP.
-    Bosch cameras expose /rcp.xml for reading and writing configuration."""
+    """Static helper for Bosch RCP (Remote Control Protocol) over HTTP(S).
+    Bosch cameras expose /rcp.xml for reading and writing configuration.
+
+    v5.2.1 — rebuilt after the first real Bosch programming run (Boss,
+    2026-09-28, hw F000B643 / sw 23500784), where every authenticated call
+    had silently gone out anonymous:
+      * /rcp.xml never sends an HTTP auth challenge. It answers 200 with
+        <auth>0</auth><err>0x60</err>, and requests' HTTPDigestAuth only sends
+        credentials AFTER a 401 challenge — so nothing ever logged in.
+      * Basic credentials are honoured over HTTPS (<auth>2</auth>) and ignored
+        over plain HTTP. HTTPS + pre-emptive Basic first; plain HTTP (with
+        Digest, the old behaviour) only as a fallback for firmware without it.
+      * The reply's <auth> level is the only proof of a login: public
+        registers (IP, MAC, versions) read fine anonymously.
+      * Types matter and a wrong one errors (0x60) or is silently ignored:
+        unit name is P_UNICODE (hex UTF-16BE, NUL-terminated — the camera's
+        own UI sends 'test' as 0x00740065007300740000), DHCP is T_OCTET, MAC
+        is P_OCTET, reboot is F_FLAG 1 (all taken from the camera's rcp.js)."""
 
     @staticmethod
-    def rcp_read(ip, cmd_hex, rcp_type='P_STRING', auth=None, timeout=3, scheme='http'):
-        """Read a value from a Bosch camera via RCP-over-HTTP.
-        rcp_type: P_STRING, T_DWORD, T_OCTET
-        scheme: 'http' or 'https' — newer firmware can be HTTPS-only.
-        Returns parsed value string, or None on error."""
-        try:
-            params = {
-                'command': f'0x{cmd_hex:04x}',
-                'type': rcp_type,
-                'direction': 'READ',
-                'num': '1',
-            }
-            kwargs = {'timeout': timeout}
-            if scheme == 'https':
+    def unicode_payload(text):
+        """'test' -> '0x00740065007300740000' (P_UNICODE write payload)."""
+        return '0x' + ''.join(f'{ord(c):04X}' for c in text) + '0000'
+
+    @staticmethod
+    def _request(ip, params, auth=None, timeout=5, scheme=None):
+        """One RCP round-trip. Returns (reply_text, auth_level) or (None, 0).
+        scheme None = HTTPS first, then HTTP. A blank password sends no
+        credentials (factory-fresh cameras take their first password write
+        anonymously)."""
+        creds = auth if (auth and auth[1]) else None
+        for sch in ([scheme] if scheme else ['https', 'http']):
+            kwargs = {'params': params, 'timeout': timeout}
+            if sch == 'https':
                 kwargs['verify'] = False
-            if auth:
-                kwargs['auth'] = HTTPDigestAuth(auth[0], auth[1])
-            r = requests.get(f'{scheme}://{ip}/rcp.xml', params=params, **kwargs)
-            if r.status_code != 200:
+                if creds:
+                    kwargs['auth'] = HTTPBasicAuth(creds[0], creds[1])
+            elif creds:
+                kwargs['auth'] = HTTPDigestAuth(creds[0], creds[1])
+            try:
+                r = requests.get(f'{sch}://{ip}/rcp.xml', **kwargs)
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError):
+                continue
+            except Exception:
+                return None, 0
+            if r.status_code != 200 or '<rcp>' not in r.text:
+                continue
+            m = re.search(r'<auth>\s*(\d+)\s*</auth>', r.text)
+            return r.text, (int(m.group(1)) if m else 0)
+        return None, 0
+
+    @staticmethod
+    def auth_level(ip, auth, timeout=4):
+        """The login level the camera grants these credentials (0 = none).
+        Uses a public register, so the answer is about the login alone."""
+        text, level = BoschRCP._request(
+            ip, {'command': f"0x{RCP_CMD['hw_ver']:04x}", 'type': 'P_STRING',
+                 'direction': 'READ', 'num': '1'}, auth=auth, timeout=timeout)
+        return level if text else 0
+
+    @staticmethod
+    def rcp_read(ip, cmd_hex, rcp_type='P_STRING', auth=None, timeout=3, scheme=None, num=1):
+        """Read a value from a Bosch camera via RCP.
+        rcp_type: P_STRING, P_UNICODE (-> str), P_OCTET (-> '00 07 5f ...'),
+        T_DWORD / T_OCTET / T_WORD / F_FLAG (-> int).
+        scheme: None = HTTPS then HTTP; 'http'/'https' to pin one.
+        Returns the parsed value, or None on error."""
+        try:
+            text, _level = BoschRCP._request(
+                ip, {'command': f'0x{cmd_hex:04x}', 'type': rcp_type,
+                     'direction': 'READ', 'num': str(num)},
+                auth=auth, timeout=timeout, scheme=scheme)
+            if not text or re.search(r'<err>', text):
                 return None
-            text = r.text
-            # Check for error
-            err_m = re.search(r'<err>(0x[0-9a-fA-F]+)</err>', text)
-            if err_m:
-                return None
-            # Parse based on type
-            if rcp_type == 'P_STRING':
+            if rcp_type in ('P_STRING', 'P_OCTET'):
                 m = re.search(r'<str>([^<]*)</str>', text)
                 return m.group(1).strip() if m else None
-            elif rcp_type == 'T_DWORD':
-                m = re.search(r'<dec>(\d+)</dec>', text)
-                return int(m.group(1)) if m else None
-            elif rcp_type == 'T_OCTET':
+            if rcp_type == 'P_UNICODE':
                 m = re.search(r'<str>([^<]*)</str>', text)
-                return m.group(1).strip() if m else None
-            return None
+                if not m:
+                    return None
+                raw = bytes(int(b, 16) for b in m.group(1).split())
+                return raw.decode('utf-16-be', errors='ignore').split('\x00')[0]
+            m = re.search(r'<result>.*?<dec>\s*(\d+)\s*</dec>', text, re.S)
+            return int(m.group(1)) if m else None
         except Exception:
             return None
 
     @staticmethod
     def rcp_write(ip, cmd_hex, rcp_type, payload, auth, timeout=5, num=1):
-        """Write a value to a Bosch camera via RCP-over-HTTP.
-        auth: (username, password) tuple. num: RCP instance number. Returns True on success."""
+        """Write a value to a Bosch camera via RCP. auth: (user, password).
+        True only when the camera took it: no <err>, and — when credentials
+        were given — the reply shows it actually logged us in."""
         try:
-            params = {
-                'command': f'0x{cmd_hex:04x}',
-                'type': rcp_type,
-                'direction': 'WRITE',
-                'num': str(num),
-                'payload': str(payload),
-            }
-            r = requests.get(f'http://{ip}/rcp.xml', params=params,
-                             auth=HTTPDigestAuth(auth[0], auth[1]), timeout=timeout)
-            if r.status_code != 200:
+            if rcp_type == 'P_UNICODE' and not str(payload).startswith('0x'):
+                payload = BoschRCP.unicode_payload(str(payload))
+            text, level = BoschRCP._request(
+                ip, {'command': f'0x{cmd_hex:04x}', 'type': rcp_type,
+                     'direction': 'WRITE', 'num': str(num), 'payload': str(payload)},
+                auth=auth, timeout=timeout)
+            if not text or re.search(r'<err>', text):
                 return False
-            if re.search(r'<err>', r.text):
+            if auth and auth[1] and level == 0:
                 return False
             return True
         except Exception:
@@ -1709,10 +1752,10 @@ class BoschRCP:
         val = BoschRCP.rcp_read(ip, RCP_CMD['gateway'], 'P_STRING', timeout=timeout, scheme=scheme)
         if val:
             config['gateway'] = val
-        val = BoschRCP.rcp_read(ip, RCP_CMD['dhcp'], 'T_DWORD', timeout=timeout, scheme=scheme)
+        val = BoschRCP.rcp_read(ip, RCP_CMD['dhcp'], 'T_OCTET', timeout=timeout, scheme=scheme)
         if val is not None:
-            config['dhcp'] = 'Yes' if val == 1 else 'No'
-        val = BoschRCP.rcp_read(ip, RCP_CMD['mac'], 'T_OCTET', timeout=timeout, scheme=scheme)
+            config['dhcp'] = 'Yes' if val else 'No'   # factory reads 3, off = 0
+        val = BoschRCP.rcp_read(ip, RCP_CMD['mac'], 'P_OCTET', timeout=timeout, scheme=scheme)
         if val:
             # MAC comes as "00 07 5f 9c 9e 75 " — normalize to colon-separated
             parts = val.split()
@@ -3012,9 +3055,12 @@ class BoschProtocol(CameraProtocol):
         # 2026-09-28 a factory Bosch logged "✗ Setting password failed" on a
         # password that had in fact taken (the next writes authenticated with
         # it five seconds later).
+        # A factory-fresh camera logs ANY password in, so "our password works"
+        # proves nothing until the camera also REJECTS a wrong one.
         deadline = time.time() + 10
         while True:
-            if self.test_password(ip, BOSCH_DEFAULT_USER, password):
+            if (self.test_password(ip, BOSCH_DEFAULT_USER, password)
+                    and not self.test_password(ip, BOSCH_DEFAULT_USER, password + '#wrong')):
                 return True
             if time.time() >= deadline:
                 return False
@@ -3026,40 +3072,40 @@ class BoschProtocol(CameraProtocol):
         # then IP last. RCP is connectionless on UDP so the IP change doesn't
         # tear down a TCP session — but the camera still drops off the L2 with
         # the old ARP, so callers should re-resolve.
+        #
+        # v5.2.1 — every value is written AND read back. The camera holds the
+        # new values without applying them until a reboot (the reboot step
+        # follows this one), so the read-back sees what we wrote. DHCP is a
+        # T_OCTET on current firmware (factory value 3, off = 0); T_DWORD
+        # errors. Proven 2026-09-28: write + read-back + F_FLAG reboot moved a
+        # camera from DHCP 10.0.0.47 to static 10.206.195.3 in ~31 s.
         auth = (BOSCH_DEFAULT_USER, password)
         ok = True
+        writes = []
         if gateway:
-            if not BoschRCP.rcp_write(ip, RCP_CMD['gateway'], 'P_STRING', gateway, auth):
-                ok = False
+            writes.append(('gateway', 'P_STRING', gateway))
         if subnet:
-            if not BoschRCP.rcp_write(ip, RCP_CMD['subnet'], 'P_STRING', subnet, auth):
+            writes.append(('subnet', 'P_STRING', subnet))
+        writes.append(('dhcp', 'T_OCTET', '0'))
+        writes.append(('ip', 'P_STRING', new_ip))   # IP last — see above
+        for key, typ, value in writes:
+            if not BoschRCP.rcp_write(ip, RCP_CMD[key], typ, value, auth):
                 ok = False
-        # DHCP off — note T_DWORD typing here, the dhcp command doesn't take a
-        # P_STRING despite "0"/"1" looking like strings. Tried that. RCP acks
-        # it but does nothing.
-        #
-        # This result used to be discarded. If the write failed, set_network
-        # still reported success and the camera stayed on DHCP — so it took
-        # the static IP right up until the next lease renewal or power cycle,
-        # then "forgot" it. Check the ack AND read the value back, because a
-        # wrong-typed write acks OK without writing anything.
-        if not BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_DWORD', '0', auth):
-            ok = False
-        else:
-            readback = BoschRCP.rcp_read(ip, RCP_CMD['dhcp'], 'T_DWORD', auth=auth)
-            if readback is not None and readback != 0:
+                continue
+            readback = BoschRCP.rcp_read(ip, RCP_CMD[key], typ, auth=auth)
+            if readback is None or str(readback) != str(value):
                 ok = False
-        # IP last — see above for why
-        if not BoschRCP.rcp_write(ip, RCP_CMD['ip'], 'P_STRING', new_ip, auth):
-            ok = False
         return ok
 
     def set_hostname(self, ip, password, hostname):
         # Bosch calls hostname "unit name" because RCP predates DNS-everywhere
         # conventions. It DOES end up being the camera's announced hostname on
         # the network though, so set it the same way you would a real hostname.
+        # v5.2.1 — P_UNICODE (P_STRING errors) + read-back.
         auth = (BOSCH_DEFAULT_USER, password)
-        return BoschRCP.rcp_write(ip, RCP_CMD['unit_name'], 'P_STRING', hostname, auth) or False
+        if not BoschRCP.rcp_write(ip, RCP_CMD['unit_name'], 'P_UNICODE', hostname, auth):
+            return False
+        return BoschRCP.rcp_read(ip, RCP_CMD['unit_name'], 'P_UNICODE', auth=auth) == hostname
 
     def reboot(self, ip, password):
         # Bosch took two firmware revs to settle on the right TYPE for the
@@ -3105,7 +3151,7 @@ class BoschProtocol(CameraProtocol):
         # Same T_DWORD typing gotcha as set_network — do not pass strings here.
         auth = (BOSCH_DEFAULT_USER, password)
         payload = '1' if enable else '0'
-        return BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_DWORD', payload, auth) or False
+        return BoschRCP.rcp_write(ip, RCP_CMD['dhcp'], 'T_OCTET', payload, auth) or False
 
     def get_serial(self, ip, password):
         # Bosch doesn't expose a serial number over RCP the way Axis does
@@ -3113,7 +3159,7 @@ class BoschProtocol(CameraProtocol):
         # is also engraved on the box. We dehyphenate it and pretend that's
         # the serial — it's unique per camera and that's what matters for
         # the report. T_OCTET is byte-level, comes back as space-separated hex.
-        mac = BoschRCP.rcp_read(ip, RCP_CMD['mac'], 'T_OCTET')
+        mac = BoschRCP.rcp_read(ip, RCP_CMD['mac'], 'P_OCTET')
         if mac:
             parts = mac.split()
             if len(parts) >= 6:
@@ -3167,12 +3213,14 @@ class BoschProtocol(CameraProtocol):
         return None
 
     def test_password(self, ip, username, password):
-        # Reading unit_name is cheap and won't lock the account on a wrong pw.
-        # Don't use anything that writes — Bosch's lockout logic is aggressive
-        # if you fat-finger the service password too many times.
-        result = BoschRCP.rcp_read(ip, RCP_CMD['unit_name'], 'P_STRING',
-                                   auth=(username, password))
-        return result is not None
+        # A READ is cheap and won't lock the account on a wrong pw. Don't use
+        # anything that writes — Bosch's lockout logic is aggressive if you
+        # fat-finger the service password too many times.
+        # v5.2.1 — the old test read unit_name as P_STRING, which errors on
+        # current firmware whatever the password, AND was sent anonymously
+        # (see BoschRCP) — so it could never pass. The login level in the
+        # reply is the real answer.
+        return BoschRCP.auth_level(ip, (username, password)) > 0
 
     def change_password(self, ip, username, old_pwd, new_pwd):
         # Same three-tier walk as create_initial_user. Use auth = (service, old)
@@ -3192,8 +3240,13 @@ class BoschProtocol(CameraProtocol):
         # respects the 'preserve network' flag if the camera supports it
         # (firmware-dependent, FLEXIDOME 7000 series and up). HTTP /reset is
         # a sledgehammer that wipes everything; that's our fallback.
+        # v5.2.1 — F_FLAG, not T_DWORD. The T_DWORD write errors (0x60), and
+        # the /reset fallback below is a plain REBOOT on current firmware, so
+        # this used to "succeed" without resetting anything (2026-09-28: same
+        # password + unit name after, and the camera fell into a ~110 s reboot
+        # cycle). F_FLAG 1 wiped it and it was back on DHCP in ~30 s.
         auth = (BOSCH_DEFAULT_USER, password)
-        if BoschRCP.rcp_write(ip, RCP_CMD['factory_reset'], 'T_DWORD', '1', auth, timeout=10):
+        if BoschRCP.rcp_write(ip, RCP_CMD['factory_reset'], 'F_FLAG', '1', auth, timeout=10):
             return True
         # Same reachability guard as reboot(): claiming a camera was wiped when
         # it was simply unplugged is the worst false positive in the toolkit.
@@ -13485,6 +13538,11 @@ Email: axisprogrammer@thelostping.net
         "5.2.1": (
             "What's new in v5.2.1",
             [
+                "• Bosch cameras now program for real: password, name and new IP all checked on the camera.",
+                "• Bosch factory reset actually resets the camera.",
+                "• A brand-new Bosch sitting on the network is found and programmed without a reset prompt.",
+                "• Auto-detect skips network ports with no cable.",
+                "• The wizard can check a camera on its new IP even when that's a different subnet (it asks first).",
                 "• Bosch and Hanwha jobs no longer grab Axis gear (like an Axis speaker) as the camera.",
                 "• The temporary address the toolkit adds can now actually reach the camera.",
                 "• After adding it, Step 2 checks it really works and tells you.",
@@ -14522,7 +14580,7 @@ https://buymeacoffee.com/thelostping""")
                         self.log("      ✓ Done.")
                     else:
                         self.log(f"      ✗ {desc} failed")
-                        errors.append(desc.lower().split()[0])
+                        errors.append(desc.split(' via ')[0].lower())
                 if self.cancel_flag:
                     self.log("Cancelled by user — bailing wizard.")
                     break
@@ -14598,7 +14656,7 @@ https://buymeacoffee.com/thelostping""")
                         self.log("      ✓ Done.")
                     else:
                         self.log(f"      ✗ {desc} failed")
-                        errors.append(desc.lower().split()[0])
+                        errors.append(desc.split(' via ')[0].lower())
                 if self.cancel_flag:
                     self.log("Cancelled by user — bailing wizard.")
                     break
@@ -16271,7 +16329,7 @@ https://buymeacoffee.com/thelostping""")
                                                 self.status_log("    ✓ Done.")
                                             else:
                                                 self.status_log(f"    ✗ {d3} failed")
-                                                errors.append(d3.lower().split()[0])
+                                                errors.append(d3.split(' via ')[0].lower())
                                                 auth_ok = False
                                         network_steps[:] = [
                                             (d2, f2) for (d2, f2) in new_steps
@@ -16294,7 +16352,7 @@ https://buymeacoffee.com/thelostping""")
                         if last_err:
                             self.status_log(f"      [debug] {last_err}")
                             self.protocol._last_create_user_error = None
-                        errors.append(desc.lower().split()[0])
+                        errors.append(desc.split(' via ')[0].lower())
                         auth_ok = False
                 _ui(self.status_set_step, 'auth', 'ok' if auth_ok else 'fail')
                 if self.cancel_flag:
@@ -16387,7 +16445,7 @@ https://buymeacoffee.com/thelostping""")
                         self.status_log("    ✓ Done.")
                     else:
                         self.status_log(f"    ✗ {desc} failed")
-                        errors.append(desc.lower().split()[0])
+                        errors.append(desc.split(' via ')[0].lower())
                         net_ok = False
                 _ui(self.status_set_step, 'network', 'ok' if net_ok else 'fail')
                 if self.cancel_flag:
@@ -16409,8 +16467,14 @@ https://buymeacoffee.com/thelostping""")
                 camera_reachable = False
                 self.status_log(f"Waiting for camera at {static_ip}...")
                 time.sleep(3)
+                # v5.2.1 — real seconds. This counted LOOPS as seconds, and each
+                # loop is a ping timeout + an HTTP probe + a sleep, so "60s" took
+                # 8.5 minutes on Boss (2026-09-28). 180 s wall clock covers a
+                # Bosch (~30 s to come back) and a slow Axis with margin.
+                _vo_start = time.time()
+                _vo_next_note = 15
                 wait_count = 0
-                while not self.cancel_flag and wait_count < 60:
+                while not self.cancel_flag and time.time() - _vo_start < 180:
                     if self.ping_camera(static_ip, timeout_ms=1500):
                         camera_reachable = True
                         break
@@ -16422,10 +16486,11 @@ https://buymeacoffee.com/thelostping""")
                             break
                     except Exception:
                         pass
-                    wait_count += 1
-                    if wait_count % 10 == 0:
-                        self.status_log(f"  Still waiting... ({wait_count}s)")
+                    if time.time() - _vo_start >= _vo_next_note:
+                        self.status_log(f"  Still waiting... ({int(time.time() - _vo_start)}s)")
+                        _vo_next_note += 15
                     time.sleep(1)
+                wait_count = int(time.time() - _vo_start)
 
                 if self.cancel_flag:
                     break
