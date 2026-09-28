@@ -11272,18 +11272,27 @@ class CCTVToolkitApp:
         self._detected_iface_index = None  # numeric interface index for netsh
         self._detected_local_ip = None
 
-        # Get factory IP for subnet matching
-        try:
-            factory_ip = self.settings.get('general', 'factory_ip') if hasattr(self, 'settings') else '192.168.0.90'
-        except:
-            factory_ip = '192.168.0.90'
+        # Get factory IP for subnet matching. v5.2.1 — the ACTIVE brand's
+        # (settings 'factory_ip' is the Axis one; a Bosch job scored NICs
+        # against 192.168.0.90 instead of 192.168.0.1).
+        factory_ip = getattr(getattr(self, 'protocol', None), 'FACTORY_IP', '') or ''
+        if not factory_ip:
+            try:
+                factory_ip = self.settings.get('general', 'factory_ip') if hasattr(self, 'settings') else '192.168.0.90'
+            except:
+                factory_ip = '192.168.0.90'
 
         # --- Step 1: Get ALL IPv4 addresses via PowerShell (locale-independent) ---
         # Returns IP + PrefixLength + InterfaceIndex in one query.
         # We score candidates to pick the right adapter — not VPN/tunnel.
+        # v5.2.1 — also AddressState + alias: a static IP on an UNPLUGGED
+        # port stays listed (as Tentative) and used to win on subnet match,
+        # so Auto-detect ran the whole wizard on a dead USB adapter
+        # (2026-09-28, Dell dongle at 192.168.0.88/16 with no cable).
         try:
             cmd = ("Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | "
-                   "Select-Object IPAddress,PrefixLength,InterfaceIndex | "
+                   "Select-Object IPAddress,PrefixLength,InterfaceIndex,InterfaceAlias,"
+                   "@{n='State';e={[string]$_.AddressState}} | "
                    "ConvertTo-Json -Compress")
             result = subprocess.run(
                 ['powershell', '-NoProfile', '-Command', cmd],
@@ -11302,6 +11311,9 @@ class CCTVToolkitApp:
 
                     # Skip unsuitable addresses
                     if not ip or ip.startswith('127.') or ip.startswith('169.254.') or ip == '0.0.0.0':
+                        continue
+                    # v5.2.1 — no link (Tentative) / conflict (Duplicate) = unusable
+                    if (e.get('State') or 'Preferred') != 'Preferred':
                         continue
 
                     # Compute subnet mask from prefix length
@@ -11324,6 +11336,11 @@ class CCTVToolkitApp:
                     # Penalize CGNAT / Tailscale (100.64.0.0/10)
                     if ip_parts[0] == 100 and 64 <= ip_parts[1] <= 127:
                         score -= 50
+                    # v5.2.1 — virtual switches (WSL/Hyper-V/VM/VPN) tie a real
+                    # NIC on the "private IP" bonus; cameras are never there.
+                    if re.search(r'vEthernet|WSL|Hyper-V|VirtualBox|VMware|Tailscale|ZeroTier|Loopback|TAP-',
+                                 e.get('InterfaceAlias') or '', re.I):
+                        score -= 40
 
                     # Prefer private IPs
                     if ip_parts[0] == 192 and ip_parts[1] == 168:
@@ -15410,7 +15427,8 @@ https://buymeacoffee.com/thelostping""")
                         # Axis-OUI ARP/ANNOUNCE packets at the wire level.
                         if not camera_ip:
                             try:
-                                _l2_iface_idx = (selected_iface or {}).get('index')
+                                # v5.2.1 — Auto-detect has no selected_iface; use the detected one
+                                _l2_iface_idx = (selected_iface or {}).get('index') or self._get_interface_index()
                                 self.status_log(
                                     f"  [diag] L2 sniff starting (iface_idx={_l2_iface_idx})")
                                 l2_cams = AxisL2Discovery.discover(
@@ -17528,10 +17546,12 @@ https://buymeacoffee.com/thelostping""")
         idx = getattr(self, '_detected_iface_index', None)
         if idx is not None:
             return idx
-        # Check saved preference from settings
+        # Check saved preference from settings. v5.2.1 — only if that port
+        # still exists and has link; USB adapters/docks renumber (a saved 19
+        # pointed at nothing on Boss 2026-09-28).
         try:
             saved = self.settings.get('general', 'interface_index')
-            if saved:
+            if saved and _iface_ipv4_state(int(saved))['up']:
                 self._detected_iface_index = int(saved)
                 return self._detected_iface_index
         except:
