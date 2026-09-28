@@ -10363,6 +10363,11 @@ class CCTVToolkitApp:
         Costs ONE temporary alias per camera at its actual subnet, vs the dumb
         sweep's six. No NIC pollution for empty subnets."""
         out = []
+        # v5.2.1 — Axis mDNS + VAPIX password walk: on a Bosch/Hanwha job this
+        # can only ever find Axis gear (e.g. a C1004-E speaker on the LAN) and
+        # would try the whole password list against it. Axis jobs only.
+        if getattr(self.protocol, 'BRAND_KEY', 'axis') != 'axis':
+            return out
         try:
             mdns_cams = AxisMDNSDiscovery.discover(timeout=4)
         except Exception:
@@ -14149,6 +14154,8 @@ https://buymeacoffee.com/thelostping""")
                                     mc_mac = mc.get('mac', '').upper().replace(':', '').replace('-', '')
                                     if mc_mac and mc_mac in seen_macs:
                                         continue
+                                    if self._wrong_brand(mc.get('mac', ''), mc_ip):
+                                        continue
                                     if mc_ip and self.ping_camera(mc_ip, timeout_ms=1000):
                                         camera_ip = mc_ip
                                         pinned_mac = mc.get('mac', '')
@@ -14174,6 +14181,8 @@ https://buymeacoffee.com/thelostping""")
                                             self.add_linklocal_route()
                                         elif not self._ensure_route_to_camera(mc_ip):
                                             continue  # v4.4.7 — no route, operator declined or admin missing
+                                    if self._wrong_brand(mc.get('mac', ''), mc_ip):
+                                        continue
                                     if mc_ip and self.ping_camera(mc_ip, timeout_ms=1000):
                                         camera_ip = mc_ip
                                         pinned_mac = mc.get('mac', '')
@@ -14992,6 +15001,7 @@ https://buymeacoffee.com/thelostping""")
         # and prep the UI
         self.notebook.select(self.setup_tab)
         self._setup_goto(len(self._setup_steps_meta) - 1)
+        self._brand_verdicts = {}  # fresh per run (see _wrong_brand)
         self.cancel_flag = False
         self.enable_cancel(True)
         self.status_enable_cancel(True)
@@ -15327,6 +15337,8 @@ https://buymeacoffee.com/thelostping""")
                                     mc_mac = mc.get('mac', '').upper().replace(':', '').replace('-', '')
                                     if mc_mac and mc_mac in seen_macs:
                                         continue
+                                    if self._wrong_brand(mc.get('mac', ''), mc_ip):
+                                        continue
                                     if mc_ip and self.ping_camera(mc_ip, timeout_ms=1000):
                                         camera_ip = mc_ip
                                         pinned_mac = mc.get('mac', '')
@@ -15368,6 +15380,8 @@ https://buymeacoffee.com/thelostping""")
                                         self.add_linklocal_route()
                                     elif not self._ensure_route_to_camera(lc_ip):
                                         continue
+                                    if self._wrong_brand(lc.get('mac', ''), lc_ip):
+                                        continue
                                     if self.ping_camera(lc_ip, timeout_ms=1000):
                                         camera_ip = lc_ip
                                         pinned_mac = lc.get('mac', '')
@@ -15401,6 +15415,8 @@ https://buymeacoffee.com/thelostping""")
                                             self.add_linklocal_route()
                                         elif not self._ensure_route_to_camera(mc_ip):
                                             continue  # v4.4.7 — no route, operator declined or admin missing
+                                    if self._wrong_brand(mc.get('mac', ''), mc_ip):
+                                        continue
                                     if mc_ip and self.ping_camera(mc_ip, timeout_ms=1000):
                                         camera_ip = mc_ip
                                         pinned_mac = mc.get('mac', '')
@@ -15450,6 +15466,8 @@ https://buymeacoffee.com/thelostping""")
                                     if sc_ip.startswith('169.254.'):
                                         self.add_linklocal_route()
                                     elif not self._ensure_route_to_camera(sc_ip):
+                                        continue
+                                    if self._wrong_brand(sc_mac, sc_ip):
                                         continue
                                     if self.ping_camera(sc_ip, timeout_ms=1000):
                                         camera_ip = sc_ip
@@ -17411,6 +17429,43 @@ https://buymeacoffee.com/thelostping""")
         except:
             pass
         return False
+
+    def _wrong_brand(self, mac, ip=''):
+        """v5.2.1 — True when a device the wizard's wait loop just found is
+        NOT the selected brand. The link-local / L2 / mDNS / SSDP pickups are
+        Axis-built, so on a Bosch job they grabbed Axis gear: 2026-09-28 an
+        AXIS C1004-E speaker on the LAN got ARP-pinned as camera 1 of a Bosch
+        run. Axis jobs are untouched. Other brands: own MAC prefix = yes,
+        another brand's prefix = no, unknown = one probe in the brand's own
+        protocol. Verdicts are cached per run so a skipped device isn't
+        re-probed every loop."""
+        if getattr(self.protocol, 'BRAND_KEY', 'axis') == 'axis':
+            return False
+        norm = (mac or '').upper().replace(':', '').replace('-', '')
+        key = norm or ip
+        cache = self.__dict__.setdefault('_brand_verdicts', {})
+        if key in cache:
+            return cache[key]
+        mine = {bytes(o[:3]).hex().upper() for o in (getattr(self.protocol, 'MAC_OUIS', None) or [])}
+        others = {p.replace('-', '').upper() for p in AXIS_OUI_PREFIXES}
+        for bkey, cls in PROTOCOLS.items():
+            if bkey != self.protocol.BRAND_KEY:
+                others |= {bytes(o[:3]).hex().upper() for o in (getattr(cls, 'MAC_OUIS', None) or [])}
+        if len(norm) >= 6 and norm[:6] in mine:
+            wrong = False
+        elif len(norm) >= 6 and norm[:6] in others:
+            wrong = True
+        elif ip:
+            try:
+                wrong = not self.protocol.get_discovery_info(ip, timeout=2)
+            except Exception:
+                wrong = True
+        else:
+            wrong = True
+        cache[key] = wrong
+        if wrong:
+            self.status_log(f"  Skipping {ip or '?'} ({mac or 'no MAC'}) — not a {self.protocol.BRAND_NAME} camera")
+        return wrong
 
     def _get_interface_index(self):
         """Get the interface index for the active network adapter.
