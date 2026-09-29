@@ -10682,7 +10682,15 @@ class CCTVToolkitApp:
         already_clean = []
         truly_used = []
         brand_key = getattr(self.protocol, 'BRAND_KEY', 'axis')
+        # v5.2.1 — one entry per camera. The neighbor table can list the same
+        # IP on two interfaces, so one Bosch showed up as both "already
+        # factory-clean" AND "previously configured" (reset prompt) 2026-09-28.
+        _seen_found = set()
         for f in found:
+            _fk = (f.get('mac') or f.get('ip') or '').upper().replace(':', '').replace('-', '')
+            if _fk in _seen_found:
+                continue
+            _seen_found.add(_fk)
             # v5.2.1 — the probes below are axis-cgi only, so every Bosch
             # counted as "previously configured": a factory-fresh Bosch got a
             # factory-reset prompt and an 800-password walk it could never
