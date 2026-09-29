@@ -14635,7 +14635,7 @@ https://buymeacoffee.com/thelostping""")
                     if result:
                         self.log("      ✓ Done.")
                         cam['hostname'] = hostname
-                        cam['name'] = hostname
+                        # v5.2.1 — keep the CSV name (COF.01.121); hostname is its own field.
                     else:
                         self.log("      ✗ Hostname failed")
                         errors.append("hostname")
@@ -16409,7 +16409,7 @@ https://buymeacoffee.com/thelostping""")
                     if self.protocol.set_hostname(camera_ip, password, hostname):
                         self.status_log("    ✓ Done.")
                         cam['hostname'] = hostname
-                        cam['name'] = hostname
+                        # v5.2.1 — keep the CSV name (COF.01.121); hostname is its own field.
                         _ui(self.status_set_step, 'hostname', 'ok', hostname)
                     else:
                         self.status_log("    ✗ Hostname failed")
