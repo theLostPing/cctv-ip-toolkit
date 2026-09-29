@@ -14627,26 +14627,21 @@ https://buymeacoffee.com/thelostping""")
 
                 if set_hostname and not self.cancel_flag:
                     step_num += 1
-                    brand_prefix = self.protocol.BRAND_KEY
-                    cam_number = cam.get('number', str(programmed_count))
-                    s = cam.get('serial', 'unknown')
-                    # v5.2.1 — Bosch hides its serial on a locked camera; the MAC
-                    # we pinned is the same identifier Axis uses ("1-bosch-unknown").
-                    if (not s or s.upper() == 'UNKNOWN') and pinned_mac:
-                        s = pinned_mac.replace(':', '').replace('-', '')
-                    if s and s.upper() != 'UNKNOWN':
-                        hostname = f"{cam_number}-{brand_prefix}-{s.lower()}"
+                    # v5.2.1 — never write '-unknown': serial, then the MAC we pinned,
+                    # then the list's MAC, then ARP. Nothing at all -> skip the step.
+                    hostname = self._hostname_for(cam, camera_ip, pinned_mac, programmed_count)
+                    if hostname is None:
+                        self.log("  Hostname skipped — the camera hasn't given a serial or MAC yet (not writing 'unknown').")
                     else:
-                        hostname = f"{cam_number}-{brand_prefix}-unknown"
-                    self.log(f"[{step_num}/{total_steps}] Setting hostname: {hostname}")
-                    result = self.protocol.set_hostname(camera_ip, password, hostname)
-                    if result:
-                        self.log("      ✓ Done.")
-                        cam['hostname'] = hostname
-                        # v5.2.1 — keep the CSV name (COF.01.121); hostname is its own field.
-                    else:
-                        self.log("      ✗ Hostname failed")
-                        errors.append("hostname")
+                        self.log(f"[{step_num}/{total_steps}] Setting hostname: {hostname}")
+                        result = self.protocol.set_hostname(camera_ip, password, hostname)
+                        if result:
+                            self.log("      ✓ Done.")
+                            cam['hostname'] = hostname
+                            # v5.2.1 — keep the CSV name (COF.01.121); hostname is its own field.
+                        else:
+                            self.log("      ✗ Hostname failed")
+                            errors.append("hostname")
                 if self.cancel_flag:
                     self.log("Cancelled by user — bailing wizard.")
                     break
@@ -16402,27 +16397,22 @@ https://buymeacoffee.com/thelostping""")
                 # ---- Phase 2b: Hostname ----
                 if set_hostname and not self.cancel_flag:
                     _ui(self.status_set_step, 'hostname', 'active')
-                    brand_prefix = self.protocol.BRAND_KEY
-                    cam_number = cam.get('number', str(programmed_count))
-                    s = cam.get('serial', 'unknown')
-                    # v5.2.1 — Bosch hides its serial on a locked camera; the MAC
-                    # we pinned is the same identifier Axis uses ("1-bosch-unknown").
-                    if (not s or s.upper() == 'UNKNOWN') and pinned_mac:
-                        s = pinned_mac.replace(':', '').replace('-', '')
-                    if s and s.upper() != 'UNKNOWN':
-                        hostname = f"{cam_number}-{brand_prefix}-{s.lower()}"
+                    # v5.2.1 — never write '-unknown': serial, then the MAC we pinned,
+                    # then the list's MAC, then ARP. Nothing at all -> skip the step.
+                    hostname = self._hostname_for(cam, camera_ip, pinned_mac, programmed_count)
+                    if hostname is None:
+                        self.status_log("  Hostname skipped — the camera hasn't given a serial or MAC yet (not writing 'unknown').")
                     else:
-                        hostname = f"{cam_number}-{brand_prefix}-unknown"
-                    self.status_log(f"  Setting hostname: {hostname}")
-                    if self.protocol.set_hostname(camera_ip, password, hostname):
-                        self.status_log("    ✓ Done.")
-                        cam['hostname'] = hostname
-                        # v5.2.1 — keep the CSV name (COF.01.121); hostname is its own field.
-                        _ui(self.status_set_step, 'hostname', 'ok', hostname)
-                    else:
-                        self.status_log("    ✗ Hostname failed")
-                        errors.append("hostname")
-                        _ui(self.status_set_step, 'hostname', 'fail')
+                        self.status_log(f"  Setting hostname: {hostname}")
+                        if self.protocol.set_hostname(camera_ip, password, hostname):
+                            self.status_log("    ✓ Done.")
+                            cam['hostname'] = hostname
+                            # v5.2.1 — keep the CSV name (COF.01.121); hostname is its own field.
+                            _ui(self.status_set_step, 'hostname', 'ok', hostname)
+                        else:
+                            self.status_log("    ✗ Hostname failed")
+                            errors.append("hostname")
+                            _ui(self.status_set_step, 'hostname', 'fail')
                 if self.cancel_flag:
                     self.status_log("Cancelled by user — bailing wizard.")
                     break
@@ -17629,6 +17619,23 @@ https://buymeacoffee.com/thelostping""")
         except:
             pass
         return False
+
+    def _hostname_for(self, cam, camera_ip, pinned_mac, programmed_count):
+        """v5.2.1 — '<number>-<brand>-<serial-or-mac>' or None. Serial first
+        (Axis), else the pinned MAC (Bosch hides its serial while locked),
+        else the list's MAC, else ARP for camera_ip. Never 'unknown'."""
+        ident = cam.get('serial') or ''
+        if not ident or ident.upper() == 'UNKNOWN':
+            ident = pinned_mac or cam.get('mac') or ''
+        if not ident:
+            try:
+                ident = self.get_mac_from_arp(camera_ip) or ''
+            except Exception:
+                ident = ''
+        ident = ident.replace(':', '').replace('-', '').strip().lower()
+        if not ident or ident == 'unknown':
+            return None
+        return f"{cam.get('number', str(programmed_count))}-{self.protocol.BRAND_KEY}-{ident}"
 
     def _wrong_brand(self, mac, ip=''):
         """v5.2.1 — True when a device the wizard's wait loop just found is
