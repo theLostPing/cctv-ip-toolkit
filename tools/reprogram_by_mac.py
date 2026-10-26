@@ -256,44 +256,46 @@ def cam_net(a, cam):
     return ipaddress.ip_network(f"{cam['ip']}/{cam_subnet(a, cam)}", strict=False)
 
 
+JOB_LOGINS = [('root', 'admin'), ('admin', 'admin'), ('root', 'pass')]
+MAX_LOGINS = 5
+
+
 def load_password_candidates(explicit, beside=None):
-    """Root passwords to try on an already-programmed camera, in order:
-    --password, then passwords.txt next to the camera list (one per line; created
-    for you on first run from the toolkit's own list), then a few common ones."""
+    """Logins to try on a camera that already has a password, in order: --password
+    (as root), then passwords.txt next to the camera list. passwords.txt holds the
+    JOB's own logins only, one per line as user:password (a bare password = root).
+    Nothing else is ever tried: a camera that takes none of them goes on the
+    factory-reset list instead of being guessed at."""
     cands = []
     if explicit:
-        cands.append(explicit)
-    toolkit = []
-    try:
-        p = os.path.join(APPDATA_CFG, 'passwords.json')
-        if os.path.exists(p):
-            with open(p) as f:
-                toolkit = [pw for pw in json.load(f) if pw]
-    except Exception:
-        pass
+        cands.append(('root', explicit))
     if beside:
         txt = os.path.join(beside, 'passwords.txt')
         if not os.path.exists(txt):
             try:
                 with open(txt, 'w', encoding='utf-8') as f:
-                    f.write('# one root password per line, tried top to bottom on cameras that already have a password\n')
-                    for pw in (toolkit or ['admin']):
-                        f.write(pw + '\n')
-                log(f"password list created: {txt}  ({len(toolkit) or 1} entries from the toolkit) - add the May password there if you know it")
+                    f.write('# the job\'s own logins, user:password, one per line\n')
+                    for u, pw in JOB_LOGINS:
+                        f.write(f'{u}:{pw}\n')
+                log(f"login list created: {txt}")
             except Exception as e:
                 log(f"could not create {txt}: {e}")
-        try:
+        if os.path.exists(txt):
             with open(txt, encoding='utf-8') as f:
                 for line in f:
-                    pw = line.rstrip('\r\n')
-                    if pw and not pw.startswith('#') and pw not in cands:
-                        cands.append(pw)
-            log(f"password list: {txt} ({len(cands) - (1 if explicit else 0)} entries)")
-        except Exception:
-            pass
-    for pw in toolkit + ['admin', 'pass', 'root', 'Admin123', 'password']:
-        if pw not in cands:
-            cands.append(pw)
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    u, pw = line.split(':', 1) if ':' in line else ('root', line)
+                    if pw and (u, pw) not in cands:
+                        cands.append((u, pw))
+    if not cands:
+        cands = list(JOB_LOGINS)
+    if len(cands) > MAX_LOGINS:
+        raise SystemExit(f"passwords.txt has {len(cands)} logins. It is for the job's own logins only "
+                         f"(at most {MAX_LOGINS}). Replace its contents with:\n" +
+                         '\n'.join(f'{u}:{pw}' for u, pw in JOB_LOGINS))
+    log("logins to try: " + ', '.join(f'{u}/{pw}' for u, pw in cands))
     return cands
 
 
@@ -336,9 +338,10 @@ def test_password(ip, user, pw):
 
 
 def find_password(ip, cands):
-    for pw in cands:
-        if test_password(ip, 'root', pw):
-            return pw
+    """(user, password) of the first login that works, else None."""
+    for u, pw in cands:
+        if test_password(ip, u, pw):
+            return u, pw
     return None
 
 
@@ -1576,21 +1579,30 @@ def _program_camera(cam, found, password, a, extra, ip):
             log("  FAILED to set root password"); return False
         cur_pw = password
     else:
-        cur_pw = find_password(ip, a.pw_candidates)
-        if not cur_pw:
-            log("  FAILED: camera has a root password and none of the candidates work. Factory-reset it (button) and try again.")
+        login = find_password(ip, a.pw_candidates)
+        if not login:
+            log("  NEEDS FACTORY RESET: none of the job logins work. Hold the control button while powering it up;")
+            log("  it comes back at 192.168.0.90 and this run picks it up.")
+            mark_reset(a, cam, ip)
             return False
-        if cur_pw != password:
-            log(f"  step 1: root password is {cur_pw!r}; changing it to the one you gave")
+        user, cur_pw = login
+        if user != 'root' or cur_pw != password:
+            log(f"  step 1: logged in as {user}/{cur_pw}; setting root password to the one you gave")
             try:
                 r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi",
                                  params={"action": "update", "user": "root", "pwd": password},
-                                 auth=HTTPDigestAuth("root", cur_pw), timeout=TIMEOUT)
+                                 auth=HTTPDigestAuth(user, cur_pw), timeout=TIMEOUT)
                 if r.status_code == 200 and not r.text.strip().lower().startswith('error'):
                     cur_pw = password
-                else:
+                elif user == 'root':
                     log(f"  could not change root password ({r.status_code}); keeping {cur_pw!r}")
+                else:
+                    log(f"  FAILED: {user} could not set the root password ({r.status_code} {r.text.strip()[:80]})")
+                    return False
             except Exception as e:
+                if user != 'root':
+                    log(f"  FAILED: {user} could not set the root password: {e}")
+                    return False
                 log(f"  could not change root password: {e}")
     if not test_password(ip, 'root', cur_pw):
         time.sleep(3)
@@ -1645,6 +1657,29 @@ def _program_camera(cam, found, password, a, extra, ip):
     return True
 
 
+def mark_reset(a, cam, ip):
+    """Camera that takes none of the job logins -> needs_reset.csv next to the list."""
+    nr = getattr(a, 'needs_reset', None)
+    if nr is None:
+        return
+    nr[cam['mac']] = ip
+    write_reset_list(a)
+
+
+def write_reset_list(a):
+    path = os.path.join(os.path.dirname(a.results), 'needs_reset.csv')
+    byname = {c['mac']: c for c in a.cams}
+    try:
+        with open(path, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['CameraName', 'MAC', 'Port', 'FoundAt', 'TargetIP'])
+            for mac, ip in a.needs_reset.items():
+                c = byname.get(mac, {})
+                w.writerow([c.get('name', ''), mac, c.get('port', ''), ip, c.get('ip', '')])
+    except Exception as e:
+        log(f"could not write {path}: {e}")
+
+
 def write_result(a, cam, ip, found):
     path = a.results
     new = not os.path.exists(path)
@@ -1673,14 +1708,14 @@ def cmd_stills(cams, a):
         info = probe(cam['ip'], timeout=2)
         if info and info['mac'] and info['mac'] != cam['mac']:
             miss.append((cam, f"different camera {info['mac']}")); print(f"{cam['name']:10} {cam['ip']:14} DIFFERENT camera there ({info['mac']})"); continue
-        pw = find_password(cam['ip'], a.pw_candidates)
-        if not pw:
-            miss.append((cam, 'password unknown')); print(f"{cam['name']:10} {cam['ip']:14} password unknown"); continue
+        login = find_password(cam['ip'], a.pw_candidates)
+        if not login:
+            miss.append((cam, 'needs factory reset')); print(f"{cam['name']:10} {cam['ip']:14} no job login works - needs factory reset"); continue
         ok = False
         for params in ({'resolution': a.stills_res}, {}):
             try:
                 r = requests.get(f"http://{cam['ip']}/axis-cgi/jpg/image.cgi", params=params,
-                                 auth=HTTPDigestAuth('root', pw), timeout=10)
+                                 auth=HTTPDigestAuth(*login), timeout=10)
                 if r.status_code == 200 and r.content[:2] == b'\xff\xd8':
                     with open(os.path.join(folder, name + '.jpg'), 'wb') as f:
                         f.write(r.content)
@@ -1726,9 +1761,12 @@ def cmd_check(cams, a, extra):
             wrong.append(cam); print(f"{cam['name']:10} {cam['ip']:14} DIFFERENT CAMERA there ({info['mac']}, {info['model']}{', log: ' + lg['name'] if lg else ''})"); continue
         if is_factory(cam['ip']):
             wrong.append(cam); print(f"{cam['name']:10} {cam['ip']:14} right camera but NO PASSWORD (factory) - run will fix"); continue
-        pw = find_password(cam['ip'], a.pw_candidates)
-        if not pw:
-            wrong.append(cam); print(f"{cam['name']:10} {cam['ip']:14} password unknown"); continue
+        login = find_password(cam['ip'], a.pw_candidates)
+        if not login:
+            wrong.append(cam); print(f"{cam['name']:10} {cam['ip']:14} no job login works - NEEDS FACTORY RESET"); continue
+        if login[0] != 'root':
+            wrong.append(cam); print(f"{cam['name']:10} {cam['ip']:14} root not a job password, {login[0]}/{login[1]} works - run will fix"); continue
+        pw = login[1]
         extra_s = ''
         if extra:
             e = user_exists(cam['ip'], pw, extra[0])
@@ -1755,6 +1793,7 @@ def cmd_run(cams, a, extra):
     iface = pick_iface(a.iface)
     al = Aliases(iface, a.keep_alias)
     a.al, a.cams = al, cams
+    a.needs_reset = {}
     a.here_net = setup_access(a, cams, al)
     iface_ips = [x['ip'] for x in local_ipv4s() if x['idx'] == iface]
     # cameras already fine are done before we start
@@ -1763,8 +1802,9 @@ def cmd_run(cams, a, extra):
         if tcp_open(c['ip'], 80, 0.5):
             info = probe(c['ip'], timeout=2)
             if info and info['mac'] == c['mac'] and not is_factory(c['ip']):
-                pw = find_password(c['ip'], a.pw_candidates)
-                if pw and pw == a.password and (not extra or user_exists(c['ip'], pw, extra[0])):
+                login = find_password(c['ip'], a.pw_candidates)
+                pw = login[1] if login else None
+                if login == ('root', a.password) and (not extra or user_exists(c['ip'], pw, extra[0])):
                     done.add(c['mac'])
     log(f"{len(done)} already complete (right IP, right root password, extra user present), {len(cams) - len(done)} to do.")
     log(f"Listening on interface {iface} ({', '.join(iface_ips)}). Plug cameras in; Ctrl-C to stop.")
@@ -1788,15 +1828,26 @@ def cmd_run(cams, a, extra):
                     continue
                 if failed.get(cam['mac'], 0) >= a.max_tries:
                     continue
+                if cam['mac'] in a.needs_reset:
+                    if not is_factory(ip):
+                        continue
+                    log(f"{cam['name']} is factory now - programming it")
                 if a.one_at_a_time:
                     input(f"\n  Found {cam['name']} at {ip}. Press Enter to program it (Ctrl-C to quit) ")
                 if program_camera(cam, info, a.password, a, extra):
                     done.add(cam['mac'])
+                    if a.needs_reset.pop(cam['mac'], None):
+                        write_reset_list(a)
+                elif cam['mac'] in a.needs_reset:
+                    pass
                 else:
                     failed[cam['mac']] = failed.get(cam['mac'], 0) + 1
                     log(f"  will retry {cam['name']} next pass ({failed[cam['mac']]}/{a.max_tries})")
             left = [c['name'] for c in cams if c['mac'] not in done]
             log(f"-- {len(done)}/{len(cams)} done. Waiting for: {', '.join(left[:12])}{' ...' if len(left) > 12 else ''}")
+            if a.needs_reset:
+                log(f"   NEEDS FACTORY RESET ({len(a.needs_reset)}): " +
+                    ', '.join(bymac[m]['name'] + (f" (port {bymac[m]['port']})" if bymac[m].get('port') else '') for m in a.needs_reset))
             time.sleep(a.interval)
         log("ALL cameras in the list are programmed.")
     except KeyboardInterrupt:
@@ -1806,6 +1857,9 @@ def cmd_run(cams, a, extra):
         left = [c['name'] for c in cams if c['mac'] not in done]
         if left:
             log(f"still not done ({len(left)}): {', '.join(left)}")
+        if a.needs_reset:
+            log(f"NEEDS FACTORY RESET ({len(a.needs_reset)}), list in needs_reset.csv: " +
+                ', '.join(bymac[m]['name'] for m in a.needs_reset))
 
 
 def main():
