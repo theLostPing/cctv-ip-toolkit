@@ -1581,6 +1581,13 @@ def _program_camera(cam, found, password, a, extra, ip):
     else:
         login = find_password(ip, a.pw_candidates)
         if not login:
+            # FW 10.x factory cameras 401 every request (param.cgi too) until root is
+            # created by an authed pwdgrp.cgi add, so is_factory() can't see them.
+            # Same call the toolkit uses; a configured camera just answers 401.
+            if create_root(ip, password) and test_password(ip, 'root', password):
+                log("  step 1: factory camera (FW 10 style), root password set")
+                login = ('root', password)
+        if not login:
             log("  NEEDS FACTORY RESET: none of the job logins work. Hold the control button while powering it up;")
             log("  it comes back at 192.168.0.90 and this run picks it up.")
             mark_reset(a, cam, ip)
@@ -1829,9 +1836,9 @@ def cmd_run(cams, a, extra):
                 if failed.get(cam['mac'], 0) >= a.max_tries:
                     continue
                 if cam['mac'] in a.needs_reset:
-                    if not is_factory(ip):
+                    if not is_factory(ip) and ip == a.needs_reset[cam['mac']]:
                         continue
-                    log(f"{cam['name']} is factory now - programming it")
+                    log(f"{cam['name']} is back at {ip} - trying it again")
                 if a.one_at_a_time:
                     input(f"\n  Found {cam['name']} at {ip}. Press Enter to program it (Ctrl-C to quit) ")
                 if program_camera(cam, info, a.password, a, extra):
