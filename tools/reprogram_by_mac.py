@@ -6,6 +6,7 @@ one camera at a time, matched by MAC against the toolkit's programmed_cameras.cs
     python reprogram_by_mac.py check --csv MACs.xlsx --here 3    # who is still fine, who is gone (plugged into switch 3)
     python reprogram_by_mac.py run --password XXXX   # sit and wait, program each camera as it shows up
     python reprogram_by_mac.py ports [--switch IP]    # which switch port each MAC is on -> switch_ports.csv
+    python reprogram_by_mac.py stills --csv switch1.csv --here 10.20.48.64/27   # a JPEG from every camera + index.html
         add --plan-base 10.20.48.0 to check ports against the numbering plan and to name
         unlisted cameras from their port (-> proposed_cameras.csv, review, then run --csv it)
 
@@ -166,6 +167,7 @@ def load_list(path, since, prefix, only_net=None):
     j_sw = find('SWITCH')
     j_port = find('SWITCH PORT')
     j_actual = find('L2POE PORT ACTUAL')
+    j_port_plain = find('PORT') if not (j_sw is not None and j_port is not None) else None
     j_desc = find('CAMERA NAME / LOCATION', 'DEVICE NAME / LOCATION')
     is_lenel = j_sw is not None and j_port is not None and j_sw != j_port
     kept = {}
@@ -194,7 +196,7 @@ def load_list(path, since, prefix, only_net=None):
             continue
         kept[mac] = {'name': name, 'ip': ip, 'mac': mac, 'model': g(j_model), 'ts': ts,
                      'gateway': g(j_gw), 'subnet': g(j_sn), 'switch': g(j_sw) if is_lenel else '',
-                     'port': g(j_port) if is_lenel else '', 'port_actual': g(j_actual),
+                     'port': g(j_port) if is_lenel else g(j_port_plain), 'port_actual': g(j_actual),
                      'desc': g(j_desc)}
     byname = {}
     for c in kept.values():
@@ -1633,6 +1635,59 @@ def write_result(a, cam, ip, found):
                     found.get('firmware', ''), '', datetime.now().isoformat()])
 
 
+
+def cmd_stills(cams, a):
+    """Grab one JPEG from every camera in the list at its IP -> <folder>/<name>_<ip>.jpg"""
+    al = Aliases(pick_iface(a.iface), a.keep_alias) if not a.no_alias else None
+    if al:
+        setup_access(a, cams, al)
+    folder = a.stills_dir or os.path.join(os.path.dirname(a.results), 'stills')
+    os.makedirs(folder, exist_ok=True)
+    got, miss = [], []
+    for cam in cams:
+        name = f"{cam['name']}_{cam['ip']}"
+        if not tcp_open(cam['ip'], 80, 0.6):
+            miss.append((cam, 'no answer')); print(f"{cam['name']:10} {cam['ip']:14} no answer"); continue
+        info = probe(cam['ip'], timeout=2)
+        if info and info['mac'] and info['mac'] != cam['mac']:
+            miss.append((cam, f"different camera {info['mac']}")); print(f"{cam['name']:10} {cam['ip']:14} DIFFERENT camera there ({info['mac']})"); continue
+        pw = find_password(cam['ip'], a.pw_candidates)
+        if not pw:
+            miss.append((cam, 'password unknown')); print(f"{cam['name']:10} {cam['ip']:14} password unknown"); continue
+        ok = False
+        for params in ({'resolution': a.stills_res}, {}):
+            try:
+                r = requests.get(f"http://{cam['ip']}/axis-cgi/jpg/image.cgi", params=params,
+                                 auth=HTTPDigestAuth('root', pw), timeout=10)
+                if r.status_code == 200 and r.content[:2] == b'\xff\xd8':
+                    with open(os.path.join(folder, name + '.jpg'), 'wb') as f:
+                        f.write(r.content)
+                    ok = True
+                    break
+            except Exception:
+                pass
+        if ok:
+            got.append(cam); print(f"{cam['name']:10} {cam['ip']:14} saved")
+        else:
+            miss.append((cam, 'no image')); print(f"{cam['name']:10} {cam['ip']:14} no image")
+    if al:
+        al.cleanup()
+    # a one-page HTML contact sheet so the whole switch can be eyeballed at once
+    try:
+        with open(os.path.join(folder, 'index.html'), 'w', encoding='utf-8') as f:
+            f.write('<html><body style="font-family:sans-serif;background:#111;color:#eee">')
+            for cam in got:
+                fn = f"{cam['name']}_{cam['ip']}.jpg"
+                f.write(f'<div style="display:inline-block;margin:6px;text-align:center"><img src="{fn}" width="320"><br>'
+                        f'{cam["name"]} {cam["ip"]}' + (f' port {cam.get("port", "")}' if cam.get('port') else '') + '</div>')
+            if miss:
+                f.write('<p>Missing: ' + ', '.join(f"{c['name']} ({why})" for c, why in miss) + '</p>')
+            f.write('</body></html>')
+    except Exception:
+        pass
+    log(f"{len(got)} stills saved, {len(miss)} missing -> {folder}  (open index.html there)")
+
+
 def cmd_check(cams, a, extra):
     al = Aliases(pick_iface(a.iface), a.keep_alias) if not a.no_alias else None
     if al:
@@ -1685,9 +1740,11 @@ def cmd_run(cams, a, extra):
     for c in cams:
         if tcp_open(c['ip'], 80, 0.5):
             info = probe(c['ip'], timeout=2)
-            if info and info['mac'] == c['mac'] and not is_factory(c['ip']) and find_password(c['ip'], a.pw_candidates):
-                done.add(c['mac'])
-    log(f"{len(done)} already programmed, {len(cams) - len(done)} to do.")
+            if info and info['mac'] == c['mac'] and not is_factory(c['ip']):
+                pw = find_password(c['ip'], a.pw_candidates)
+                if pw and pw == a.password and (not extra or user_exists(c['ip'], pw, extra[0])):
+                    done.add(c['mac'])
+    log(f"{len(done)} already complete (right IP, right root password, extra user present), {len(cams) - len(done)} to do.")
     log(f"Listening on interface {iface} ({', '.join(iface_ips)}). Plug cameras in; Ctrl-C to stop.")
 
     seen_unknown = set()
@@ -1732,7 +1789,7 @@ def cmd_run(cams, a, extra):
 def main():
     global LOG_FH
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('mode', nargs='?', default='run', choices=['check', 'run', 'ports', 'list', 'list-ifaces'])
+    p.add_argument('mode', nargs='?', default='run', choices=['check', 'run', 'ports', 'stills', 'list', 'list-ifaces'])
     p.add_argument('--csv', help='camera list: the Lenel programming sheet (.xlsx/.csv), the toolkit run log programmed_cameras.csv, or a camera-list export')
     p.add_argument('--log', help='toolkit run log to cross-reference MACs against (default: programmed_cameras.csv if found)')
     p.add_argument('--here', help='the switch this laptop is plugged into: its number in the list (e.g. 3) or its camera subnet as CIDR (10.20.48.128/27)')
@@ -1755,6 +1812,8 @@ def main():
     p.add_argument('--max-tries', type=int, default=3)
     p.add_argument('--switch', help='ports: switch management IP (found via LLDP if not given)')
     p.add_argument('--assign-by-port', action='store_true', help='ports: trust the port, not the sheet MAC - write assigned_switchN.csv (name/IP from the sheet row at that port, MAC from the switch)')
+    p.add_argument('--stills-dir', help='stills: folder to save JPEGs in (default: stills\\ next to the list)')
+    p.add_argument('--stills-res', default='1280x720', help='stills: requested resolution (default 1280x720)')
     p.add_argument('--switch-number', type=int, help='ports: which switch of the plan this is (1 = cameras 1-24); guessed from the listed cameras on it if omitted')
     p.add_argument('--plan-base', help='numbering plan: network base, e.g. 10.20.48.0 ("" = no plan)')
     p.add_argument('--plan-first', type=int, default=67, help='numbering plan: host offset of camera 1 (default 67)')
@@ -1828,6 +1887,8 @@ def main():
         cmd_check(cams, a, extra)
     elif a.mode == 'ports':
         cmd_ports(cams, a)
+    elif a.mode == 'stills':
+        cmd_stills(cams, a)
     else:
         cmd_run(cams, a, extra)
 
