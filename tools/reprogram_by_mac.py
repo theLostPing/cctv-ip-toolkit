@@ -256,20 +256,42 @@ def cam_net(a, cam):
     return ipaddress.ip_network(f"{cam['ip']}/{cam_subnet(a, cam)}", strict=False)
 
 
-def load_password_candidates(explicit):
+def load_password_candidates(explicit, beside=None):
+    """Root passwords to try on an already-programmed camera, in order:
+    --password, then passwords.txt next to the camera list (one per line; created
+    for you on first run from the toolkit's own list), then a few common ones."""
     cands = []
     if explicit:
         cands.append(explicit)
+    toolkit = []
     try:
         p = os.path.join(APPDATA_CFG, 'passwords.json')
         if os.path.exists(p):
             with open(p) as f:
-                for pw in json.load(f):
-                    if pw and pw not in cands:
-                        cands.append(pw)
+                toolkit = [pw for pw in json.load(f) if pw]
     except Exception:
         pass
-    for pw in ('admin', 'pass', 'root', 'Admin123', 'password'):
+    if beside:
+        txt = os.path.join(beside, 'passwords.txt')
+        if not os.path.exists(txt):
+            try:
+                with open(txt, 'w', encoding='utf-8') as f:
+                    f.write('# one root password per line, tried top to bottom on cameras that already have a password\n')
+                    for pw in (toolkit or ['admin']):
+                        f.write(pw + '\n')
+                log(f"password list created: {txt}  ({len(toolkit) or 1} entries from the toolkit) - add the May password there if you know it")
+            except Exception as e:
+                log(f"could not create {txt}: {e}")
+        try:
+            with open(txt, encoding='utf-8') as f:
+                for line in f:
+                    pw = line.rstrip('\r\n')
+                    if pw and not pw.startswith('#') and pw not in cands:
+                        cands.append(pw)
+            log(f"password list: {txt} ({len(cands) - (1 if explicit else 0)} entries)")
+        except Exception:
+            pass
+    for pw in toolkit + ['admin', 'pass', 'root', 'Admin123', 'password']:
         if pw not in cands:
             cands.append(pw)
     return cands
@@ -1871,7 +1893,7 @@ def main():
             raise SystemExit('--extra-user must be user:password')
         u, pw = a.extra_user.split(':', 1)
         extra = (u, pw, a.extra_role)
-    a.pw_candidates = load_password_candidates(a.password)
+    a.pw_candidates = load_password_candidates(a.password, os.path.dirname(os.path.abspath(csv_path)))
 
     if a.mode == 'list':
         print(f"{len(cams)} cameras:")
