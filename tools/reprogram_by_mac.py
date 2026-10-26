@@ -1329,6 +1329,9 @@ def cmd_ports(cams, a):
     has_sheet = any(c.get('port') for c in cams)
     use_plan = (not has_sheet) and a.plan_base and plan_ok(a, cams)
     sw_no = a.switch_number
+    if not sw_no and a.here and a.here.isdigit():
+        sw_no = int(a.here)
+        log(f"  treating this as switch #{sw_no} (from --here)")
     if not sw_no and (has_sheet or use_plan):
         votes = {}
         for r in rows:
@@ -1392,6 +1395,60 @@ def cmd_ports(cams, a):
                                   'Subnet': cam_subnet(a, fake), 'Model': r['Model'], 'New IP': gw_ip,
                                   'MAC Address': r['MAC'], 'Processed': 'No', 'Port': r['Port'], 'Switch': sw_no,
                                   'SheetMAC': '', 'LogName': r['LogName']})
+    if a.assign_by_port and has_sheet and sw_no:
+        per_port = {}
+        for r in rows:
+            pn = port_no(r['Port'])
+            if pn and pn <= a.plan_per_switch and r['MAC'] not in my_macs:
+                per_port.setdefault(pn, []).append(r)
+        assigned = []
+        notes = []
+        for pn in sorted(set(per_port) | set(at_port)):
+            here_rows = per_port.get(pn, [])
+            sc = at_port.get(pn)
+            axis_rows = [r for r in here_rows if r['Vendor'] == 'Axis' or r['Device'].startswith('Axis')]
+            if not sc:
+                if here_rows:
+                    notes.append(f"port {pn}: {len(here_rows)} MAC(s) but the sheet has no camera on this port")
+                continue
+            if not here_rows:
+                if any(port_no(r['Port']) == pn and r['MAC'] in my_macs for r in rows):
+                    notes.append(f"port {pn}: THIS LAPTOP is here; sheet expects {sc['name']} {sc['ip']} (move the laptop and re-run to see it)")
+                else:
+                    notes.append(f"port {pn}: EMPTY, sheet expects {sc['name']} {sc['ip']}")
+                continue
+            if len(axis_rows) != 1:
+                notes.append(f"port {pn}: {len(here_rows)} MACs ({', '.join(r['MAC'] for r in here_rows)}) - not assigning, look at the cabling")
+                continue
+            r = axis_rows[0]
+            flags = []
+            if r['MAC'] != sc['mac']:
+                flags.append(f"sheet MAC was {sc['mac']}")
+            if bymac.get(r['MAC']) and bymac[r['MAC']]['name'] != sc['name']:
+                flags.append(f"sheet called this MAC {bymac[r['MAC']]['name']}")
+            lg = a.log.get(r['MAC'])
+            if lg and lg['name'] != sc['name']:
+                flags.append(f"5/5 log called it {lg['name']}")
+            if r['Model'] and sc.get('model') and r['Model'] != sc['model']:
+                flags.append(f"MODEL {r['Model']} vs sheet {sc['model']}")
+            assigned.append({'Camera Name': sc['name'], 'IP Address': sc['ip'], 'Gateway': cam_gateway(a, sc),
+                             'Subnet': cam_subnet(a, sc), 'Model': r['Model'] or sc.get('model', ''), 'New IP': sc['ip'],
+                             'MAC Address': r['MAC'], 'Processed': 'No', 'Port': r['Port'], 'Switch': sw_no,
+                             'Hostname': sc['name'], 'CurrentIP': r['IP'], 'Status': r['Status'],
+                             'SheetMAC': sc['mac'], 'LogName': (lg['name'] if lg else ''), 'Flags': '; '.join(flags)})
+        aout = os.path.join(os.path.dirname(a.results), f'assigned_switch{sw_no}.csv')
+        with open(aout, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=list(assigned[0].keys()) if assigned else ['Camera Name'])
+            w.writeheader()
+            w.writerows(assigned)
+        print(f"\nASSIGNED BY PORT (switch {sw_no}): the camera on port N is the sheet's camera for port N")
+        print(f"{'Port':8} {'Name':10} {'IP':14} {'MAC':18} {'Flags'}")
+        for x in assigned:
+            print(f"{x['Port']:8} {x['Camera Name']:10} {x['IP Address']:14} {x['MAC Address']:18} {x['Flags']}")
+        for n in notes:
+            print(f"  ! {n}")
+        log(f"{len(assigned)} cameras assigned by port -> {aout}  (REVIEW, then: run --csv \"{aout}\" --here {sw_no} --password ...)")
+
     if proposals:
         pout = os.path.join(os.path.dirname(a.results), 'proposed_cameras.csv')
         new_file = not os.path.exists(pout)
@@ -1455,9 +1512,35 @@ def wait_for(ip, mac, seconds):
     return None
 
 
+def arp_pin(iface_idx, ip, mac, on=True):
+    """Static neighbour entry so 192.168.0.90 stays THIS camera while several
+    factory cameras share that address. Removed again when done."""
+    try:
+        if on:
+            ps(f"New-NetNeighbor -InterfaceIndex {iface_idx} -IPAddress '{ip}' -LinkLayerAddress '{mac.replace(':', '-')}' "
+               f"-State Permanent -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null")
+        else:
+            ps(f"Remove-NetNeighbor -InterfaceIndex {iface_idx} -IPAddress '{ip}' -Confirm:$false -ErrorAction SilentlyContinue")
+    except Exception:
+        pass
+
+
 def program_camera(cam, found, password, a, extra):
     """found = probe dict at the IP where the camera lives right now."""
     ip = found['ip']
+    pinned = False
+    if ip == FACTORY_IP and getattr(a, 'al', None) is not None:
+        arp_pin(a.al.idx, ip, cam['mac'], True)
+        pinned = True
+        time.sleep(1)
+    try:
+        return _program_camera(cam, found, password, a, extra, ip)
+    finally:
+        if pinned:
+            arp_pin(a.al.idx, ip, cam['mac'], False)
+
+
+def _program_camera(cam, found, password, a, extra, ip):
     log(f"PROGRAMMING {cam['name']} ({cam['mac']}) found at {ip}, target {cam['ip']}  fw {found.get('firmware') or '?'}")
     if cam['model'] and found['model'] and cam['model'] != found['model']:
         log(f"  NOTE model is {found['model']}, list says {cam['model']} - continuing (same MAC)")
@@ -1493,6 +1576,10 @@ def program_camera(cam, found, password, a, extra):
 
     gw, sn = cam_gateway(a, cam), cam_subnet(a, cam)
     tnet = cam_net(a, cam)
+    again = probe(ip, timeout=2)
+    if not again or again['mac'] != cam['mac']:
+        log(f"  STOP: {ip} now answers as {again['mac'] if again else 'nothing'}, not {cam['mac']} - another factory camera took the address; retrying later")
+        return False
     if ip != cam['ip']:
         if a.al is not None and not a.no_alias and not any(ipaddress.ip_address(x['ip']) in tnet for x in local_ipv4s()) \
                 and (a.here_net is None or tnet == a.here_net):
@@ -1667,6 +1754,7 @@ def main():
     p.add_argument('--interval', type=float, default=4, help='seconds between discovery passes')
     p.add_argument('--max-tries', type=int, default=3)
     p.add_argument('--switch', help='ports: switch management IP (found via LLDP if not given)')
+    p.add_argument('--assign-by-port', action='store_true', help='ports: trust the port, not the sheet MAC - write assigned_switchN.csv (name/IP from the sheet row at that port, MAC from the switch)')
     p.add_argument('--switch-number', type=int, help='ports: which switch of the plan this is (1 = cameras 1-24); guessed from the listed cameras on it if omitted')
     p.add_argument('--plan-base', help='numbering plan: network base, e.g. 10.20.48.0 ("" = no plan)')
     p.add_argument('--plan-first', type=int, default=67, help='numbering plan: host offset of camera 1 (default 67)')
