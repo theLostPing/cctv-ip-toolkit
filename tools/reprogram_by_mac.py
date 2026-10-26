@@ -1041,6 +1041,11 @@ def arp_table():
     return out
 
 
+def port_num(pname):
+    nums = re.findall(r'\d+', str(pname or ''))
+    return int(nums[-1]) if nums else None
+
+
 def _port_sort_key(name):
     nums = re.findall(r'\d+', name or '')
     return (0, int(nums[-1])) if nums else (1, name or '')
@@ -1360,6 +1365,7 @@ def cmd_ports(cams, a):
                      'Device': who, 'TargetIP': c['ip'] if c else '', 'Model': (info['model'] if info else (c['model'] if c else '')),
                      'Status': status, 'Switch': switch_ip or ''})
     rows.sort(key=lambda r: (_port_sort_key(r['Port']), r['Device']))
+    a.laptop_ports = {port_num(r['Port']) for r in rows if r['MAC'] in my_macs and port_num(r['Port'])}
 
     # --- expected ports: from the Lenel sheet when the list has them, else from the numbering plan
     def port_no(pname):
@@ -1476,10 +1482,31 @@ def cmd_ports(cams, a):
                              'Hostname': sc['name'], 'CurrentIP': r['IP'], 'Status': r['Status'],
                              'SheetMAC': sc['mac'], 'LogName': (lg['name'] if lg else ''), 'Flags': '; '.join(flags)})
         aout = os.path.join(os.path.dirname(a.results), f'assigned_switch{sw_no}.csv')
+        # keep cameras from an earlier read whose port is not visible now (the laptop's
+        # port, or one unplugged for it), so the two passes add up to the whole switch
+        keep = []
+        seen = {x['Camera Name'] for x in assigned}
+        if os.path.exists(aout):
+            try:
+                with open(aout, newline='') as f:
+                    for old in csv.DictReader(f):
+                        pn = port_num(old.get('Port', ''))
+                        if old.get('Camera Name') and old['Camera Name'] not in seen and pn and pn not in per_port:
+                            old['Flags'] = 'kept from the earlier read (port not visible now)'
+                            keep.append(old)
+            except Exception as e:
+                log(f"  could not read the earlier {aout}: {e}")
+        if keep:
+            log(f"  kept {len(keep)} camera(s) from the earlier read of this switch: " +
+                ', '.join(f"{x['Camera Name']} (port {port_num(x.get('Port'))})" for x in keep))
+        assigned = sorted(assigned + keep, key=lambda x: port_num(x.get('Port')) or 99)
+        fields = ['Camera Name', 'IP Address', 'Gateway', 'Subnet', 'Model', 'New IP', 'MAC Address', 'Processed',
+                  'Port', 'Switch', 'Hostname', 'CurrentIP', 'Status', 'SheetMAC', 'LogName', 'Flags']
         with open(aout, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=list(assigned[0].keys()) if assigned else ['Camera Name'])
+            w = csv.DictWriter(f, fieldnames=fields, restval='', extrasaction='ignore')
             w.writeheader()
             w.writerows(assigned)
+        a.assigned_path, a.sw_no = aout, sw_no
         print(f"\nASSIGNED BY PORT (switch {sw_no}): the camera on port N is the sheet's camera for port N")
         print(f"{'Port':8} {'Name':10} {'IP':14} {'MAC':18} {'Flags'}")
         for x in assigned:
@@ -1753,9 +1780,12 @@ def cmd_stills(cams, a):
         setup_access(a, cams, al)
     folder = a.stills_dir or os.path.join(os.path.dirname(a.results), 'stills')
     os.makedirs(folder, exist_ok=True)
-    got, miss = [], []
+    got, miss, had = [], [], []
+    existing = os.listdir(folder)
     for cam in cams:
         name = f"{cam['name']}_{cam['ip']}"
+        if not a.stills_redo and f"{name}.jpg" in existing:
+            had.append(cam); print(f"{cam['name']:10} {cam['ip']:14} already have it"); continue
         if not tcp_open(cam['ip'], 80, 0.6):
             miss.append((cam, 'no answer')); print(f"{cam['name']:10} {cam['ip']:14} no answer"); continue
         info = probe(cam['ip'], timeout=2)
@@ -1786,16 +1816,74 @@ def cmd_stills(cams, a):
     try:
         with open(os.path.join(folder, 'index.html'), 'w', encoding='utf-8') as f:
             f.write('<html><body style="font-family:sans-serif;background:#111;color:#eee">')
-            for cam in got:
-                fn = f"{cam['name']}_{cam['ip']}.jpg"
+            ports = {f"{c['name']}_{c['ip']}.jpg": c.get('port', '') for c in cams}
+            jpgs = sorted((fn for fn in os.listdir(folder) if fn.lower().endswith('.jpg')),
+                          key=lambda fn: (cam_number(fn.split('_')[0]) or 9999, fn))
+            for fn in jpgs:
+                label = fn[:-4].replace('_', ' ')
+                pt = port_num(ports.get(fn))
                 f.write(f'<div style="display:inline-block;margin:6px;text-align:center"><img src="{fn}" width="320"><br>'
-                        f'{cam["name"]} {cam["ip"]}' + (f' port {cam.get("port", "")}' if cam.get('port') else '') + '</div>')
+                        f'{label}' + (f' port {pt}' if pt else '') + '</div>')
             if miss:
                 f.write('<p>Missing: ' + ', '.join(f"{c['name']} ({why})" for c, why in miss) + '</p>')
             f.write('</body></html>')
     except Exception:
         pass
-    log(f"{len(got)} stills saved, {len(miss)} missing -> {folder}  (open index.html there)")
+    log(f"{len(got)} new stills, {len(had)} already had one, {len(miss)} missing -> {folder}  (open index.html there)")
+    return got, had, miss
+
+
+def cmd_switch(sheet, a, extra):
+    """One pass on one switch: read the ports, program every camera that is plugged
+    in, grab the stills it doesn't have yet, then say what to move. Two passes per
+    switch: laptop on port 24 first, then on port 2 for camera 24."""
+    if not (a.num or '').isdigit():
+        raise SystemExit("switch needs the switch number, e.g.  switch 3 --csv ...MACs.xlsx --password admin")
+    if not a.password:
+        raise SystemExit("switch needs --password (the root password to set), e.g. --password admin")
+    n = int(a.num)
+    a.here, a.switch_number, a.assign_by_port = str(n), n, True
+    a.telnet = a.telnet or 'admin:admin'
+    a.assigned_path = None
+    log(f"=== switch {n}: READ ===")
+    cmd_ports(sheet, a)
+    path = a.assigned_path
+    if not path or not os.path.exists(path):
+        raise SystemExit("READ did not write assigned_switch%d.csv - paste this window to Claude" % n)
+    cams = load_list(path, '', '', None)
+    lap = getattr(a, 'laptop_ports', set())
+    active = [c for c in cams if port_num(c.get('port')) not in lap]
+    if not active:
+        raise SystemExit("no cameras to program on this switch - paste this window to Claude")
+    a.here = str(cam_net(a, active[0]))
+    a.idle_exit = a.idle_exit or 240
+    log(f"=== switch {n}: RUN  {len(active)} cameras" + (f" (laptop on port {', '.join(map(str, sorted(lap)))})" if lap else '') + " ===")
+    cmd_run(active, a, extra)
+    done = getattr(a, 'run_done', set())
+    log(f"=== switch {n}: STILLS ===")
+    cmd_stills(active, a)
+
+    sheet_at = {port_num(c.get('port')): c for c in sheet if switch_no(c.get('switch', '')) == n and c.get('port')}
+    by_port = {port_num(c.get('port')): c for c in cams}
+    left = [c['name'] for c in active if c['mac'] not in done]
+    print()
+    log(f"=== switch {n}: {len(active) - len(left)}/{len(active)} programmed this pass, {len(cams)} of {len(sheet_at) or 24} cameras known on the switch ===")
+    if left:
+        log(f"NOT DONE: {', '.join(left)}")
+    if getattr(a, 'needs_reset', None):
+        log("NEEDS FACTORY RESET: " + ', '.join(c['name'] for c in active if c['mac'] in a.needs_reset) +
+            "  (reset, then run this same command again)")
+    nm = lambda pt: (by_port.get(pt) or sheet_at.get(pt) or {}).get('name', f'port {pt}')
+    if lap == {24}:
+        log(f"NEXT: unplug {nm(2)} from port 2 and put the laptop there, plug {nm(24)} back into port 24, "
+            f"then run this same command again.")
+    elif lap == {2}:
+        missing = [nm(pt) for pt in sorted(sheet_at) if pt not in by_port]
+        if missing:
+            log(f"still not seen on this switch: {', '.join(missing)}")
+        log(f"NEXT: plug {nm(2)} back into port 2. Switch {n} is finished; on switch {n + 1} start with the laptop on port 24.")
+    elif lap:
+        log(f"laptop is on port {', '.join(map(str, sorted(lap)))}: plug that camera back in when you leave.")
 
 
 def cmd_check(cams, a, extra):
@@ -1865,6 +1953,8 @@ def cmd_run(cams, a, extra):
     seen_unknown = set()
     failed = {}
     inprog = set()
+    a.run_done = done
+    last = {'t': time.time()}
 
     def status(what):
       with _LOG_LOCK:   # worker threads add to inprog
@@ -1903,6 +1993,7 @@ def cmd_run(cams, a, extra):
                 batch.append((cam, info))
 
             def finish(cam, ok):
+                last['t'] = time.time()
                 with _LOG_LOCK:
                     inprog.discard(cam['name'])
                 if ok:
@@ -1943,8 +2034,12 @@ def cmd_run(cams, a, extra):
             if a.needs_reset:
                 log(f"   NEEDS FACTORY RESET ({len(a.needs_reset)}): " +
                     ', '.join(bymac[m]['name'] + (f" (port {bymac[m]['port']})" if bymac[m].get('port') else '') for m in a.needs_reset))
+            if getattr(a, 'idle_exit', 0) and len(done) < len(cams) and time.time() - last['t'] > a.idle_exit:
+                log(f"nothing new for {a.idle_exit}s - finishing this pass")
+                break
             time.sleep(a.interval)
-        log("ALL cameras in the list are programmed.")
+        if len(done) >= len(cams):
+            log("ALL cameras in the list are programmed.")
     except KeyboardInterrupt:
         log("stopped by user")
     finally:
@@ -1975,7 +2070,8 @@ def main():
     global LOG_FH
     no_quickedit()
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('mode', nargs='?', default='run', choices=['check', 'run', 'ports', 'stills', 'list', 'list-ifaces'])
+    p.add_argument('mode', nargs='?', default='run', choices=['check', 'run', 'ports', 'stills', 'switch', 'list', 'list-ifaces'])
+    p.add_argument('num', nargs='?', help='switch: the switch number (1-7)')
     p.add_argument('--csv', help='camera list: the Lenel programming sheet (.xlsx/.csv), the toolkit run log programmed_cameras.csv, or a camera-list export')
     p.add_argument('--log', help='toolkit run log to cross-reference MACs against (default: programmed_cameras.csv if found)')
     p.add_argument('--here', help='the switch this laptop is plugged into: its number in the list (e.g. 3) or its camera subnet as CIDR (10.20.48.128/27)')
@@ -1996,6 +2092,8 @@ def main():
     p.add_argument('--wait', type=int, default=120, help='seconds to wait for a camera at its new IP')
     p.add_argument('--interval', type=float, default=4, help='seconds between discovery passes')
     p.add_argument('--max-tries', type=int, default=3)
+    p.add_argument('--idle-exit', type=int, default=0, help='run: stop after this many seconds with nothing new (switch mode: 240)')
+    p.add_argument('--stills-redo', action='store_true', help='stills: grab again even if the JPEG is already there')
     p.add_argument('--parallel', type=int, default=4, help='run: cameras programmed at the same time (1 = one by one)')
     p.add_argument('--switch', help='ports: switch management IP (found via LLDP if not given)')
     p.add_argument('--assign-by-port', action='store_true', help='ports: trust the port, not the sheet MAC - write assigned_switchN.csv (name/IP from the sheet row at that port, MAC from the switch)')
@@ -2076,6 +2174,8 @@ def main():
         cmd_ports(cams, a)
     elif a.mode == 'stills':
         cmd_stills(cams, a)
+    elif a.mode == 'switch':
+        cmd_switch(cams, a, extra)
     else:
         cmd_run(cams, a, extra)
 
