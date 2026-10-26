@@ -1584,9 +1584,14 @@ def _program_camera(cam, found, password, a, extra, ip):
             # FW 10.x factory cameras 401 every request (param.cgi too) until root is
             # created by an authed pwdgrp.cgi add, so is_factory() can't see them.
             # Same call the toolkit uses; a configured camera just answers 401.
-            if create_root(ip, password) and test_password(ip, 'root', password):
-                log("  step 1: factory camera (FW 10 style), root password set")
-                login = ('root', password)
+            if create_root(ip, password):
+                # a just-reset camera can take a few seconds to accept the new root
+                for _ in range(6):
+                    if test_password(ip, 'root', password):
+                        log("  step 1: factory camera (FW 10 style), root password set")
+                        login = ('root', password)
+                        break
+                    time.sleep(3)
         if not login:
             log("  NEEDS FACTORY RESET: none of the job logins work. Hold the control button while powering it up;")
             log("  it comes back at 192.168.0.90 and this run picks it up.")
@@ -1670,6 +1675,8 @@ def mark_reset(a, cam, ip):
     if nr is None:
         return
     nr[cam['mac']] = ip
+    a.reset_at = getattr(a, 'reset_at', {})
+    a.reset_at[cam['mac']] = time.time()
     write_reset_list(a)
 
 
@@ -1836,7 +1843,9 @@ def cmd_run(cams, a, extra):
                 if failed.get(cam['mac'], 0) >= a.max_tries:
                     continue
                 if cam['mac'] in a.needs_reset:
-                    if not is_factory(ip) and ip == a.needs_reset[cam['mac']]:
+                    # same IP and not factory: look again every 3 minutes only (a
+                    # camera still booting from a reset can refuse the logins once)
+                    if not is_factory(ip) and ip == a.needs_reset[cam['mac']]                             and time.time() - getattr(a, 'reset_at', {}).get(cam['mac'], 0) < 180:
                         continue
                     log(f"{cam['name']} is back at {ip} - trying it again")
                 if a.one_at_a_time:
