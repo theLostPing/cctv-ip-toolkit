@@ -1069,6 +1069,142 @@ def parse_mac_table_text(path):
                 table[mac] = f'Port {port}'
     return table
 
+
+# ---------------------------------------------------------------- telnet CLI fetch
+def telnet_mac_table(ip, user, password, timeout=25, raw_out=None):
+    """Log in to the switch CLI over telnet (port 23), run 'show mac-address-table',
+    return the raw text (pager handled). Edgecore/Accton and Cisco-style prompts."""
+    IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
+
+    def negotiate(sock, data):
+        """Strip telnet IAC sequences, refusing every option."""
+        out = bytearray()
+        i = 0
+        while i < len(data):
+            b = data[i]
+            if b != IAC:
+                out.append(b)
+                i += 1
+                continue
+            if i + 1 >= len(data):
+                break
+            cmd = data[i + 1]
+            if cmd in (DO, DONT, WILL, WONT) and i + 2 < len(data):
+                opt = data[i + 2]
+                reply = WONT if cmd == DO else (DONT if cmd == WILL else None)
+                if reply is not None:
+                    try:
+                        sock.sendall(bytes([IAC, reply, opt]))
+                    except Exception:
+                        pass
+                i += 3
+            elif cmd == SB:
+                j = data.find(bytes([IAC, SE]), i)
+                i = (j + 2) if j >= 0 else len(data)
+            else:
+                i += 2
+        return bytes(out)
+
+    def read_until(sock, patterns, limit):
+        buf = b''
+        end = time.time() + limit
+        while time.time() < end:
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                continue
+            if not chunk:
+                break
+            buf += negotiate(sock, chunk)
+            low = buf.lower()
+            for pat in patterns:
+                if pat in low:
+                    return buf, pat
+        return buf, None
+
+    sock = socket.create_connection((ip, 23), timeout=5)
+    sock.settimeout(1.0)
+    text = b''
+    try:
+        buf, hit = read_until(sock, (b'username:', b'login:', b'user name:', b'password:'), 8)
+        text += buf
+        if hit and hit != b'password:':
+            sock.sendall(user.encode() + b'\r\n')
+            buf, hit = read_until(sock, (b'password:',), 8)
+            text += buf
+        if hit == b'password:':
+            sock.sendall(password.encode() + b'\r\n')
+        buf, hit = read_until(sock, (b'#', b'>', b'invalid', b'failed', b'denied', b'username:', b'login:'), 10)
+        text += buf
+        if hit in (b'invalid', b'failed', b'denied', b'username:', b'login:'):
+            raise RuntimeError('login refused')
+        if hit == b'>':
+            sock.sendall(b'enable\r\n')
+            buf, hit2 = read_until(sock, (b'password:', b'#'), 6)
+            text += buf
+            if hit2 == b'password:':
+                sock.sendall(password.encode() + b'\r\n')
+                buf, _ = read_until(sock, (b'#',), 6)
+                text += buf
+        sock.sendall(b'terminal length 0\r\n')
+        read_until(sock, (b'#',), 4)
+        sock.sendall(b'show mac-address-table\r\n')
+        out = b''
+        end = time.time() + timeout
+        quiet = 0
+        mac_re = re.compile(rb'([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}|([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}')
+        while time.time() < end:
+            try:
+                chunk = sock.recv(8192)
+            except socket.timeout:
+                quiet += 1
+                if out and quiet >= 3:
+                    break
+                continue
+            except OSError:
+                break          # switch closed the session: whatever we have is the answer
+            if not chunk:
+                break
+            quiet = 0
+            chunk = negotiate(sock, chunk)
+            out += chunk
+            if b'--more--' in out[-200:].lower() or b'-- more --' in out[-200:].lower():
+                try:
+                    sock.sendall(b' ')
+                except OSError:
+                    break
+            stripped = out.rstrip()
+            if stripped.endswith((b'#', b'>')) and mac_re.search(out) and b'more' not in out[-40:].lower():
+                # prompt came back after the listing; give a late page half a second
+                if time.time() + 1 < end:
+                    time.sleep(0.5)
+                    try:
+                        more = sock.recv(8192)
+                        if more:
+                            out += negotiate(sock, more)
+                            continue
+                    except (socket.timeout, OSError):
+                        pass
+                break
+        try:
+            sock.sendall(b'exit\r\n')
+        except Exception:
+            pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    raw = out.decode('utf-8', 'ignore').replace('\x08', '')
+    raw = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', raw)
+    if raw_out:
+        try:
+            with open(raw_out, 'w', encoding='utf-8') as f:
+                f.write(raw)
+        except Exception:
+            pass
+    return raw
+
 def cmd_ports(cams, a):
     """Who is on which switch port. Needs the switch's SNMP read community (default 'public')."""
     bymac = {c['mac']: c for c in cams}
@@ -1076,7 +1212,7 @@ def cmd_ports(cams, a):
     hn = setup_access(a, cams, al) if al else None
     switch_ip = a.switch
     lldp = []
-    if (not switch_ip and not a.mac_table) or a.lldp:
+    if (not switch_ip and not a.mac_table and not (a.telnet and a.here)) or a.lldp:
         if is_admin():
             lldp = lldp_listen(a.lldp_seconds)
             for i in lldp:
@@ -1095,6 +1231,25 @@ def cmd_ports(cams, a):
         table = parse_mac_table_text(a.mac_table)
         log(f"  MAC table read from {a.mac_table}: {len(table)} entries")
         switch_ip = switch_ip or 'pasted'
+    elif a.telnet:
+        if ':' not in a.telnet:
+            raise SystemExit('--telnet must be user:password')
+        tuser, tpass = a.telnet.split(':', 1)
+        tip = switch_ip or (str(hn.broadcast_address - 1) if hn is not None else None)
+        if not tip:
+            raise SystemExit('--telnet needs --switch <ip> or --here so I know which switch to log in to')
+        raw_path = os.path.join(os.path.dirname(a.results), f"mac_table_{tip.replace('.', '_')}.txt")
+        try:
+            log(f"  logging in to {tip} over telnet as {tuser} ...")
+            raw = telnet_mac_table(tip, tuser, tpass, raw_out=raw_path)
+            table = parse_mac_table_text(raw_path)
+            log(f"  'show mac-address-table' from {tip}: {len(table)} entries (raw saved to {raw_path})")
+            if not table:
+                log("  nothing parsed - open the raw file and send it to me")
+            switch_ip = tip
+        except Exception as e:
+            log(f"  telnet to {tip} failed: {e}")
+            table = None
     cands = [] if table is not None else ([switch_ip] if switch_ip else [])
     if hn is not None:
         cands.append(str(hn.broadcast_address - 1))   # this site: the switch is the top host of its /27
@@ -1520,6 +1675,7 @@ def main():
     p.add_argument('--plan-name', default='KBO-{n:03d}', help='numbering plan: name pattern for proposals (default KBO-{n:03d})')
     p.add_argument('--community', default='public', help='ports: SNMP read community')
     p.add_argument('--mac-table', help="ports: a text file with the switch's 'show mac-address-table' output, used instead of SNMP")
+    p.add_argument('--telnet', help="ports: user:password to log in to the switch CLI over telnet and run 'show mac-address-table' (used instead of SNMP)")
     p.add_argument('--lldp', action='store_true', help='ports: always listen for LLDP even if --switch is given')
     p.add_argument('--lldp-seconds', type=int, default=35)
     p.add_argument('--snapshot', help='ports: save the set of MACs seen to this file')
