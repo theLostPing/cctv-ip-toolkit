@@ -37,7 +37,9 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 try:
@@ -68,9 +70,19 @@ def _default_csv_candidates():
 LOG_FH = None
 
 
+_LOG_LOCK = threading.RLock()   # re-entrant: the CSV writers hold it and may log
+_TL = threading.local()   # per-thread camera name, so parallel cameras' lines stay readable
+
+
 def log(msg):
-    line = f"{datetime.now().strftime('%H:%M:%S')}  {msg}"
-    print(line, flush=True)
+    tag = getattr(_TL, 'tag', '')
+    line = f"{datetime.now().strftime('%H:%M:%S')}  {('[' + tag + '] ') if tag else ''}{msg}"
+    with _LOG_LOCK:
+        print(line, flush=True)
+        _log_file(line)
+
+
+def _log_file(line):
     if LOG_FH:
         try:
             LOG_FH.write(line + '\n')
@@ -1552,9 +1564,20 @@ def arp_pin(iface_idx, ip, mac, on=True):
         pass
 
 
+_ALIAS_LOCK = threading.Lock()
+
+
 def program_camera(cam, found, password, a, extra):
     """found = probe dict at the IP where the camera lives right now."""
     ip = found['ip']
+    _TL.tag = cam['name'] if getattr(a, 'parallel', 1) > 1 else ''
+    try:
+        return _program_camera_pinned(cam, found, password, a, extra, ip)
+    finally:
+        _TL.tag = ''
+
+
+def _program_camera_pinned(cam, found, password, a, extra, ip):
     pinned = False
     if ip == FACTORY_IP and getattr(a, 'al', None) is not None:
         arp_pin(a.al.idx, ip, cam['mac'], True)
@@ -1631,9 +1654,10 @@ def _program_camera(cam, found, password, a, extra, ip):
     if ip != cam['ip']:
         if a.al is not None and not a.no_alias and not any(ipaddress.ip_address(x['ip']) in tnet for x in local_ipv4s()) \
                 and (a.here_net is None or tnet == a.here_net):
-            mine = free_host_ip(tnet, {c['ip'] for c in a.cams})
-            if mine:
-                a.al.ensure(mine, tnet.prefixlen)
+            with _ALIAS_LOCK:
+                mine = free_host_ip(tnet, {c['ip'] for c in a.cams})
+                if mine:
+                    a.al.ensure(mine, tnet.prefixlen)
         log(f"  step 2: static {cam['ip']} / {sn} gw {gw}")
         if not set_network(ip, cur_pw, cam['ip'], sn, gw, found.get('firmware', '')):
             log("  FAILED to set network"); return False
@@ -1681,6 +1705,11 @@ def mark_reset(a, cam, ip):
 
 
 def write_reset_list(a):
+    with _LOG_LOCK:
+        _write_reset_list(a)
+
+
+def _write_reset_list(a):
     path = os.path.join(os.path.dirname(a.results), 'needs_reset.csv')
     byname = {c['mac']: c for c in a.cams}
     try:
@@ -1695,6 +1724,11 @@ def write_reset_list(a):
 
 
 def write_result(a, cam, ip, found):
+    with _LOG_LOCK:
+        _write_result(a, cam, ip, found)
+
+
+def _write_result(a, cam, ip, found):
     path = a.results
     new = not os.path.exists(path)
     with open(path, 'a', newline='') as f:
@@ -1828,6 +1862,7 @@ def cmd_run(cams, a, extra):
     try:
         while len(done) < len(cams):
             ips = discover(iface_ips)
+            batch = []
             for ip in sorted(ips):
                 info = probe(ip, timeout=2)
                 if not info or not info['mac']:
@@ -1848,17 +1883,40 @@ def cmd_run(cams, a, extra):
                     if not is_factory(ip) and ip == a.needs_reset[cam['mac']]                             and time.time() - getattr(a, 'reset_at', {}).get(cam['mac'], 0) < 180:
                         continue
                     log(f"{cam['name']} is back at {ip} - trying it again")
+                if any(c['mac'] == cam['mac'] for c, _ in batch):
+                    continue
                 if a.one_at_a_time:
                     input(f"\n  Found {cam['name']} at {ip}. Press Enter to program it (Ctrl-C to quit) ")
-                if program_camera(cam, info, a.password, a, extra):
+                batch.append((cam, info))
+
+            def finish(cam, ok):
+                if ok:
                     done.add(cam['mac'])
                     if a.needs_reset.pop(cam['mac'], None):
                         write_reset_list(a)
-                elif cam['mac'] in a.needs_reset:
-                    pass
-                else:
+                elif cam['mac'] not in a.needs_reset:
                     failed[cam['mac']] = failed.get(cam['mac'], 0) + 1
                     log(f"  will retry {cam['name']} next pass ({failed[cam['mac']]}/{a.max_tries})")
+
+            # factory cameras all share 192.168.0.90 (ARP pin), so those go one at a time
+            serial = [x for x in batch if a.parallel <= 1 or a.one_at_a_time or x[1]['ip'] == FACTORY_IP]
+            par = [x for x in batch if x not in serial]
+            if par:
+                if len(par) > 1:
+                    log(f"programming {len(par)} cameras, {min(len(par), a.parallel)} at a time: " +
+                        ', '.join(c['name'] for c, _ in par))
+                with ThreadPoolExecutor(max_workers=a.parallel) as ex:
+                    futs = {ex.submit(program_camera, c, i, a.password, a, extra): c for c, i in par}
+                    for f in as_completed(futs):
+                        c = futs[f]
+                        try:
+                            ok = f.result()
+                        except Exception as e:
+                            log(f"[{c['name']}] ERROR {type(e).__name__}: {e}")
+                            ok = False
+                        finish(c, ok)
+            for c, i in serial:
+                finish(c, program_camera(c, i, a.password, a, extra))
             left = [c['name'] for c in cams if c['mac'] not in done]
             log(f"-- {len(done)}/{len(cams)} done. Waiting for: {', '.join(left[:12])}{' ...' if len(left) > 12 else ''}")
             if a.needs_reset:
@@ -1902,6 +1960,7 @@ def main():
     p.add_argument('--wait', type=int, default=120, help='seconds to wait for a camera at its new IP')
     p.add_argument('--interval', type=float, default=4, help='seconds between discovery passes')
     p.add_argument('--max-tries', type=int, default=3)
+    p.add_argument('--parallel', type=int, default=4, help='run: cameras programmed at the same time (1 = one by one)')
     p.add_argument('--switch', help='ports: switch management IP (found via LLDP if not given)')
     p.add_argument('--assign-by-port', action='store_true', help='ports: trust the port, not the sheet MAC - write assigned_switchN.csv (name/IP from the sheet row at that port, MAC from the switch)')
     p.add_argument('--stills-dir', help='stills: folder to save JPEGs in (default: stills\\ next to the list)')
