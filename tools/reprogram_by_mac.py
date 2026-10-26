@@ -1043,6 +1043,32 @@ def plan_ok(a, cams):
         log(f"  plan check: {len(bad)} listed camera(s) do not follow the numbering plan: {', '.join(bad[:8])}")
     return not bad
 
+
+def parse_mac_table_text(path):
+    """Parse a pasted `show mac-address-table` (Edgecore/Cisco-style) into {MAC: 'Port N'}.
+    Tolerant: any line with a MAC and a port token like 'Eth 1/ 5', 'Eth1/5', '1/5', 'Gi1/0/5', 'Port 5'."""
+    table = {}
+    mac_re = re.compile(r'([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}|([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}')
+    port_res = [re.compile(r'(?:Eth(?:ernet)?\s*)?\b\d+/(?:\d+/)?\s*(\d+)\b', re.I),
+                re.compile(r'\bPort\s*(\d+)\b', re.I),
+                re.compile(r'\b(?:Gi|Fa|Te)\S*?(\d+)\b', re.I)]
+    with open(path, encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            m = mac_re.search(line)
+            if not m:
+                continue
+            mac = norm_mac(m.group(0))
+            rest = line[:m.start()] + ' ' + line[m.end():]
+            port = None
+            for pr in port_res:
+                pm = pr.search(rest)
+                if pm:
+                    port = int(pm.group(1))
+                    break
+            if mac and port is not None:
+                table[mac] = f'Port {port}'
+    return table
+
 def cmd_ports(cams, a):
     """Who is on which switch port. Needs the switch's SNMP read community (default 'public')."""
     bymac = {c['mac']: c for c in cams}
@@ -1050,7 +1076,7 @@ def cmd_ports(cams, a):
     hn = setup_access(a, cams, al) if al else None
     switch_ip = a.switch
     lldp = []
-    if not switch_ip or a.lldp:
+    if (not switch_ip and not a.mac_table) or a.lldp:
         if is_admin():
             lldp = lldp_listen(a.lldp_seconds)
             for i in lldp:
@@ -1065,7 +1091,11 @@ def cmd_ports(cams, a):
             log("  not Administrator, skipping LLDP")
     tried = []
     table = None
-    cands = [switch_ip] if switch_ip else []
+    if a.mac_table:
+        table = parse_mac_table_text(a.mac_table)
+        log(f"  MAC table read from {a.mac_table}: {len(table)} entries")
+        switch_ip = switch_ip or 'pasted'
+    cands = [] if table is not None else ([switch_ip] if switch_ip else [])
     if hn is not None:
         cands.append(str(hn.broadcast_address - 1))   # this site: the switch is the top host of its /27
     cands += [a.gateway if a.gateway and a.gateway != 'auto' else '', '192.168.2.10', '192.168.1.1', '192.168.0.1']
@@ -1489,6 +1519,7 @@ def main():
     p.add_argument('--plan-block', type=int, default=32, help='numbering plan: addresses per switch block (default 32)')
     p.add_argument('--plan-name', default='KBO-{n:03d}', help='numbering plan: name pattern for proposals (default KBO-{n:03d})')
     p.add_argument('--community', default='public', help='ports: SNMP read community')
+    p.add_argument('--mac-table', help="ports: a text file with the switch's 'show mac-address-table' output, used instead of SNMP")
     p.add_argument('--lldp', action='store_true', help='ports: always listen for LLDP even if --switch is given')
     p.add_argument('--lldp-seconds', type=int, default=35)
     p.add_argument('--snapshot', help='ports: save the set of MACs seen to this file')
