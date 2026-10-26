@@ -1957,8 +1957,23 @@ def cmd_run(cams, a, extra):
                 ', '.join(bymac[m]['name'] for m in a.needs_reset))
 
 
+def no_quickedit():
+    """Windows console QuickEdit: one stray click starts a selection and FREEZES the
+    program on its next print until a right-click/Enter, then it all scrolls past.
+    Turn it off for this window."""
+    try:
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-10)
+        mode = ctypes.c_uint32()
+        if k.GetConsoleMode(h, ctypes.byref(mode)):
+            k.SetConsoleMode(h, (mode.value & ~0x0040) | 0x0080)   # -QUICK_EDIT, +EXTENDED_FLAGS
+    except Exception:
+        pass
+
+
 def main():
     global LOG_FH
+    no_quickedit()
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('mode', nargs='?', default='run', choices=['check', 'run', 'ports', 'stills', 'list', 'list-ifaces'])
     p.add_argument('--csv', help='camera list: the Lenel programming sheet (.xlsx/.csv), the toolkit run log programmed_cameras.csv, or a camera-list export')
