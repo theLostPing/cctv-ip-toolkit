@@ -6,6 +6,8 @@ one camera at a time, matched by MAC against the toolkit's programmed_cameras.cs
     python reprogram_by_mac.py check                 # who is still fine, who is gone
     python reprogram_by_mac.py run --password XXXX   # sit and wait, program each camera as it shows up
     python reprogram_by_mac.py ports [--switch IP]    # which switch port each MAC is on -> switch_ports.csv
+        add --plan-base 10.20.48.0 to check ports against the numbering plan and to name
+        unlisted cameras from their port (-> proposed_cameras.csv, review, then run --csv it)
 
 What it does for every camera it finds that is in the list and not already right:
     1. sets the root password (factory camera has none)
@@ -839,6 +841,42 @@ def _port_sort_key(name):
     return (0, int(nums[-1])) if nums else (1, name or '')
 
 
+
+# ---------------------------------------------------------------- numbering plan
+def cam_number(name):
+    m = re.search(r'(\d+)\s*$', name or '')
+    return int(m.group(1)) if m else None
+
+
+def plan_ip(a, n):
+    """Camera number -> IP under the site plan: cameras are numbered in blocks of
+    --plan-per-switch (one switch each); each block owns --plan-block addresses
+    starting at --plan-base + --plan-first. Default plan = 24 cameras per switch,
+    32 addresses per block (8 spare), first camera at base+67."""
+    base = int(ipaddress.ip_address(a.plan_base))
+    k = (n - 1) // a.plan_per_switch
+    return str(ipaddress.ip_address(base + a.plan_first + (n - 1 - k * a.plan_per_switch) + k * a.plan_block))
+
+
+def plan_port(a, n):
+    return (n - 1) % a.plan_per_switch + 1
+
+
+def plan_switch(a, n):
+    return (n - 1) // a.plan_per_switch + 1
+
+
+def plan_ok(a, cams):
+    """True if every listed camera's IP matches the plan - otherwise we do not propose anything."""
+    bad = []
+    for c in cams:
+        n = cam_number(c['name'])
+        if n is None or plan_ip(a, n) != c['ip']:
+            bad.append(c['name'])
+    if bad:
+        log(f"  plan check: {len(bad)} listed camera(s) do not follow the numbering plan: {', '.join(bad[:8])}")
+    return not bad
+
 def cmd_ports(cams, a):
     """Who is on which switch port. Needs the switch's SNMP read community (default 'public')."""
     bymac = {c['mac']: c for c in cams}
@@ -926,15 +964,76 @@ def cmd_ports(cams, a):
                      'Device': who, 'TargetIP': c['ip'] if c else '', 'Model': (info['model'] if info else (c['model'] if c else '')),
                      'Status': status, 'Switch': switch_ip or ''})
     rows.sort(key=lambda r: (_port_sort_key(r['Port']), r['Device']))
+
+    # --- numbering plan: expected port per camera, proposals for unknown Axis units
+    def port_no(pname):
+        nums = re.findall(r'\d+', pname or '')
+        return int(nums[-1]) if nums else None
+    use_plan = a.plan_base and plan_ok(a, cams)
+    sw_no = a.switch_number
+    if use_plan and not sw_no:
+        votes = {}
+        for r in rows:
+            if r['TargetIP'] and r['Port']:
+                n = cam_number(r['Device'])
+                if n:
+                    votes[plan_switch(a, n)] = votes.get(plan_switch(a, n), 0) + 1
+        if votes:
+            sw_no = max(votes, key=votes.get)
+            log(f"  this looks like switch #{sw_no} of the plan ({votes[sw_no]} of {sum(votes.values())} listed cameras on it agree)"
+                + ("" if len(votes) == 1 else f"; others vote {votes}"))
+    proposals = []
+    for r in rows:
+        r['ExpectedPort'] = ''
+        r['Proposed'] = ''
+        if not use_plan:
+            continue
+        pn = port_no(r['Port'])
+        if r['TargetIP']:
+            n = cam_number(r['Device'])
+            if n:
+                exp = plan_port(a, n)
+                r['ExpectedPort'] = str(exp)
+                if pn and pn != exp:
+                    r['Status'] = (r['Status'] + '; ' if r['Status'] else '') + f'port {pn} but plan says {exp}'
+                if pn and sw_no and plan_switch(a, n) != sw_no:
+                    r['Status'] = (r['Status'] + '; ' if r['Status'] else '') + f'belongs to switch {plan_switch(a, n)}'
+        elif r['Device'].startswith('Axis') and pn and sw_no and pn <= a.plan_per_switch:
+            n = (sw_no - 1) * a.plan_per_switch + pn
+            name = a.plan_name.format(n=n)
+            r['Proposed'] = f"{name} {plan_ip(a, n)}"
+            proposals.append({'Camera Name': name, 'IP Address': plan_ip(a, n), 'Gateway': a.gateway,
+                              'Subnet': a.subnet, 'Model': r['Model'], 'New IP': plan_ip(a, n),
+                              'MAC Address': r['MAC'], 'Processed': 'No', 'Port': r['Port'], 'Switch': sw_no})
+    if proposals:
+        pout = os.path.join(os.path.dirname(a.results), 'proposed_cameras.csv')
+        new_file = not os.path.exists(pout)
+        have = set()
+        if not new_file:
+            with open(pout, newline='') as f:
+                have = {norm_mac(x.get('MAC Address', '')) for x in csv.DictReader(f)}
+        with open(pout, 'a', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=list(proposals[0].keys()))
+            if new_file:
+                w.writeheader()
+            for pr in proposals:
+                if pr['MAC Address'] not in have:
+                    w.writerow(pr)
+        log(f"  {len(proposals)} unlisted Axis unit(s) given a name + IP from their port -> {pout}  (REVIEW it, then: run --csv {pout})")
+
     out = os.path.join(os.path.dirname(a.results), 'switch_ports.csv')
     with open(out, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=['Port', 'Device', 'IP', 'TargetIP', 'MAC', 'Vendor', 'Model', 'Status', 'Switch'])
+        w = csv.DictWriter(f, fieldnames=['Port', 'Device', 'IP', 'TargetIP', 'MAC', 'Vendor', 'Model', 'Status', 'ExpectedPort', 'Proposed', 'Switch'])
         w.writeheader()
         w.writerows(rows)
-    print(f"\n{'Port':10} {'Device':28} {'IP':15} {'MAC':18} {'Status'}")
+    print(f"\n{'Port':10} {'Device':28} {'IP':15} {'MAC':18} {'Status / proposal'}")
     for r in rows:
-        if r['Port'] or r['Device'] != 'unknown device':
-            print(f"{r['Port']:10} {r['Device'][:28]:28} {r['IP']:15} {r['MAC']:18} {r['Status']}")
+        if r['Port'] or (r['IP'] and not r['TargetIP']):
+            tail = r['Status'] + ((' -> ' + r['Proposed']) if r['Proposed'] else '')
+            print(f"{r['Port']:10} {r['Device'][:28]:28} {r['IP']:15} {r['MAC']:18} {tail}")
+    off = [r['Device'] for r in rows if r['TargetIP'] and not r['Port']]
+    if off:
+        print(f"({len(off)} listed cameras are not on this switch; full table in the CSV)")
     on_switch = [r for r in rows if r['Port']]
     log(f"{len(on_switch)} MACs on the switch, {sum(1 for r in on_switch if r['TargetIP'])} are list cameras, "
         f"{sum(1 for r in on_switch if r['Vendor'] and r['Vendor'] != 'Axis')} other known vendors. Saved {out}")
@@ -1170,6 +1269,12 @@ def main():
     p.add_argument('--interval', type=float, default=4, help='seconds between discovery passes')
     p.add_argument('--max-tries', type=int, default=3)
     p.add_argument('--switch', help='ports: switch management IP (found via LLDP if not given)')
+    p.add_argument('--switch-number', type=int, help='ports: which switch of the plan this is (1 = cameras 1-24); guessed from the listed cameras on it if omitted')
+    p.add_argument('--plan-base', help='numbering plan: network base, e.g. 10.20.48.0 ("" = no plan)')
+    p.add_argument('--plan-first', type=int, default=67, help='numbering plan: host offset of camera 1 (default 67)')
+    p.add_argument('--plan-per-switch', type=int, default=24, help='numbering plan: cameras per switch (default 24)')
+    p.add_argument('--plan-block', type=int, default=32, help='numbering plan: addresses per switch block (default 32)')
+    p.add_argument('--plan-name', default='KBO-{n:03d}', help='numbering plan: name pattern for proposals (default KBO-{n:03d})')
     p.add_argument('--community', default='public', help='ports: SNMP read community')
     p.add_argument('--lldp', action='store_true', help='ports: always listen for LLDP even if --switch is given')
     p.add_argument('--lldp-seconds', type=int, default=35)
