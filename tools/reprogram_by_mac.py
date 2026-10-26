@@ -1542,11 +1542,16 @@ def cmd_ports(cams, a):
 
 # ---------------------------------------------------------------- the work
 def wait_for(ip, mac, seconds):
-    end = time.time() + seconds
+    start = time.time()
+    end = start + seconds
+    said = start
     while time.time() < end:
         info = probe(ip, timeout=2)
         if info and info['mac'] == mac:
             return info
+        if time.time() - said >= 20:
+            said = time.time()
+            log(f"    still waiting for it at {ip} ({int(said - start)}s of {seconds}s)")
         time.sleep(2)
     return None
 
@@ -1859,6 +1864,14 @@ def cmd_run(cams, a, extra):
 
     seen_unknown = set()
     failed = {}
+    inprog = set()
+
+    def status(what):
+      with _LOG_LOCK:   # worker threads add to inprog
+        left = [c['name'] for c in cams if c['mac'] not in done and c['name'] not in inprog]
+        log(f"== {len(done)}/{len(cams)} done ({what})"
+            + (f" | working on: {', '.join(sorted(inprog))}" if inprog else '')
+            + (f" | not seen yet: {len(left)}" if left else ''))
     try:
         while len(done) < len(cams):
             ips = discover(iface_ips)
@@ -1890,6 +1903,8 @@ def cmd_run(cams, a, extra):
                 batch.append((cam, info))
 
             def finish(cam, ok):
+                with _LOG_LOCK:
+                    inprog.discard(cam['name'])
                 if ok:
                     done.add(cam['mac'])
                     if a.needs_reset.pop(cam['mac'], None):
@@ -1897,6 +1912,7 @@ def cmd_run(cams, a, extra):
                 elif cam['mac'] not in a.needs_reset:
                     failed[cam['mac']] = failed.get(cam['mac'], 0) + 1
                     log(f"  will retry {cam['name']} next pass ({failed[cam['mac']]}/{a.max_tries})")
+                status(f"{cam['name']} {'DONE' if ok else 'not done'}")
 
             # factory cameras all share 192.168.0.90 (ARP pin), so those go one at a time
             serial = [x for x in batch if a.parallel <= 1 or a.one_at_a_time or x[1]['ip'] == FACTORY_IP]
@@ -1906,7 +1922,11 @@ def cmd_run(cams, a, extra):
                     log(f"programming {len(par)} cameras, {min(len(par), a.parallel)} at a time: " +
                         ', '.join(c['name'] for c, _ in par))
                 with ThreadPoolExecutor(max_workers=a.parallel) as ex:
-                    futs = {ex.submit(program_camera, c, i, a.password, a, extra): c for c, i in par}
+                    def one(c, i):
+                        with _LOG_LOCK:
+                            inprog.add(c['name'])
+                        return program_camera(c, i, a.password, a, extra)
+                    futs = {ex.submit(one, c, i): c for c, i in par}
                     for f in as_completed(futs):
                         c = futs[f]
                         try:
@@ -1916,6 +1936,7 @@ def cmd_run(cams, a, extra):
                             ok = False
                         finish(c, ok)
             for c, i in serial:
+                inprog.add(c['name'])
                 finish(c, program_camera(c, i, a.password, a, extra))
             left = [c['name'] for c in cams if c['mac'] not in done]
             log(f"-- {len(done)}/{len(cams)} done. Waiting for: {', '.join(left[:12])}{' ...' if len(left) > 12 else ''}")
