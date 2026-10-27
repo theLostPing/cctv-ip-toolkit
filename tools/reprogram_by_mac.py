@@ -1536,13 +1536,15 @@ def cmd_ports(cams, a):
         w = csv.DictWriter(f, fieldnames=['Port', 'Device', 'IP', 'TargetIP', 'MAC', 'Vendor', 'Model', 'Status', 'ExpectedPort', 'LogName', 'Proposed', 'Switch'])
         w.writeheader()
         w.writerows(rows)
-    print(f"\n{'Port':10} {'Device':28} {'IP':15} {'MAC':18} {'Status / proposal'}")
-    for r in rows:
+    show = not getattr(a, 'quiet_table', False)
+    if show:
+        print(f"\n{'Port':10} {'Device':28} {'IP':15} {'MAC':18} {'Status / proposal'}")
+    for r in rows if show else []:
         if r['Port'] or (r['IP'] and not r['TargetIP']):
             tail = r['Status'] + ((' -> ' + r['Proposed']) if r['Proposed'] else '')
             print(f"{r['Port']:10} {r['Device'][:28]:28} {r['IP']:15} {r['MAC']:18} {tail}")
     off = [r['Device'] for r in rows if r['TargetIP'] and not r['Port']]
-    if off:
+    if off and show:
         print(f"({len(off)} listed cameras are not on this switch; full table in the CSV)")
     if al:
         al.cleanup()
@@ -1786,7 +1788,7 @@ def cmd_stills(cams, a):
         name = f"{cam['name']}_{cam['ip']}"
         if not a.stills_redo and f"{name}.jpg" in existing:
             had.append(cam); print(f"{cam['name']:10} {cam['ip']:14} already have it"); continue
-        if not tcp_open(cam['ip'], 80, 0.6):
+        if not (tcp_open(cam['ip'], 80, 2) or tcp_open(cam['ip'], 80, 2)):
             miss.append((cam, 'no answer')); print(f"{cam['name']:10} {cam['ip']:14} no answer"); continue
         info = probe(cam['ip'], timeout=2)
         if info and info['mac'] and info['mac'] != cam['mac']:
@@ -1845,6 +1847,7 @@ def cmd_switch(sheet, a, extra):
     a.here, a.switch_number, a.assign_by_port = str(n), n, True
     a.telnet = a.telnet or 'admin:admin'
     a.assigned_path = None
+    a.quiet_table = True
     log(f"=== switch {n}: READ ===")
     cmd_ports(sheet, a)
     path = a.assigned_path
@@ -1874,7 +1877,11 @@ def cmd_switch(sheet, a, extra):
         log("NEEDS FACTORY RESET: " + ', '.join(c['name'] for c in active if c['mac'] in a.needs_reset) +
             "  (reset, then run this same command again)")
     nm = lambda pt: (by_port.get(pt) or sheet_at.get(pt) or {}).get('name', f'port {pt}')
-    if lap == {24}:
+    p2 = by_port.get(2)
+    if lap == {24} and p2 and p2['mac'] not in done:
+        log(f"NEXT: {p2['name']} on port 2 is NOT done, so don't use its port yet. It answers nowhere: factory-reset it "
+            f"(hold the button while powering it up) and run this same command again with the laptop still on port 24.")
+    elif lap == {24}:
         log(f"NEXT: unplug {nm(2)} from port 2 and put the laptop there, plug {nm(24)} back into port 24, "
             f"then run this same command again.")
     elif lap == {2}:
