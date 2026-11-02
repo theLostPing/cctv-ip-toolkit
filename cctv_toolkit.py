@@ -68,10 +68,17 @@ try:
 except ImportError:
     HAS_OPENPYXL = False
 
+# v5.3.0 — switch access (port map, PoE cycle, LLDP, "the port decides the
+# camera"). Pure python; lives beside this file and is bundled by PyInstaller.
+try:
+    import switchlib
+except ImportError:
+    switchlib = None
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-APP_VERSION = "5.2.1"
+APP_VERSION = "5.3.0"
 GITHUB_LATEST_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases/latest"
 GITHUB_ALL_RELEASES_API = "https://api.github.com/repos/theLostPing/cctv-ip-toolkit/releases?per_page=20"
 GITHUB_RELEASES_PAGE = "https://github.com/theLostPing/cctv-ip-toolkit/releases/latest"
@@ -340,6 +347,19 @@ DEFAULT_SETTINGS = {
         # additional full MACs (one per line, any common format).
         'dhcp_mac_filter_enabled': 'true',
         'dhcp_mac_whitelist': '',
+        # v5.3.0 — Switch Loading, hardened. The switch the cameras hang off
+        # (remembered per PC), how it is read, and the run limits that came out
+        # of a 7-switch / 151-camera site: verify 4 cameras at a time, stop a
+        # run that has seen nothing new for 4 minutes, and try at most 5 logins
+        # per camera (the job's own, not an 800-entry list).
+        'switch_ip': '',
+        'switch_community': 'public',
+        'switch_telnet_user': '',
+        'switch_telnet_password': '',
+        'switch_profile': 'edgecore',
+        'sl_parallel_verify': '4',
+        'sl_idle_exit_s': '240',
+        'sl_max_logins': '5',
     },
     'warnings': {
         'show_incomplete_camera_warning': 'true',
@@ -1130,7 +1150,8 @@ class CameraDataManager:
         def richness(cam):
             """Count non-empty meaningful fields — richer entry wins"""
             score = 0
-            for key in ('name', 'hostname', 'ip', 'model', 'serial', 'mac', 'gateway', 'subnet', 'number'):
+            for key in ('name', 'hostname', 'ip', 'model', 'serial', 'mac', 'gateway', 'subnet', 'number',
+                        'switch', 'port'):
                 val = cam.get(key, '')
                 if val and val != '(Auth Required)':
                     score += 1
@@ -1225,12 +1246,18 @@ class CameraDataManager:
         """Export to CSV file"""
         with open(filepath, 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['Camera Name', 'IP Address', 'Gateway', 'Subnet', 'Model', 'New IP', 'MAC Address', 'Processed'])
+            w.writerow(['Camera Name', 'IP Address', 'Gateway', 'Subnet', 'Model', 'New IP', 'MAC Address', 'Processed',
+                        'Switch', 'Port'])
             for cam in self.cameras:
                 w.writerow([cam.get('name',''), cam.get('ip',''), cam.get('gateway',''),
                            cam.get('subnet',''), cam.get('model',''), cam.get('new_ip',''),
                            cam.get('mac',''),
-                           'Yes' if cam.get('processed') else 'No'])
+                           'Yes' if cam.get('processed') else 'No',
+                           cam.get('switch', ''), cam.get('port', '')])
+
+    def rows_with_ports(self):
+        """v5.3.0 — cameras that carry a switch port (the sheet said where each one plugs in)."""
+        return [c for c in self.cameras if str(c.get('port') or '').strip()]
 
 
 class PasswordDataManager:
@@ -2762,14 +2789,38 @@ class AxisProtocol(CameraProtocol):
         # downscale here, the GUI handles fitting. Bandwidth on this is
         # noticeable when you've got 30 of these running in parallel during
         # discovery; that's why TIMEOUT is short.
-        try:
-            r = requests.get(f"http://{ip}/axis-cgi/jpg/image.cgi",
-                auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
-            if r.status_code == 200:
-                return r.content
-        except:
-            pass
+        # v5.3.0 — two tries: the first request to a camera right after this PC
+        # gained an address on its subnet always missed (ARP took longer than
+        # the connect timeout). A second try a moment later gets the picture.
+        for attempt in range(2):
+            try:
+                r = requests.get(f"http://{ip}/axis-cgi/jpg/image.cgi",
+                    auth=HTTPDigestAuth(username, password), timeout=TIMEOUT)
+                if r.status_code == 200:
+                    return r.content
+                if r.status_code == 401:
+                    break
+            except Exception:
+                pass
+            time.sleep(1.5)
         return None
+
+    def user_exists(self, ip, password, username):
+        """v5.3.0 — True/False whether `username` is on the camera; None when the
+        camera would not tell us (no auth, odd firmware). 'Done' for a camera means
+        right IP + root login + every extra user present, so a re-run can skip it."""
+        try:
+            r = requests.get(f"http://{ip}/axis-cgi/pwdgrp.cgi", params={"action": "get"},
+                             auth=HTTPDigestAuth("root", password), timeout=TIMEOUT)
+            if r.status_code != 200:
+                return None
+            names = set()
+            for line in r.text.splitlines():
+                if '=' in line:
+                    names.update(x.strip().strip('"') for x in line.split('=', 1)[1].split(','))
+            return username in names
+        except Exception:
+            return None
 
     def test_password(self, ip, username, password):
         # Cheapest authenticated call I can think of — Brand group is tiny,
@@ -4926,8 +4977,9 @@ class SmartDataAnalyzer:
             column_types = {}
             for col_idx in range(max(len(rows[0]) if rows else 0, len(header_map))):
                 field = header_map.get(col_idx, 'unknown')
-                # Skip non-camera fields
-                if field in ('rack', 'switch', 'port', 'unknown'):
+                # Skip non-camera fields. v5.3.0: switch + port are camera
+                # fields now — the port map needs them.
+                if field in ('rack', 'unknown'):
                     field = 'unknown'
                 sample = rows[0][col_idx] if rows and col_idx < len(rows[0]) else ''
                 column_types[col_idx] = {
@@ -4952,8 +5004,8 @@ class SmartDataAnalyzer:
             values = all_columns[col_idx]
             col_type, confidence = SmartDataAnalyzer.guess_column_type(values, all_columns)
             
-            # Skip non-camera fields
-            if col_type in ('rack', 'switch', 'port'):
+            # Skip non-camera fields (v5.3.0: switch / port are kept)
+            if col_type in ('rack',):
                 col_type = 'unknown'
             
             # Avoid duplicate assignments (prefer first match)
@@ -5180,7 +5232,7 @@ class SmartImportDialog(tk.Toplevel):
         # If header was detected, use that mapping instead
         if header_map:
             for col_idx, field in header_map.items():
-                if field in ('rack', 'switch', 'port', 'unknown'):
+                if field in ('rack', 'unknown'):
                     field = 'unknown'
                 sample = self.rows[0][col_idx] if col_idx < len(self.rows[0]) else ''
                 analysis[col_idx] = {'type': field, 'confidence': 1.0, 'sample': sample}
@@ -5191,7 +5243,8 @@ class SmartImportDialog(tk.Toplevel):
         self.mapping_label.pack_forget()
         
         # Create mapping dropdowns
-        field_options = ['(skip)', 'number', 'name', 'ip', 'gateway', 'subnet', 'model', 'mac', 'serial', 'new_ip']
+        field_options = ['(skip)', 'number', 'name', 'ip', 'gateway', 'subnet', 'model', 'mac', 'serial', 'new_ip',
+                         'switch', 'port']
         self.column_vars = []
         
         num_cols = max(len(row) for row in self.rows)
@@ -6869,7 +6922,9 @@ class CameraEditorDialog(tk.Toplevel):
         # Remaining fields
         for label, key in [("New IP (for updates):", "new_ip"),
                            ("Hostname (optional):", "hostname"),
-                           ("Model (optional):", "model")]:
+                           ("Model (optional):", "model"),
+                           ("Switch (optional):", "switch"),
+                           ("Switch port (optional):", "port")]:
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', pady=3)
             entry = ttk.Entry(frame, width=30)
             entry.grid(row=row, column=1, sticky='ew', pady=3, padx=(10, 0))
@@ -6974,13 +7029,28 @@ class CameraEditorDialog(tk.Toplevel):
             # v5.0 b2: MAC field is the 6-hex OUI for brand validation, not a
             # per-camera binding. Strip non-hex, uppercase, cap at 6 chars.
             # Empty stays empty = no brand check.
-            'mac': ''.join(c for c in self.entries['mac'].get().strip()
-                           if c in '0123456789abcdefABCDEF').upper()[:6],
+            # v5.3.0: a FULL MAC (from the sheet or the port map) must survive
+            # an edit — Switch Loading matches on it. Untouched OUI = keep the
+            # row's full MAC; a typed 12-hex MAC is kept whole.
+            'mac': self._mac_result(),
             'brand': self.camera.get('brand', 'axis') if self.camera else 'axis',
             'pending': pending,
-            'processed': False
+            'processed': False,
+            'switch': self.entries['switch'].get().strip(),
+            'port': self.entries['port'].get().strip(),
         }
         self.destroy()
+
+    def _mac_result(self):
+        typed = ''.join(c for c in self.entries['mac'].get().strip()
+                        if c in '0123456789abcdefABCDEF').upper()
+        existing = ''.join(c for c in (self.camera or {}).get('mac', '') or ''
+                           if c in '0123456789abcdefABCDEF').upper()
+        if len(existing) == 12 and typed == existing[:6]:
+            return (self.camera or {}).get('mac', '')
+        if len(typed) == 12:
+            return ':'.join(typed[i:i + 2] for i in range(0, 12, 2))
+        return typed[:6]
     
     def cancel(self):
         self.result = None
@@ -7348,6 +7418,391 @@ class LldpDiscoveryDialog(tk.Toplevel):
 
 
 # ============================================================================
+# SWITCH PORT MAP (v5.3.0) — "the port decides the camera"
+# ============================================================================
+class SwitchPortMapDialog(tk.Toplevel):
+    """Read the PoE switch the cameras hang off and line its ports up against
+    the camera list: the list row for (switch, port) gives the name, IP,
+    gateway and mask; the switch gives the MAC. Then Switch Loading can match
+    every camera by MAC, and a camera that never shows up has a port number
+    next to its name.
+
+    Born on a 7-switch / 151-camera site where the integrator sheet's MAC
+    column was wrong for every single camera and the physical ports were
+    right. Also: PoE-cycle a port, find the switch's address, say where this
+    PC is plugged in, and plan the second pass (this PC occupies one camera
+    port; that camera is done last from a port whose camera is finished)."""
+
+    PROFILES = [('edgecore', 'Edgecore / Accton'), ('cisco', 'Cisco'), ('aruba', 'Aruba / HPE'), ('generic', 'Other')]
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.title("Switch Port Map")
+        self.transient(parent)
+        self.resizable(True, True)
+        self._cancel = threading.Event()
+        self._busy = False
+        self._result = None
+        self._read = None
+        self._key = ''
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        s = app.settings
+
+        frame = ttk.Frame(self, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="Switch Port Map", font=('Helvetica', 14, 'bold')).pack(anchor='w')
+        ttk.Label(frame, text="Read the switch, see which camera is on which port, and fill the MACs in the "
+                              "camera list from the ports. The list row for a port gives the name and IP; the "
+                              "switch gives the MAC. Plug this PC into a CAMERA port, not an uplink.",
+                  foreground='gray', font=('Helvetica', 9), wraplength=900, justify='left').pack(anchor='w', pady=(2, 8))
+
+        top = ttk.Frame(frame)
+        top.pack(fill=tk.X)
+        ttk.Label(top, text="Switch in the list:").grid(row=0, column=0, sticky='w', pady=2)
+        self.switch_var = tk.StringVar()
+        self.switch_cb = ttk.Combobox(top, textvariable=self.switch_var, width=28, state='readonly')
+        self.switch_cb.grid(row=0, column=1, sticky='w', padx=(6, 14), pady=2)
+        ttk.Label(top, text="Switch IP:").grid(row=0, column=2, sticky='w')
+        self.ip_var = tk.StringVar(value=s.get('general', 'switch_ip') or '')
+        ttk.Entry(top, textvariable=self.ip_var, width=18).grid(row=0, column=3, sticky='w', padx=(6, 6))
+        self.find_btn = ttk.Button(top, text="Find my switch", command=self._find)
+        self.find_btn.grid(row=0, column=4, sticky='w')
+
+        ttk.Label(top, text="SNMP community:").grid(row=1, column=0, sticky='w', pady=2)
+        self.comm_var = tk.StringVar(value=s.get('general', 'switch_community') or 'public')
+        ttk.Entry(top, textvariable=self.comm_var, width=16).grid(row=1, column=1, sticky='w', padx=(6, 14), pady=2)
+        ttk.Label(top, text="Telnet user / password:").grid(row=1, column=2, sticky='w')
+        tp = ttk.Frame(top)
+        tp.grid(row=1, column=3, columnspan=2, sticky='w', padx=(6, 0))
+        self.tuser_var = tk.StringVar(value=s.get('general', 'switch_telnet_user') or '')
+        self.tpass_var = tk.StringVar(value=s.get('general', 'switch_telnet_password') or '')
+        ttk.Entry(tp, textvariable=self.tuser_var, width=10).pack(side=tk.LEFT)
+        ttk.Entry(tp, textvariable=self.tpass_var, width=12, show='*').pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(tp, text="type:").pack(side=tk.LEFT)
+        self.prof_var = tk.StringVar(value=s.get('general', 'switch_profile') or 'edgecore')
+        self.prof_cb = ttk.Combobox(tp, textvariable=self.prof_var, width=16, state='readonly',
+                                    values=[k for k, _ in self.PROFILES])
+        self.prof_cb.pack(side=tk.LEFT, padx=(4, 0))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X, pady=(8, 4))
+        self.read_btn = ttk.Button(btns, text="📖 Read switch", command=self._read_switch)
+        self.read_btn.pack(side=tk.LEFT)
+        self.assign_btn = ttk.Button(btns, text="→ Fill MACs in the camera list by port", command=self._assign, state='disabled')
+        self.assign_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.poe_btn = ttk.Button(btns, text="⚡ PoE cycle selected port", command=self._poe, state='disabled')
+        self.poe_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.export_btn = ttk.Button(btns, text="💾 Export port map", command=self._export, state='disabled')
+        self.export_btn.pack(side=tk.LEFT, padx=(8, 0))
+        self.sl_btn = ttk.Button(btns, text="⚡ Start Switch Loading", command=self._start_sl)
+        self.sl_btn.pack(side=tk.RIGHT)
+
+        self.status_var = tk.StringVar(value="Pick the switch, plug this PC into one of its camera ports, click Read switch.")
+        ttk.Label(frame, textvariable=self.status_var, font=('Helvetica', 10)).pack(anchor='w')
+
+        cols = ('port', 'status', 'mac', 'vendor', 'ip', 'expected', 'flags')
+        self.tree = ttk.Treeview(frame, columns=cols, show='headings', height=18, selectmode='browse')
+        for c, t, w in (('port', 'Port', 50), ('status', 'Status', 110), ('mac', 'MAC on port', 140),
+                        ('vendor', 'Vendor', 80), ('ip', 'Answers at', 110), ('expected', 'List says (name → IP)', 220),
+                        ('flags', 'Notes', 420)):
+            self.tree.heading(c, text=t)
+            self.tree.column(c, width=w, anchor='w')
+        vsb = ttk.Scrollbar(frame, orient='vertical', command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(4, 0))
+        vsb.pack(side=tk.RIGHT, fill=tk.Y, pady=(4, 0))
+        self.tree.tag_configure('ok', foreground='#2E7D32')
+        self.tree.tag_configure('warn', foreground='#E65100')
+        self.tree.tag_configure('bad', foreground='#C62828')
+        self.tree.tag_configure('dim', foreground='#9E9E9E')
+        self.tree.tag_configure('me', foreground='#1565C0')
+
+        self.advice_var = tk.StringVar(value='')
+        ttk.Label(self, textvariable=self.advice_var, foreground='#1565C0', font=('Helvetica', 10, 'bold'),
+                  wraplength=980, justify='left', padding=(12, 4)).pack(fill=tk.X, side=tk.BOTTOM)
+        self._fill_switches()
+        _center_on_parent(self, parent, 1100, 640)
+
+    # ------------------------------------------------------------ helpers
+    def _log(self, m):
+        try:
+            self.app.log(m)
+        except Exception:
+            pass
+
+    def _set_status(self, m):
+        self.after(0, lambda: self.status_var.set(m))
+
+    def _fill_switches(self):
+        cams = self.app.camera_data.get_all()
+        keys = sorted({str(c.get('switch') or '').strip() for c in cams if str(c.get('switch') or '').strip()},
+                      key=lambda k: (switchlib.switch_no(k) is None, switchlib.switch_no(k) or 0, k))
+        with_ports = len(self.app.camera_data.rows_with_ports())
+        values = keys if keys else []
+        values = values + ['(every row with a port)']
+        self.switch_cb['values'] = values
+        self.switch_var.set(values[0])
+        if not with_ports:
+            self.status_var.set("The camera list has no Switch / Port columns. Import the sheet with them "
+                                "(Smart Import maps 'Switch' and 'Switch Port'), or the port map can only show who is where.")
+
+    def _switch_key(self):
+        v = self.switch_var.get()
+        return '' if v.startswith('(') else v
+
+    def _creds(self):
+        return (self.ip_var.get().strip(), self.comm_var.get().strip(), self.tuser_var.get().strip(),
+                self.tpass_var.get(), self.prof_var.get().strip() or 'generic')
+
+    def _save_creds(self):
+        ip, comm, tu, tpw, prof = self._creds()
+        s = self.app.settings
+        s.set('general', 'switch_ip', ip)
+        s.set('general', 'switch_community', comm)
+        s.set('general', 'switch_telnet_user', tu)
+        s.set('general', 'switch_telnet_password', tpw)
+        s.set('general', 'switch_profile', prof)
+
+    def _subnets(self):
+        """The camera subnets of the selected switch's rows (the switch usually lives in one)."""
+        import ipaddress
+        nets = []
+        key = self._switch_key()
+        for c in self.app.camera_data.get_all():
+            if key and not switchlib.same_switch(c.get('switch'), key):
+                continue
+            if not key and not c.get('port'):
+                continue
+            try:
+                n = ipaddress.ip_network(f"{c.get('ip')}/{c.get('subnet') or '255.255.255.0'}", strict=False)
+                if n not in nets:
+                    nets.append(n)
+            except Exception:
+                pass
+        return nets
+
+    def _busy_on(self, on):
+        self._busy = on
+        for b in (self.read_btn, self.find_btn):
+            b.config(state='disabled' if on else 'normal')
+
+    # ------------------------------------------------------------ find
+    def _find(self):
+        if self._busy:
+            return
+        self._busy_on(True)
+        self._set_status("Looking for the switch: LLDP, the usual addresses, then a sweep of the camera subnet…")
+        nets = self._subnets()
+        hints = [h for h in (self.ip_var.get().strip(),) if h]
+        ip, comm, tu, tpw, prof = self._creds()
+
+        def work():
+            try:
+                found = switchlib.find_switch(nets, hints=hints, community=comm, telnet_user=tu,
+                                              telnet_password=tpw, lldp_seconds=35 if _is_admin_windows() else 0,
+                                              cancel=self._cancel, log=self._log)
+            except Exception as e:
+                found = []
+                self._log(f"find switch: {e}")
+            def done():
+                self._busy_on(False)
+                if not found:
+                    self.status_var.set("No switch found. Type its IP (usually the top host of the camera subnet) and Read.")
+                    return
+                best = found[0]
+                self.ip_var.set(best['ip'])
+                self.status_var.set(f"Switch candidates: " + '; '.join(
+                    f"{f['ip']} ({f['via']}{', ' + f['sysname'] if f['sysname'] else ''})" for f in found[:4])
+                    + ". Best one is filled in — click Read switch.")
+            self.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ read
+    def _read_switch(self):
+        if self._busy:
+            return
+        ip, comm, tu, tpw, prof = self._creds()
+        if not ip:
+            messagebox.showwarning("Switch IP", "Type the switch's IP, or click Find my switch.", parent=self)
+            return
+        self._save_creds()
+        self._key = self._switch_key()
+        self._busy_on(True)
+        self._set_status(f"Reading {ip}…")
+        key = self._key
+        cams = self.app.camera_data.get_all()
+
+        def work():
+            res = switchlib.read_switch(ip, community=comm, telnet_user=tu, telnet_password=tpw, profile=prof, log=self._log)
+            live = {}
+            if res['ok']:
+                # wake the ARP table: ping the rows' target IPs for this switch, then ask
+                # each one that answers who it is (model + MAC), so the map shows where
+                # every camera currently answers.
+                self._set_status(f"Read {len(res['table'])} MACs from {res['sysname'] or ip} via {res['via']}; checking who answers…")
+                targets = []
+                for rows in switchlib.rows_for_switch(cams, key).values():
+                    for c in rows:
+                        if c.get('ip'):
+                            targets.append(c['ip'])
+                fip = getattr(self.app.protocol, 'FACTORY_IP', '')
+                if fip:
+                    targets.append(fip)
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=32) as ex:
+                    alive = [t for t, ok in zip(targets, ex.map(lambda t: switchlib.ping(t, 500), targets)) if ok]
+                arp = switchlib.arp_table()
+                arp_rev = {v: k for k, v in arp.items()}
+                for t in alive:
+                    try:
+                        info = self.app.protocol.probe_unrestricted(t) or {}
+                    except Exception:
+                        info = {}
+                    m = switchlib.norm_mac(info.get('mac') or '') or arp_rev.get(t, '')
+                    if m:
+                        live[m] = {'ip': t, 'model': info.get('model', '')}
+                for m, a in arp.items():
+                    live.setdefault(m, {'ip': a, 'model': ''})
+            self.after(0, lambda: self._show(res, live))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show(self, res, live):
+        self._busy_on(False)
+        self._read = res
+        self.tree.delete(*self.tree.get_children())
+        if not res['ok']:
+            self.status_var.set("Could not read the switch: " + '; '.join(res['errors'] or ['no answer']))
+            self.assign_btn.config(state='disabled')
+            return
+        cams = self.app.camera_data.get_all()
+        extra = tuple(':'.join(f'{b:02x}' for b in o) for o in (getattr(self.app.protocol, 'MAC_OUIS', None) or []))
+        result = switchlib.assign_by_port(cams, res['table'], switch_key=self._key,
+                                          laptop_macs=switchlib.my_macs(), live=live, extra_ouis=extra)
+        self._result = result
+        n_match = n_wins = n_dark = 0
+        for r in result['ports']:
+            st = r['status']
+            cam = r.get('cam')
+            exp = f"{cam.get('name', '?')} → {cam.get('ip', '?')}" if cam else ''
+            tag = 'dim'
+            if st.startswith('MATCH'):
+                tag = 'ok'; n_match += 1
+            elif st.startswith(('PORT WINS', 'NEW MAC')):
+                tag = 'warn'; n_wins += 1
+            elif st.startswith(('DARK', 'NOT A CAMERA', 'CABLING', 'MODEL?')):
+                tag = 'bad'; n_dark += st.startswith('DARK')
+            elif st == 'THIS PC':
+                tag = 'me'
+            self.tree.insert('', 'end', iid=str(r['port']), values=(
+                r['port'], st, r['mac'], r['vendor'], r['ip'], exp, '; '.join(r['flags'])), tags=(tag,))
+        name = res['sysname'] or self.ip_var.get()
+        listed = f" The list calls it {self._key}." if (self._key and res['sysname'] and
+                                                               not switchlib.same_switch(self._key, res['sysname'])) else ''
+        self.status_var.set(f"{name} via {res['via']}: {len(res['table'])} MACs, {len(result['assign'])} cameras matched to list rows "
+                            f"({n_match} as listed, {n_wins} where the port wins over the list), {n_dark} dark ports."
+                            f"{listed}" + (f" This PC is on port {', '.join(map(str, sorted(result['laptop_ports'])))}." if result['laptop_ports'] else ''))
+        for n in result['notes']:
+            self._log(f"port map: {n}")
+        if result['laptop_on_camera_port'] is None and result['notes']:
+            self.advice_var.set(result['notes'][-1])
+        else:
+            self.advice_var.set(switchlib.next_pass_advice(result, cams, self._key))
+        self.assign_btn.config(state='normal' if result['assign'] else 'disabled')
+        self.export_btn.config(state='normal')
+        self.poe_btn.config(state='normal')
+
+    # ------------------------------------------------------------ assign
+    def _assign(self):
+        if not self._result:
+            return
+        assign = self._result['assign']
+        wins = [(c, m, f) for c, m, f in assign if switchlib.norm_mac(c.get('mac', '')) not in ('', m)]
+        msg = (f"Write {len(assign)} MAC(s) into the camera list from the switch ports?\n\n"
+               f"{len(wins)} row(s) currently hold a DIFFERENT MAC and will be overwritten "
+               f"(the port decides the camera; the sheet's MAC column was wrong for every camera on the site this was built on).")
+        if not messagebox.askyesno("Fill MACs by port", msg, parent=self):
+            return
+        cams = self.app.camera_data.get_all()
+        cleared = 0
+        for cam, mac, flags in assign:
+            for other in cams:
+                if other is not cam and switchlib.norm_mac(other.get('mac', '')) == mac:
+                    other['mac'] = ''
+                    cleared += 1
+            cam['mac'] = mac
+            if self._key and not cam.get('switch'):
+                cam['switch'] = self._key
+        self.app.camera_data.save()
+        self.app.refresh_camera_list()
+        self._log(f"Port map: {len(assign)} MAC(s) written from switch ports" + (f", {cleared} other row(s) had that MAC and were cleared" if cleared else ''))
+        self.status_var.set(f"{len(assign)} MAC(s) written to the camera list. Switch Loading can match them now.")
+        self._show(self._read, {m: {'ip': r['ip'], 'model': r['model']} for r in self._result['ports'] for m in [r['mac']] if m})
+
+    # ------------------------------------------------------------ PoE
+    def _poe(self):
+        sel = self.tree.selection()
+        if not sel or self._busy:
+            return
+        port = int(sel[0])
+        ip, comm, tu, tpw, prof = self._creds()
+        row = next((r for r in (self._result or {}).get('ports', []) if r['port'] == port), None)
+        if row and row['status'] == 'THIS PC':
+            messagebox.showwarning("That is this PC's port", "Cycling your own port drops this PC off the switch.", parent=self)
+            return
+        who = (row or {}).get('cam', {}) or {}
+        if not messagebox.askyesno("PoE cycle", f"Power port {port} off for 6 s and back on?\n\n"
+                                   f"{who.get('name', 'The camera there')} reboots and announces itself again "
+                                   f"(DHCP / link-local), which is what discovery listens for.", parent=self):
+            return
+        self._busy_on(True)
+        self._set_status(f"PoE cycling port {port}…")
+        wcomm = comm if comm != 'public' else 'private'
+
+        def work():
+            ok, how = switchlib.poe_cycle(ip, port, community=wcomm, telnet_user=tu, telnet_password=tpw,
+                                          profile=prof, ifname=(row or {}).get('port_token', ''), log=self._log)
+            self.after(0, lambda: (self._busy_on(False), self.status_var.set(
+                f"Port {port} power-cycled ({how})." if ok else f"Could not cycle port {port}: {how}")))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ export
+    def _export(self):
+        if not self._result:
+            return
+        name = (self._read or {}).get('sysname') or self.ip_var.get().replace('.', '_')
+        safe = re.sub(r'[^A-Za-z0-9_.-]+', '_', name)
+        path = EXPORT_DIR / f"switch_ports_{safe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            with open(path, 'w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow(['Switch', 'Port', 'Status', 'MAC', 'Vendor', 'AnswersAt', 'Model', 'ListName', 'ListIP', 'Notes'])
+                for r in self._result['ports']:
+                    cam = r.get('cam') or {}
+                    w.writerow([name, r['port'], r['status'], r['mac'], r['vendor'], r['ip'], r['model'],
+                                cam.get('name', ''), cam.get('ip', ''), '; '.join(r['flags'])])
+            self.status_var.set(f"Port map saved: {path}")
+            self._log(f"Port map exported to {path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e), parent=self)
+
+    def _start_sl(self):
+        self._on_close()
+        try:
+            self.app.start_switch_loading_wizard()
+        except Exception as e:
+            self._log(f"Switch Loading did not start: {e}")
+
+    def _on_close(self):
+        self._cancel.set()
+        try:
+            self._save_creds()
+        except Exception:
+            pass
+        self.destroy()
+
+
+# ============================================================================
 # MAIN APPLICATION
 # ============================================================================
 class CCTVToolkitApp:
@@ -7608,6 +8063,8 @@ class CCTVToolkitApp:
         
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Switch Port Map…",
+                               command=self.show_switch_port_map)
         tools_menu.add_command(label="Identify Switch Port (LLDP)...",
                                command=self.show_lldp_discovery)
         tools_menu.add_command(label="Find Camera Anywhere…",
@@ -8444,6 +8901,11 @@ class CCTVToolkitApp:
              "whatever order it's discovered, matching cameras to CSV rows by MAC. "
              "Requires every CSV row to have a MAC.",
              h('start_switch_loading_wizard'), '#FF6F00'),
+            ('Programming', "🔌  Switch Port Map",
+             "Read the PoE switch: which camera is on which port, fill the MACs in the "
+             "list from the ports, PoE-cycle a port, plan the second pass. Pairs with "
+             "Switch Loading.",
+             h('show_switch_port_map'), '#5D4037'),
             ('Programming', "🔄  Update / Change Settings",
              "Push IP / hostname / DHCP-toggle changes to cameras that are ALREADY "
              "programmed.",
@@ -9053,8 +9515,11 @@ class CCTVToolkitApp:
         ttk.Button(toolbar, text="⚠️ Factory Default", command=self.factory_default_camera).pack(side=tk.LEFT, padx=2)
         
         # Camera list treeview
-        columns = ('name', 'hostname', 'ip', 'mac', 'gateway', 'subnet', 'model', 'new_ip', 'status')
+        columns = ('name', 'hostname', 'ip', 'mac', 'gateway', 'subnet', 'model', 'new_ip', 'swport', 'status')
         self.camera_tree = ttk.Treeview(frame, columns=columns, show='headings', height=15, selectmode='extended')
+        # v5.3.0 — where the camera plugs in (switch / port), from the sheet or the port map.
+        self.camera_tree.heading('swport', text='Switch / Port')
+        self.camera_tree.column('swport', width=110)
         
         self.camera_tree.heading('name', text='Camera Name')
         self.camera_tree.heading('hostname', text='Hostname')
@@ -10348,7 +10813,7 @@ class CCTVToolkitApp:
         except Exception:
             pass
 
-    def _find_working_password(self, ip, timeout_per=2, known_mac=None):
+    def _find_working_password(self, ip, timeout_per=2, known_mac=None, max_tries=0, first=()):
         """v4.4.8 — Find a password that authenticates against the camera at
         `ip` via basicdeviceinfo.cgi. Tries HTTP Digest first (Axis FW 10+
         default) then Basic.
@@ -10396,7 +10861,17 @@ class CCTVToolkitApp:
                 return cached
 
         # 2. Walk the saved list.
-        pwds = list(self.password_data.get_all() or [])
+        # v5.3.0 — `first` (the job's own logins: wizard password, existing
+        # password) go ahead of the saved list, and `max_tries` caps the walk.
+        # On site an 800-entry list cost 4 minutes per camera and told us
+        # nothing a 5-entry job list would not have; a camera that takes none
+        # of the job's logins gets a factory reset, not a dictionary attack.
+        pwds = [p for p in first if p]
+        for p in (self.password_data.get_all() or []):
+            if p not in pwds:
+                pwds.append(p)
+        if max_tries and max_tries > 0:
+            pwds = pwds[:max_tries]
         if '' not in pwds:
             pwds.insert(0, '')
         for pwd in pwds:
@@ -10670,6 +11145,32 @@ class CCTVToolkitApp:
             self.log("Pre-flight: none found — proceeding to normal wait loop.")
             return 0
 
+        # v5.3.0 — Switch Loading: a camera whose MAC is not in the list is not
+        # ours. Don't probe its password, don't offer to reset it, don't
+        # mention it beyond one line. (The site with 800 production cameras.)
+        _sl_mode = bool((opts or {}).get('switch_loading_mode'))
+        if _sl_mode:
+            _listed = {(c.get('mac') or '').upper().replace(':', '').replace('-', '')
+                       for c in self.camera_data.get_all()}
+            _listed.discard('')
+            _ours, _theirs = [], []
+            for f in found:
+                _m = (f.get('mac') or '').upper().replace(':', '').replace('-', '')
+                (_ours if (_m and _m in _listed) else _theirs).append(f)
+            if _theirs:
+                self.log(f"Pre-flight: {len(_theirs)} camera(s) on the wire are not in the list — left alone.")
+            found = _ours
+            if not found:
+                self.log("Pre-flight: nothing of ours needs a reset — proceeding to the wait loop.")
+                return 0
+        _job_pwd = (opts or {}).get('password') or ''
+        _sl_cap = 0
+        if _sl_mode:
+            try:
+                _sl_cap = int(self.settings.get('general', 'sl_max_logins') or 5)
+            except Exception:
+                _sl_cap = 5
+
         # v4.5.1-beta3: filter out cameras that are already factory-clean.
         # If the operator has already manually reset a camera (paperclip)
         # but its MAC still matches one in the Camera List, the old code
@@ -10720,6 +11221,40 @@ class CCTVToolkitApp:
                     if r2.status_code == 200:
                         already_clean.append(f)
                         continue
+                    # v5.3.0 — two more honest answers before "previously
+                    # configured, walk passwords, reset":
+                    # (a) it already has THIS job's password (a run that
+                    #     stopped part-way) — program it, don't reset it;
+                    # (b) FW 10.x factory cameras answer 401 to EVERYTHING,
+                    #     the user list included, until root is created by an
+                    #     authenticated add. The old check called every one of
+                    #     them "needs factory reset" on site. Try the add: on a
+                    #     factory camera it creates root; on a configured
+                    #     camera it is refused and nothing changes.
+                    if _job_pwd:
+                        try:
+                            if self.protocol.test_password(f['ip'], self.protocol.DEFAULT_USER, _job_pwd):
+                                f['_has_job_pwd'] = True
+                                self.log(f"  {f['ip']}: already has this job's password — will be programmed, not reset")
+                                already_clean.append(f)
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            if self.protocol.create_initial_user(f['ip'], _job_pwd):
+                                _ok = False
+                                for _ in range(6):   # a just-reset camera takes a few seconds to accept root
+                                    if self.protocol.test_password(f['ip'], self.protocol.DEFAULT_USER, _job_pwd):
+                                        _ok = True
+                                        break
+                                    time.sleep(3)
+                                if _ok:
+                                    f['_has_job_pwd'] = True
+                                    self.log(f"  {f['ip']}: factory camera on older firmware — root password set, will be programmed")
+                                    already_clean.append(f)
+                                    continue
+                        except Exception:
+                            pass
             except Exception:
                 pass
             truly_used.append(f)
@@ -10731,8 +11266,13 @@ class CCTVToolkitApp:
             # v5.2.1 — hand these straight to the wait loop. A non-Axis camera
             # on a DHCP lease (Bosch on the office LAN) is invisible to every
             # wait-loop path unless it reboots, so it waited forever in view.
+            # v5.3.0 — Axis too: a camera parked on a foreign static IP with
+            # the job's password (or just given root) will never announce
+            # itself either; the wait loop pings it where we found it.
             if brand_key != 'axis':
                 self._preflight_clean_cams = list(already_clean)
+            else:
+                self._preflight_clean_cams = [f for f in already_clean if f.get('_has_job_pwd')]
         found = truly_used
 
         if not found:
@@ -10776,8 +11316,10 @@ class CCTVToolkitApp:
                 self.log(f"  {f['ip']}: saved-password check is Axis-only — asking you")
                 working_pwd = None
             else:
-                self.log(f"  {f['ip']}: walking saved passwords for auth…")
-                working_pwd = self._find_working_password(f['ip'], known_mac=f.get('mac'))
+                self.log(f"  {f['ip']}: trying the job's logins" + (f" (at most {_sl_cap})" if _sl_cap else " and the saved list") + "…")
+                working_pwd = self._find_working_password(
+                    f['ip'], known_mac=f.get('mac'), max_tries=_sl_cap,
+                    first=(_job_pwd, (opts or {}).get('existing_root_pwd') or ''))
             if working_pwd is None:
                 # v4.4.8-beta8 — saved walk failed. Don't silently skip; prompt
                 # the operator inline so they can type the password they know
@@ -10803,14 +11345,25 @@ class CCTVToolkitApp:
                     dlg.grab_set()
                     body = ttk.Frame(dlg, padding=15)
                     body.pack(fill='both', expand=True)
-                    msg = (f"None of {len(self.password_data.get_all() or [])} saved "
-                           f"passwords authenticated against {f['ip']} "
-                           f"({f.get('model', '?')}).\n\n"
+                    _where = ''
+                    try:
+                        _fm = (f.get('mac') or '').upper().replace(':', '').replace('-', '')
+                        for _c in self.camera_data.get_all():
+                            if _fm and (_c.get('mac') or '').upper().replace(':', '').replace('-', '') == _fm:
+                                _where = f"  (list: {_c.get('name', '?')}" + (
+                                    f", switch {_c.get('switch')} port {_c.get('port')}" if _c.get('port') else '') + ")"
+                                break
+                    except Exception:
+                        pass
+                    _guide = switchlib.reset_guide(f.get('model', ''), getattr(self.protocol, 'BRAND_NAME', '')) if switchlib else ''
+                    msg = (f"None of the logins tried authenticated against {f['ip']} "
+                           f"({f.get('model', '?')}){_where}.\n\n"
                            f"Three options:\n"
                            f"  • Type the password and click OK to factory-reset\n"
                            f"  • Click 'Already factory-reset' if you've already "
-                           f"paperclipped this camera (no password needed)\n"
-                           f"  • Click Skip to leave this camera alone")
+                           f"reset this camera by hand (no password needed)\n"
+                           f"  • Click Skip to leave this camera alone\n\n"
+                           f"How to reset it by hand: {_guide}")
                     ttk.Label(body, text=msg, wraplength=460,
                               justify='left').pack(anchor='w', pady=(0, 10))
                     pwd_var = tk.StringVar()
@@ -11071,10 +11624,12 @@ class CCTVToolkitApp:
                 status = f"⚠ Need {', '.join(missing)}"
             display_model = cam.get('model', '')
             pass  # Brand is global — no per-camera prefix needed
+            sw, pt = str(cam.get('switch') or '').strip(), str(cam.get('port') or '').strip()
+            swport = f"{sw} / {pt}" if (sw and pt) else (sw or pt)
             self.camera_tree.insert('', 'end', iid=str(i), values=(
                 cam.get('name', ''), cam.get('hostname', ''), cam.get('ip', ''), cam.get('mac', ''),
                 cam.get('gateway', ''), cam.get('subnet', ''), display_model,
-                cam.get('new_ip', ''), status
+                cam.get('new_ip', ''), swport, status
             ))
         self.camera_status.set(f"{len(cameras)} cameras total, {valid} ready for programming")
         self._update_tab_counts()
@@ -13543,6 +14098,24 @@ Email: axisprogrammer@thelostping.net
     # What's New (first launch of a new version)
     # ------------------------------------------------------------------
     WHATS_NEW = {
+        "5.3.0": (
+            "What's new in v5.3.0 — Switch Loading, hardened",
+            [
+                "• NEW Switch Port Map: read the switch (or find it) and see which camera is on which port.",
+                "• The port decides the camera: MACs in your list are filled in from the switch ports.",
+                "• Switch and Port columns from your sheet are kept, shown and editable.",
+                "• Re-running a switch is safe: cameras already done are checked and skipped.",
+                "• Up to 4 cameras finish in the background while the next one is programmed.",
+                "• Older-firmware factory cameras no longer get called 'needs a reset'.",
+                "• A camera that already has the job password is programmed, not reset.",
+                "• A run that sees nothing new for 4 minutes stops and lists what is not done, with ports.",
+                "• PoE-cycle a port from the map to make a stubborn camera announce itself.",
+                "• Second-pass advice: where to move the PC so its own port's camera gets done.",
+                "• One master list per run with every camera, done or not.",
+                "• Only the job's logins are tried per camera, not the whole saved list.",
+                "• Everything from the 5.2.1 beta (real Bosch programming) is included.",
+            ],
+        ),
         "5.2.1": (
             "What's new in v5.2.1",
             [
@@ -13966,6 +14539,23 @@ https://buymeacoffee.com/thelostping""")
             var = tk.BooleanVar(value=self.settings.get_bool('warnings', key))
             ttk.Checkbutton(warnings_frame, text=label, variable=var).pack(anchor=tk.W, pady=3)
             warning_vars[key] = var
+
+        # Switch Loading limits (v5.3.0)
+        sl_frame = ttk.LabelFrame(frame, text="Switch Loading", padding="15")
+        sl_frame.pack(fill=tk.X, pady=(0, 15))
+        sl_fields = [
+            ('Cameras finishing at once:', 'sl_parallel_verify', "how many cameras wait for their new IP in the background while the next one is programmed (4 is a good number)"),
+            ('Stop after this many idle seconds:', 'sl_idle_exit_s', "a run that has found nothing new for this long ends with a list of what is not done (0 = never)"),
+            ('Logins to try per camera:', 'sl_max_logins', "the job's password plus the first N saved passwords; a camera that takes none gets a factory reset, not a dictionary walk (0 = the whole list)"),
+        ]
+        for i, (label, key, hint) in enumerate(sl_fields):
+            ttk.Label(sl_frame, text=label, font=('Helvetica', 10)).grid(row=i, column=0, sticky='w', pady=4)
+            entry = ttk.Entry(sl_frame, width=8, font=('Helvetica', 10))
+            entry.insert(0, self.settings.get('general', key))
+            entry.grid(row=i, column=1, sticky='w', padx=(15, 10), pady=4)
+            ttk.Label(sl_frame, text=hint, foreground='gray', font=('Helvetica', 9), wraplength=380,
+                      justify=tk.LEFT).grid(row=i, column=2, sticky='w')
+            settings_entries[key] = entry
 
         # Update channel section (v4.5.1+)
         update_frame = ttk.LabelFrame(frame, text="Update Channel", padding="15")
@@ -14918,6 +15508,95 @@ https://buymeacoffee.com/thelostping""")
     # of the wizard itself in v5.0 b4 — so it went in v5.2 along with the
     # deprecated confirm dialog it used to pair with.
 
+    def show_switch_port_map(self):
+        """v5.3.0 — Tools → Switch Port Map / Operations tile."""
+        if switchlib is None:
+            messagebox.showerror("Switch Port Map", "switchlib.py is missing next to the toolkit.", parent=self.root)
+            return
+        SwitchPortMapDialog(self.root, self)
+
+    def _sl_precheck_done(self, cameras, password, check_users=True):
+        """v5.3.0 — Switch Loading pre-check. A camera that already answers at
+        its listed IP with its listed MAC, takes the job password and has every
+        extra user is DONE: mark it, skip it. Makes a second pass on a switch
+        (laptop moved to another port) fast and harmless. Returns the rows."""
+        done = []
+        users = (self.additional_users_data.get_all() or []) if check_users else []
+        user_exists = getattr(self.protocol, 'user_exists', None)
+        for c in list(cameras):
+            if getattr(self, 'cancel_flag', False):
+                break
+            ip = (c.get('ip') or '').strip()
+            mac = _normalize_mac(c.get('mac', ''))
+            if not ip or not mac:
+                continue
+            if not self.ping_camera(ip, timeout_ms=600):
+                continue
+            try:
+                p = self.protocol.probe_unrestricted(ip) or {}
+            except Exception:
+                p = {}
+            seen = _normalize_mac(p.get('mac') or '') or _normalize_mac(self.get_mac_from_arp(ip) or '')
+            if seen != mac:
+                if seen:
+                    self.status_log(f"  {c.get('name', '?')}: {ip} answers but it is {seen}, not {mac} — another camera has its address")
+                continue
+            try:
+                if not self.protocol.test_password(ip, self.protocol.DEFAULT_USER, password):
+                    self.status_log(f"  {c.get('name', '?')}: at {ip} but the password is not this job's — will be re-programmed")
+                    continue
+            except Exception:
+                continue
+            ok = True
+            if users and user_exists:
+                for u in users:
+                    try:
+                        present = user_exists(ip, password, u['username'])
+                    except Exception:
+                        present = None
+                    if present is False:
+                        self.status_log(f"  {c.get('name', '?')}: at {ip}, password OK, but user '{u['username']}' is missing — not done")
+                        ok = False
+                        break
+            if not ok:
+                continue
+            try:
+                idx = self.camera_data.get_all().index(c)
+                self.camera_data.mark_processed(idx)
+            except ValueError:
+                pass
+            done.append(c)
+            self.status_log(f"  ✓ {c.get('name', '?')} at {ip} is already complete")
+        if done:
+            self.root.after(0, self.refresh_camera_list)
+        return done
+
+    def _sl_write_master(self, cameras, remaining):
+        """v5.3.0 — one master list per Switch Loading run with EVERY row, done
+        or not. programmed_cameras.csv only ever had the rows programmed by a
+        run, so cameras that were already complete were missing from the
+        site's final list and had to be pulled back out of the switch tables."""
+        path = EXPORT_DIR / f"switch_master_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        left = {id(c) for c in remaining}
+        rows = sorted(cameras, key=lambda c: (str(c.get('switch') or ''), switchlib.port_num(c.get('port')) if switchlib else 0,
+                                              str(c.get('name') or '')))
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(['CameraName', 'Switch', 'Port', 'IPAddress', 'MACAddress', 'SerialNumber', 'Model', 'Firmware',
+                        'Hostname', 'Status'])
+            for c in rows:
+                if id(c) in left:
+                    status = 'NOT DONE'
+                elif c.get('status') == 'failed':
+                    status = 'FAILED: ' + (c.get('fail_reason') or '')
+                elif c.get('processed'):
+                    status = 'done'
+                else:
+                    status = c.get('status') or ''
+                w.writerow([c.get('name', ''), c.get('switch', ''), c.get('port', ''), c.get('ip', ''), c.get('mac', ''),
+                            c.get('serial', ''), c.get('model', ''), c.get('firmware', ''), c.get('hostname', ''), status])
+        return path
+
     def switch_loading_available(self):
         """v5.1.0 — Switch Loading is only offered when every loaded camera
         row has a MAC address populated. Returns (bool_available, reason_str).
@@ -14946,6 +15625,15 @@ https://buymeacoffee.com/thelostping""")
         for early MAC filter, MAC-based row matching, and post-program
         MAC verification."""
         available, reason = self.switch_loading_available()
+        if not available and switchlib is not None and self.camera_data.rows_with_ports():
+            # v5.3.0 — the list knows the ports; the switch knows the MACs.
+            if messagebox.askyesno(
+                    "Fill the MACs from the switch?",
+                    f"{reason}.\n\nThe camera list has switch ports, so the toolkit can read the "
+                    "switch and fill each row's MAC from the port it is on (the port decides the "
+                    "camera).\n\nOpen the Switch Port Map now?", parent=self.root):
+                self.show_switch_port_map()
+            return
         if not available:
             messagebox.showerror(
                 "Switch Loading needs MAC for every camera",
@@ -15196,6 +15884,368 @@ https://buymeacoffee.com/thelostping""")
 
             # v4.3 #11 — Auto NIC multi-home (with explicit consent dialog)
             self._offer_multihome(opts, cameras)
+
+            # ================================================================
+            # v5.3.0 — Switch Loading, hardened with the lessons of a 7-switch
+            # / 151-camera site (2026-10):
+            #   * pre-check: a camera already at its IP with the job password
+            #     and its users is DONE — re-running a switch is safe and fast
+            #   * the ~65 s a camera takes to come back on its new IP is spent
+            #     in a background pool (4 at a time) while the next camera is
+            #     found and programmed; cameras at the shared factory IP are
+            #     still programmed one at a time behind the ARP pin
+            #   * a run that has seen nothing new for N minutes stops with a
+            #     list of what is not done and where it plugs in
+            #   * one master list per run with every row, done or not
+            # ================================================================
+            _fin_lock = threading.Lock()
+            _sl_inflight = {}
+            _sl_pool = None
+            _sl_last_progress = [time.time()]
+            _sl_idle_stop = [False]
+            _sl_already = []
+            _sl_needs_reset = []
+            try:
+                _sl_parallel = max(1, int(self.settings.get('general', 'sl_parallel_verify') or 4))
+            except Exception:
+                _sl_parallel = 4
+            try:
+                _sl_idle_s = int(self.settings.get('general', 'sl_idle_exit_s') or 240)
+            except Exception:
+                _sl_idle_s = 240
+            if switch_loading_mode:
+                from concurrent.futures import ThreadPoolExecutor
+                _sl_pool = ThreadPoolExecutor(max_workers=_sl_parallel, thread_name_prefix='sl-verify')
+                self.status_log(f"Pre-check: looking for cameras that are already complete ({len(cameras)} in the list)…")
+                _sl_already = self._sl_precheck_done(cameras, password, add_additional_users)
+                for _c in _sl_already:
+                    try:
+                        cameras.remove(_c)
+                    except ValueError:
+                        pass
+                self.status_log(f"Pre-check: {len(_sl_already)} already complete, {len(cameras)} to do.")
+
+            def _sl_counts():
+                with _fin_lock:
+                    return total_ok + len(_sl_already), total_fail, len(_sl_inflight)
+
+            def _sl_refresh_counts():
+                if not switch_loading_mode:
+                    return
+                done, fails, inflight = _sl_counts()
+                _ui(self.status_set_camera, '(awaiting MAC match)',
+                    f'{done} done · {fails} failed · {inflight} finishing in background · {len(remaining)} remaining')
+
+            def _finish(ctx, ui=True):
+                """Everything after the IP change: wait for the camera at its new
+                address, ONVIF cleanup, serial / MAC / picture, the MAC re-check,
+                the CSV row, done or failed. Inline for the classic wizard; Switch
+                Loading runs it in the background pool (v5.3.0)."""
+                nonlocal total_ok, total_fail
+                cam = ctx['cam']
+                cam_name = ctx['cam_name']
+                static_ip = ctx['static_ip']
+                pinned_mac = ctx['pinned_mac']
+                errors = ctx['errors']
+                actual_model = ctx['actual_model']
+                expected_model = ctx['expected_model']
+                actual_firmware = ctx['actual_firmware']
+                programmed_count = ctx['programmed_count']
+                tag = '' if ui else f'[{cam_name}] '
+
+                def slog(m):
+                    self.status_log(tag + m)
+
+                def ustep(step, state, detail=''):
+                    if ui:
+                        _ui(self.status_set_step, step, state, detail)
+
+                # ---- Wait for camera at new IP ----
+                # v4.3 #15 fix — see classic wizard for full rationale. ICMP
+                # first (cheap), HTTP probe via protocol.probe_unrestricted
+                # as the reliable backup (works on all brands).
+                ustep('verify_online', 'active')
+                camera_reachable = False
+                slog(f"Waiting for camera at {static_ip}...")
+                time.sleep(3)
+                # v5.2.1 — real seconds. This counted LOOPS as seconds, and each
+                # loop is a ping timeout + an HTTP probe + a sleep, so "60s" took
+                # 8.5 minutes on Boss (2026-09-28). 180 s wall clock covers a
+                # Bosch (~30 s to come back) and a slow Axis with margin.
+                _vo_start = time.time()
+                _vo_next_note = 15
+                while not self.cancel_flag and time.time() - _vo_start < 180:
+                    if self.ping_camera(static_ip, timeout_ms=1500):
+                        camera_reachable = True
+                        break
+                    try:
+                        p = self.protocol.probe_unrestricted(static_ip)
+                        if p and (p.get('mac') or p.get('model')):
+                            camera_reachable = True
+                            slog(f"  Camera answered HTTP probe at {static_ip} (ICMP silent)")
+                            break
+                    except Exception:
+                        pass
+                    if time.time() - _vo_start >= _vo_next_note:
+                        slog(f"  Still waiting... ({int(time.time() - _vo_start)}s)")
+                        _vo_next_note += 15
+                    time.sleep(1)
+                wait_count = int(time.time() - _vo_start)
+
+                if self.cancel_flag:
+                    return
+
+                if not camera_reachable:
+                    slog(f"✗ Camera not responding at {static_ip} after {wait_count}s")
+                    errors.append("unreachable")
+                    ustep('verify_online', 'fail', f'{wait_count}s timeout')
+                else:
+                    slog(f"Camera online at {static_ip} (after {wait_count + 3}s)")
+                    ustep('verify_online', 'ok', f'{wait_count + 3}s')
+                    time.sleep(1)
+                    # v5.3.0 — on site one camera answered on its new IP but
+                    # refused its own password for a while after the restart.
+                    # Give the login up to 20 s to settle before anything
+                    # authenticated below is tried.
+                    for _ in range(10):
+                        try:
+                            if self.protocol.test_password(static_ip, username, password):
+                                break
+                        except Exception:
+                            pass
+                        if self.cancel_flag:
+                            return
+                        time.sleep(2)
+
+                # v4.3 #10: ONVIF user teardown — see classic wizard for full
+                # rationale. New wizard's ProgramWizardDialog exposes the
+                # "Keep ONVIF user" checkbox + optional custom user/password.
+                # Behavior matrix:
+                #   keep=False           → delete ONVIF root (default — clean state)
+                #   keep=True, no creds  → don't delete, root remains
+                #   keep=True, custom    → delete root, create custom (rename)
+                if camera_reachable and hasattr(self.protocol, 'delete_onvif_user'):
+                    keep_onvif = bool(opts.get('keep_onvif_user', False))
+                    custom_u = (opts.get('onvif_username') or '').strip()
+                    custom_p = (opts.get('onvif_password') or '').strip()
+                    if not keep_onvif:
+                        if self.protocol.delete_onvif_user(static_ip, password, 'root'):
+                            slog("ONVIF user deleted — camera ends with VAPIX root only.")
+                        else:
+                            slog("⚠ ONVIF user delete failed — leftover ONVIF account on camera.")
+                    elif custom_u and custom_p and hasattr(self.protocol, 'add_onvif_user'):
+                        # Rename pattern: delete transient root, create operator-named user
+                        if not self.protocol.delete_onvif_user(static_ip, password, 'root'):
+                            slog("⚠ Could not delete ONVIF root before custom-user create — proceeding anyway.")
+                        if self.protocol.add_onvif_user(static_ip, password, custom_u, custom_p):
+                            slog(f"ONVIF user replaced: 'root' → '{custom_u}'.")
+                        else:
+                            slog(f"⚠ Could not create ONVIF user '{custom_u}' — camera may have NO ONVIF user.")
+                    else:
+                        slog("ONVIF user kept as 'root' (operator-requested).")
+
+                # ---- Capture serial / MAC / image ----
+                ustep('capture', 'active')
+                serial = 'UNKNOWN'
+                if camera_reachable:
+                    serial = self.protocol.get_serial(static_ip, password)
+                    slog(f"Serial: {serial}")
+                    if serial and serial != 'UNKNOWN':
+                        cam['serial'] = serial
+                        if len(serial) == 12:
+                            cam['mac'] = ':'.join(serial[j:j+2] for j in range(0, 12, 2))
+                            slog(f"MAC: {cam['mac']}")
+                    elif pinned_mac:
+                        cam['mac'] = pinned_mac
+                        slog(f"MAC (from ARP): {pinned_mac}")
+                else:
+                    if pinned_mac:
+                        cam['mac'] = pinned_mac
+                        mac_clean = pinned_mac.upper().replace(':', '').replace('-', '')
+                        cam['serial'] = mac_clean
+                        slog(f"MAC (from ARP): {pinned_mac}")
+                        serial = mac_clean
+
+                if actual_model and not expected_model:
+                    cam['model'] = actual_model
+
+                if camera_reachable:
+                    img = self.protocol.get_image(static_ip, username, password)
+                    if img and ui:
+                        _ui(self.status_set_preview, img)
+                    # Retry firmware with auth if we didn't get it before
+                    if actual_firmware == 'UNKNOWN':
+                        try:
+                            fw = self.protocol.get_firmware(static_ip, password)
+                            if fw and fw != 'UNKNOWN':
+                                actual_firmware = fw
+                                slog(f"Firmware: {actual_firmware}")
+                                ustep('firmware', 'ok', actual_firmware)
+                        except Exception:
+                            pass
+                    # 2026-05-03 — always read hostname back so the camera list
+                    # populates even when "Set hostname" wasn't checked OR when
+                    # set_hostname returned False but the change actually persisted.
+                    if hasattr(self.protocol, 'verify_camera_state'):
+                        try:
+                            vstate = self.protocol.verify_camera_state(static_ip, password)
+                            if vstate.get('actual_hostname') and not cam.get('hostname'):
+                                cam['hostname'] = vstate['actual_hostname']
+                                slog(f"Backfilled hostname from camera: {cam['hostname']}")
+                        except Exception:
+                            pass
+                    # v5.3.0 — "done" means the extra users are on the camera
+                    # too; a camera missing one is not done.
+                    if add_additional_users and hasattr(self.protocol, 'user_exists'):
+                        for eu in (self.additional_users_data.get_all() or []):
+                            try:
+                                present = self.protocol.user_exists(static_ip, password, eu['username'])
+                            except Exception:
+                                present = None
+                            if present is False:
+                                slog(f"  User '{eu['username']}' is missing — adding it")
+                                if not self.protocol.add_user(static_ip, password, eu['username'], eu['password'], eu['role']):
+                                    errors.append(f"user:{eu['username']}")
+
+                if actual_firmware == 'UNKNOWN':
+                    ustep('firmware', 'fail', 'UNKNOWN')
+
+                cam['firmware'] = actual_firmware
+                ustep('capture', 'ok', f"{serial} / {cam.get('mac', '?')}")
+
+                # v5.1.0 — Switch Loading post-program MAC confirmation.
+                # We programmed this row based on a MAC match at discovery.
+                # Now that the camera is at its new IP, re-fetch its MAC and
+                # verify it equals the CSV row's MAC. Catches the rare case
+                # where two simultaneous programmings could swap configs
+                # mid-flight, or where the post-program camera is somehow
+                # a different one than we expected.
+                if switch_loading_mode and 'verify_mac' in used_steps:
+                    ustep('verify_mac', 'active')
+                    expected_mac_norm = (cam.get('mac', '') or '').upper().replace(':', '').replace('-', '').replace('.', '')
+                    seen_mac_raw = ''
+                    if camera_reachable:
+                        try:
+                            probe2 = self.protocol.probe_unrestricted(static_ip)
+                            seen_mac_raw = probe2.get('mac') or ''
+                        except Exception:
+                            seen_mac_raw = ''
+                        if not seen_mac_raw:
+                            seen_mac_raw = self.get_mac_from_arp(static_ip) or ''
+                    seen_mac_norm = seen_mac_raw.upper().replace(':', '').replace('-', '').replace('.', '')
+                    if not seen_mac_norm:
+                        slog(
+                            f"⚠ verify_mac: could not read MAC at {static_ip} — "
+                            "treating as soft-fail (camera reachable but MAC not exposed by API/ARP).")
+                        errors.append('verify_mac_unreadable')
+                        ustep('verify_mac', 'fail', '(unreadable)')
+                    elif seen_mac_norm == expected_mac_norm:
+                        slog(f"✓ verify_mac: camera at {static_ip} reports MAC {seen_mac_raw} — matches CSV row")
+                        ustep('verify_mac', 'ok', seen_mac_raw)
+                    else:
+                        slog(
+                            f"✗ verify_mac: SLIP DETECTED at {static_ip}.\n"
+                            f"    expected MAC: {cam.get('mac', '?')}\n"
+                            f"    found    MAC: {seen_mac_raw}\n"
+                            f"    Programming this row's config landed on the wrong camera. "
+                            f"Likely cause: two cameras with the same factory IP racing the "
+                            f"set_network step. Investigate before shipping this row.")
+                        errors.append('mac_mismatch')
+                        ustep('verify_mac', 'fail', f'got {seen_mac_raw}')
+
+                with _fin_lock:
+                    self.camera_data.save()
+                _ui(self.refresh_camera_list)
+
+                # v4.3 #13 — assign Building Reports sticker number if enabled
+                br_label = ''
+                with _fin_lock:
+                    if br_enabled and ctx.get('br_counter') is not None and not errors:
+                        br_label = str(ctx['br_counter'])
+                        slog(f"Building Reports sticker: #{br_label}  ← peel and apply to {cam.get('name', cam_name)}")
+
+                # ---- Write CSV row ----
+                cam_mac = cam.get('mac', pinned_mac or '')
+                with _fin_lock:
+                    with open(OUTPUT_CSV, 'a', newline='') as f:
+                        csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac,
+                                               actual_model or expected_model, actual_firmware,
+                                               br_label,
+                                               datetime.now().isoformat()])
+
+                # ---- Mark success/fail ----
+                if 'unreachable' in errors:
+                    with _fin_lock:
+                        self._mark_cam_failed(cam, ', '.join(errors))
+                        total_fail += 1
+                        ok_n, fail_n = total_ok, total_fail
+                    slog(f"\n*** {cam_name} FAILED: {', '.join(errors)} ***")
+                    if ui:
+                        _ui(self.status_set_banner, f'FAILED  ({ok_n} OK / {fail_n} fail)',
+                            f"{cam_name} failed — plug in next camera", '#F44336')
+                elif errors:
+                    with _fin_lock:
+                        self._mark_cam_failed(cam, ', '.join(errors))
+                        total_fail += 1
+                        ok_n, fail_n = total_ok, total_fail
+                    slog(f"\n*** {cam_name} PARTIAL FAIL: {', '.join(errors)} ***")
+                    if ui:
+                        _ui(self.status_set_banner, f'PARTIAL  ({ok_n} OK / {fail_n} fail)',
+                            f"{cam_name} had errors — plug in next camera", '#FF9800')
+                else:
+                    with _fin_lock:
+                        try:
+                            idx = self.camera_data.get_all().index(cam)
+                            self.camera_data.mark_processed(idx)
+                        except ValueError:
+                            pass
+                        total_ok += 1
+                        ok_n, fail_n = total_ok, total_fail
+                    slog(f"\n*** {cam_name} COMPLETE ***")
+                    # v4.5.1-beta2: extra-large + long-hold success callout —
+                    # Brian asked for bigger/longer 'success' so a tech who
+                    # looks away during programming doesn't return to find
+                    # only "PLUG IN CAMERA" with no signal that the previous
+                    # one finished. 60pt + 5s hold per ask.
+                    if ui:
+                        _ui(self.status_set_banner_big,
+                            f'✓  {cam_name}  DONE',
+                            f'  ({ok_n} OK / {fail_n} fail) — plug in next camera  ',
+                            '#4CAF50')
+                    else:
+                        done_n, _f, _i = _sl_counts()
+                        _ui(self.status_set_banner_big, f'✓  {cam_name}  DONE',
+                            f'  {done_n} done · {len(remaining)} remaining  ', '#4CAF50')
+
+            def _sl_submit(ctx):
+                """Hand a programmed camera to the background pool; wait when the
+                pool is full so no more than _sl_parallel are finishing at once."""
+                while not self.cancel_flag:
+                    with _fin_lock:
+                        n = len(_sl_inflight)
+                    if n < _sl_parallel:
+                        break
+                    time.sleep(1)
+                with _fin_lock:
+                    _sl_inflight[ctx['cam_name']] = time.time()
+                _sl_refresh_counts()
+
+                def _job():
+                    try:
+                        _finish(ctx, ui=False)
+                    except Exception as e:
+                        self.status_log(f"[{ctx['cam_name']}] ✗ finishing failed: {e!r}")
+                        try:
+                            with _fin_lock:
+                                self._mark_cam_failed(ctx['cam'], f'finish: {e}')
+                        except Exception:
+                            pass
+                    finally:
+                        with _fin_lock:
+                            _sl_inflight.pop(ctx['cam_name'], None)
+                        _sl_last_progress[0] = time.time()
+                        _sl_refresh_counts()
+                _sl_pool.submit(_job)
 
             # v4.4.8 — Pre-flight: find any previously-configured cameras on
             # the programming NIC across common /24s and offer to factory-reset
@@ -15681,8 +16731,22 @@ https://buymeacoffee.com/thelostping""")
                         _heartbeat_target = '(any unprogrammed camera in CSV)' if switch_loading_mode else next_name
                         self.status_log(f"  ...still searching for {_heartbeat_target} ({_elapsed}s) — checking: {', '.join(_modes)}. Plug in / reboot to trigger fresh DHCP DISCOVER.")
                         _last_heartbeat = _now
+                        if switch_loading_mode:
+                            # the background finishers flash DONE over this banner; put it back
+                            _ui(self.status_set_banner, 'LOOKING FOR ANY CAMERA',
+                                f'Switch Loading — {len(remaining)} of {len(cameras)} remaining', '#FF9800')
+                            _sl_refresh_counts()
+                            # v5.3.0 — idle exit: nothing new for N minutes and nothing
+                            # finishing in the background = this pass is over. The run
+                            # used to sit here forever on one missing camera.
+                            with _fin_lock:
+                                _busy = len(_sl_inflight)
+                            if _sl_idle_s and not _busy and (_now - _sl_last_progress[0]) > _sl_idle_s:
+                                _sl_idle_stop[0] = True
+                                self.status_log(f"Nothing new for {int((_now - _sl_last_progress[0]) // 60)} min — finishing this pass.")
+                                break
 
-                if self.cancel_flag:
+                if self.cancel_flag or _sl_idle_stop[0]:
                     break
 
                 # ---- MAC freshness gate (v4.3 #9) ----
@@ -15797,9 +16861,12 @@ https://buymeacoffee.com/thelostping""")
                     next_name = next_cam.get('name', '?')
                     next_model = next_cam.get('model', '')
                     programmed_count += 1
+                    _sl_last_progress[0] = time.time()
                     self.status_log(
                         f"  ✓ MAC {pinned_mac} matches CSV row '{next_name}' "
-                        f"(#{next_cam.get('number','?')}) — programming")
+                        f"(#{next_cam.get('number','?')})"
+                        + (f" — switch {next_cam.get('switch')} port {next_cam.get('port')}" if next_cam.get('port') else '')
+                        + " — programming")
                     _ui(self.status_set_camera, next_name,
                         f"{programmed_count - 1} of {len(cameras)} done · {len(remaining)} remaining")
 
@@ -16248,11 +17315,40 @@ https://buymeacoffee.com/thelostping""")
                 # phase to bail the outer while loop immediately.
                 _ui(self.status_set_step, 'auth', 'active')
                 auth_ok = True
+                # v5.3.0 — a camera that already takes the job's password (a run
+                # that stopped part-way, or the pre-flight just gave it root)
+                # must not fail on "create user": skip that step.
+                _already_authed = False
+                try:
+                    _already_authed = bool(self.protocol.test_password(camera_ip, username, password))
+                except Exception:
+                    _already_authed = False
+                if _already_authed:
+                    self.status_log("  Camera already accepts this job's password — skipping user creation.")
+                    auth_steps = [(d, f) for (d, f) in auth_steps if 'user' not in d.lower()]
                 for desc, step_fn in auth_steps:
                     if self.cancel_flag: break
                     self.status_log(f"  {desc}")
                     try:
                         step_result = step_fn()
+                        # v5.3.0 — a just-reset camera takes a few seconds to
+                        # accept its first root login. Retry the user step while
+                        # the camera is still answering HTTP instead of calling
+                        # it a failure on the first 401.
+                        if not step_result and 'user' in desc.lower():
+                            for _try in range(5):
+                                if self.cancel_flag:
+                                    break
+                                time.sleep(3)
+                                try:
+                                    if not (self.protocol.probe_unrestricted(camera_ip) or {}).get('model'):
+                                        continue
+                                except Exception:
+                                    continue
+                                self.status_log(f"    …camera still settling, retry {_try + 1}/5")
+                                step_result = step_fn()
+                                if step_result:
+                                    break
                     except ProtocolCancelled:
                         # Cancel button hit while a retry was in-flight or
                         # a back-off was sleeping. Clean abort, no crash.
@@ -16457,230 +17553,26 @@ https://buymeacoffee.com/thelostping""")
                         cam['mac'] = pinned_mac
                 self.arp_unpin(camera_ip)
 
-                # ---- Wait for camera at new IP ----
-                # v4.3 #15 fix — see classic wizard for full rationale. ICMP
-                # first (cheap), HTTP probe via protocol.probe_unrestricted
-                # as the reliable backup (works on all brands).
-                _ui(self.status_set_step, 'verify_online', 'active')
-                camera_reachable = False
-                self.status_log(f"Waiting for camera at {static_ip}...")
-                time.sleep(3)
-                # v5.2.1 — real seconds. This counted LOOPS as seconds, and each
-                # loop is a ping timeout + an HTTP probe + a sleep, so "60s" took
-                # 8.5 minutes on Boss (2026-09-28). 180 s wall clock covers a
-                # Bosch (~30 s to come back) and a slow Axis with margin.
-                _vo_start = time.time()
-                _vo_next_note = 15
-                wait_count = 0
-                while not self.cancel_flag and time.time() - _vo_start < 180:
-                    if self.ping_camera(static_ip, timeout_ms=1500):
-                        camera_reachable = True
-                        break
-                    try:
-                        p = self.protocol.probe_unrestricted(static_ip)
-                        if p and (p.get('mac') or p.get('model')):
-                            camera_reachable = True
-                            self.status_log(f"  Camera answered HTTP probe at {static_ip} (ICMP silent)")
-                            break
-                    except Exception:
-                        pass
-                    if time.time() - _vo_start >= _vo_next_note:
-                        self.status_log(f"  Still waiting... ({int(time.time() - _vo_start)}s)")
-                        _vo_next_note += 15
-                    time.sleep(1)
-                wait_count = int(time.time() - _vo_start)
-
-                if self.cancel_flag:
-                    break
-
-                if not camera_reachable:
-                    self.status_log(f"✗ Camera not responding at {static_ip} after {wait_count}s")
-                    errors.append("unreachable")
-                    _ui(self.status_set_step, 'verify_online', 'fail', f'{wait_count}s timeout')
-                else:
-                    self.status_log(f"Camera online at {static_ip} (after {wait_count + 3}s)")
-                    _ui(self.status_set_step, 'verify_online', 'ok', f'{wait_count + 3}s')
-                    time.sleep(1)
-
-                # v4.3 #10: ONVIF user teardown — see classic wizard for full
-                # rationale. New wizard's ProgramWizardDialog exposes the
-                # "Keep ONVIF user" checkbox + optional custom user/password.
-                # Behavior matrix:
-                #   keep=False           → delete ONVIF root (default — clean state)
-                #   keep=True, no creds  → don't delete, root remains
-                #   keep=True, custom    → delete root, create custom (rename)
-                if camera_reachable and hasattr(self.protocol, 'delete_onvif_user'):
-                    keep_onvif = bool(opts.get('keep_onvif_user', False))
-                    custom_u = (opts.get('onvif_username') or '').strip()
-                    custom_p = (opts.get('onvif_password') or '').strip()
-                    if not keep_onvif:
-                        if self.protocol.delete_onvif_user(static_ip, password, 'root'):
-                            self.status_log("ONVIF user deleted — camera ends with VAPIX root only.")
-                        else:
-                            self.status_log("⚠ ONVIF user delete failed — leftover ONVIF account on camera.")
-                    elif custom_u and custom_p and hasattr(self.protocol, 'add_onvif_user'):
-                        # Rename pattern: delete transient root, create operator-named user
-                        if not self.protocol.delete_onvif_user(static_ip, password, 'root'):
-                            self.status_log("⚠ Could not delete ONVIF root before custom-user create — proceeding anyway.")
-                        if self.protocol.add_onvif_user(static_ip, password, custom_u, custom_p):
-                            self.status_log(f"ONVIF user replaced: 'root' → '{custom_u}'.")
-                        else:
-                            self.status_log(f"⚠ Could not create ONVIF user '{custom_u}' — camera may have NO ONVIF user.")
-                    else:
-                        self.status_log("ONVIF user kept as 'root' (operator-requested).")
-
-                # ---- Capture serial / MAC / image ----
-                _ui(self.status_set_step, 'capture', 'active')
-                serial = 'UNKNOWN'
-                if camera_reachable:
-                    serial = self.protocol.get_serial(static_ip, password)
-                    self.status_log(f"Serial: {serial}")
-                    if serial and serial != 'UNKNOWN':
-                        cam['serial'] = serial
-                        if len(serial) == 12:
-                            cam['mac'] = ':'.join(serial[j:j+2] for j in range(0, 12, 2))
-                            self.status_log(f"MAC: {cam['mac']}")
-                    elif pinned_mac:
-                        cam['mac'] = pinned_mac
-                        self.status_log(f"MAC (from ARP): {pinned_mac}")
-                else:
-                    if pinned_mac:
-                        cam['mac'] = pinned_mac
-                        mac_clean = pinned_mac.upper().replace(':', '').replace('-', '')
-                        cam['serial'] = mac_clean
-                        self.status_log(f"MAC (from ARP): {pinned_mac}")
-                        serial = mac_clean
-
-                if actual_model and not expected_model:
-                    cam['model'] = actual_model
-
-                if camera_reachable:
-                    img = self.protocol.get_image(static_ip, username, password)
-                    if img:
-                        _ui(self.status_set_preview, img)
-                    # Retry firmware with auth if we didn't get it before
-                    if actual_firmware == 'UNKNOWN':
-                        try:
-                            fw = self.protocol.get_firmware(static_ip, password)
-                            if fw and fw != 'UNKNOWN':
-                                actual_firmware = fw
-                                self.status_log(f"Firmware: {actual_firmware}")
-                                _ui(self.status_set_step, 'firmware', 'ok', actual_firmware)
-                        except Exception:
-                            pass
-                    # 2026-05-03 — always read hostname back so the camera list
-                    # populates even when "Set hostname" wasn't checked OR when
-                    # set_hostname returned False but the change actually persisted.
-                    if hasattr(self.protocol, 'verify_camera_state'):
-                        try:
-                            vstate = self.protocol.verify_camera_state(static_ip, password)
-                            if vstate.get('actual_hostname') and not cam.get('hostname'):
-                                cam['hostname'] = vstate['actual_hostname']
-                                self.status_log(f"Backfilled hostname from camera: {cam['hostname']}")
-                        except Exception:
-                            pass
-
-                if actual_firmware == 'UNKNOWN':
-                    _ui(self.status_set_step, 'firmware', 'fail', 'UNKNOWN')
-
-                cam['firmware'] = actual_firmware
-                _ui(self.status_set_step, 'capture', 'ok',
-                    f"{serial} / {cam.get('mac', '?')}")
-
-                # v5.1.0 — Switch Loading post-program MAC confirmation.
-                # We programmed this row based on a MAC match at discovery.
-                # Now that the camera is at its new IP, re-fetch its MAC and
-                # verify it equals the CSV row's MAC. Catches the rare case
-                # where two simultaneous programmings could swap configs
-                # mid-flight, or where the post-program camera is somehow
-                # a different one than we expected.
-                if switch_loading_mode and 'verify_mac' in used_steps:
-                    _ui(self.status_set_step, 'verify_mac', 'active')
-                    expected_mac_norm = (cam.get('mac', '') or '').upper().replace(':', '').replace('-', '').replace('.', '')
-                    seen_mac_raw = ''
-                    if camera_reachable:
-                        try:
-                            probe2 = self.protocol.probe_unrestricted(static_ip)
-                            seen_mac_raw = probe2.get('mac') or ''
-                        except Exception:
-                            seen_mac_raw = ''
-                        if not seen_mac_raw:
-                            seen_mac_raw = self.get_mac_from_arp(static_ip) or ''
-                    seen_mac_norm = seen_mac_raw.upper().replace(':', '').replace('-', '').replace('.', '')
-                    if not seen_mac_norm:
-                        self.status_log(
-                            f"⚠ verify_mac: could not read MAC at {static_ip} — "
-                            "treating as soft-fail (camera reachable but MAC not exposed by API/ARP).")
-                        errors.append('verify_mac_unreadable')
-                        _ui(self.status_set_step, 'verify_mac', 'fail', '(unreadable)')
-                    elif seen_mac_norm == expected_mac_norm:
-                        self.status_log(
-                            f"✓ verify_mac: camera at {static_ip} reports MAC {seen_mac_raw} — matches CSV row")
-                        _ui(self.status_set_step, 'verify_mac', 'ok', seen_mac_raw)
-                    else:
-                        self.status_log(
-                            f"✗ verify_mac: SLIP DETECTED at {static_ip}.\n"
-                            f"    expected MAC: {cam.get('mac', '?')}\n"
-                            f"    found    MAC: {seen_mac_raw}\n"
-                            f"    Programming this row's config landed on the wrong camera. "
-                            f"Likely cause: two cameras with the same factory IP racing the "
-                            f"set_network step. Investigate before shipping this row.")
-                        errors.append('mac_mismatch')
-                        _ui(self.status_set_step, 'verify_mac', 'fail', f'got {seen_mac_raw}')
-
-                self.camera_data.save()
-                _ui(self.refresh_camera_list)
-
-                # v4.3 #13 — assign Building Reports sticker number if enabled
-                br_label = ''
-                if br_enabled and br_counter is not None and not errors:
-                    br_label = str(br_counter)
-                    self.status_log(f"Building Reports sticker: #{br_label}  ← peel and apply to {cam.get('name', cam_name)}")
+                # ---- Hand off: wait at the new IP, verify, record ----
+                # v5.3.0 — the classic wizard finishes the camera right here;
+                # Switch Loading hands it to the background pool and goes
+                # looking for the next one.
+                _ctx = {'cam': cam, 'cam_name': cam_name, 'static_ip': static_ip,
+                        'pinned_mac': pinned_mac, 'errors': errors, 'actual_model': actual_model,
+                        'expected_model': expected_model, 'actual_firmware': actual_firmware,
+                        'programmed_count': programmed_count, 'br_counter': None}
+                if br_enabled and br_counter is not None:
+                    _ctx['br_counter'] = br_counter
                     br_counter += 1
-
-                # ---- Write CSV row ----
-                cam_mac = cam.get('mac', pinned_mac or '')
-                with open(OUTPUT_CSV, 'a', newline='') as f:
-                    csv.writer(f).writerow([cam.get('name', cam_name), static_ip, serial, cam_mac,
-                                           actual_model or expected_model, actual_firmware,
-                                           br_label,
-                                           datetime.now().isoformat()])
-
-                # ---- Mark success/fail ----
-                if 'unreachable' in errors:
-                    self._mark_cam_failed(cam, ', '.join(errors))
-                    total_fail += 1
-                    self.status_log(f"\n*** {cam_name} FAILED: {', '.join(errors)} ***")
-                    _ui(self.status_set_banner, f'FAILED  ({total_ok} OK / {total_fail} fail)',
-                        f"{cam_name} failed — plug in next camera", '#F44336')
-                elif errors:
-                    self._mark_cam_failed(cam, ', '.join(errors))
-                    total_fail += 1
-                    self.status_log(f"\n*** {cam_name} PARTIAL FAIL: {', '.join(errors)} ***")
-                    _ui(self.status_set_banner, f'PARTIAL  ({total_ok} OK / {total_fail} fail)',
-                        f"{cam_name} had errors — plug in next camera", '#FF9800')
-                else:
-                    idx = self.camera_data.get_all().index(cam)
-                    self.camera_data.mark_processed(idx)
-                    total_ok += 1
-                    self.status_log(f"\n*** {cam_name} COMPLETE ***")
-                    # v4.5.1-beta2: extra-large + long-hold success callout —
-                    # Brian asked for bigger/longer 'success' so a tech who
-                    # looks away during programming doesn't return to find
-                    # only "PLUG IN CAMERA" with no signal that the previous
-                    # one finished. 60pt + 5s hold per ask.
-                    _ui(self.status_set_banner_big,
-                        f'✓  {cam_name}  DONE',
-                        f'  ({total_ok} OK / {total_fail} fail) — plug in next camera  ',
-                        '#4CAF50')
-
                 remaining.pop(cam_idx)
-
-                # v5.1.0 — In switch_loading mode, clear last_announced_name so
-                # the next outer-loop iteration refreshes the banner counts
-                # (programmed_count / remaining) for the next MAC we find.
                 if switch_loading_mode:
                     last_announced_name = None
+                    _ui(self.status_set_step, 'verify_online', 'pending', '(in background)')
+                    _ui(self.status_set_step, 'capture', 'pending', '(in background)')
+                    _ui(self.status_set_step, 'verify_mac', 'pending', '(in background)')
+                    _sl_submit(_ctx)
+                    continue
+                _finish(_ctx, ui=True)
 
                 if remaining and not self.cancel_flag and not switch_loading_mode:
                     # v4.5.1-beta5: keep the SUCCESS banner up until the
@@ -16749,13 +17641,40 @@ https://buymeacoffee.com/thelostping""")
                                 last_heartbeat = now_t
                             time.sleep(2)
 
+            # v5.3.0 — let the background finishers land before the summary.
+            if _sl_pool is not None:
+                _drain_start = time.time()
+                while True:
+                    with _fin_lock:
+                        busy = list(_sl_inflight)
+                    if not busy:
+                        break
+                    if int(time.time() - _drain_start) % 15 == 0:
+                        _ui(self.status_set_banner, 'FINISHING…',
+                            f"waiting for {len(busy)} camera(s): {', '.join(busy[:4])}", '#2196F3')
+                    time.sleep(1)
+                _sl_pool.shutdown(wait=True)
             self.remove_linklocal_route()
 
             self.status_log(f"\n{'=' * 50}")
-            self.status_log(f"PROGRAMMING COMPLETE: {total_ok} succeeded, {total_fail} failed")
+            self.status_log(f"PROGRAMMING COMPLETE: {total_ok} succeeded, {total_fail} failed"
+                            + (f", {len(_sl_already)} were already complete" if _sl_already else ''))
             if remaining:
                 self.status_log(f"  {len(remaining)} cameras not programmed")
+                if switch_loading_mode:
+                    for _c in remaining:
+                        _w = (f" — switch {_c.get('switch')} port {_c.get('port')}" if _c.get('port') else '')
+                        self.status_log(f"    NOT DONE: {_c.get('name', '?')} ({_c.get('mac', 'no MAC')}){_w}")
+                    self.status_log("  A camera that never showed up is on a foreign address or has a password that is not the job's: "
+                                    "factory-reset it on its port (PoE cycle from the Switch Port Map helps it re-announce), then run again.")
             self.status_log(f"Results saved to {OUTPUT_CSV}")
+            if switch_loading_mode:
+                try:
+                    _mp = self._sl_write_master(cameras + _sl_already, remaining)
+                    if _mp:
+                        self.status_log(f"Master list (every row, done or not): {_mp}")
+                except Exception as _me:
+                    self.status_log(f"  (master list not written: {_me})")
             self.status_log(f"{'=' * 50}")
 
             if self.cancel_flag:

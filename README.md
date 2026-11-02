@@ -24,6 +24,8 @@ Both are built from the same source per release.
 ## Features
 
 - ARP + LLDP network discovery (know which switch port each camera is on)
+- **Switch Port Map (5.3.0):** read the PoE switch over telnet or SNMP, line its ports up against your sheet, and fill the MACs in from the ports — *the port decides the camera*. PoE-cycle a port, find the switch's address, plan the second pass for the port your laptop is on.
+- **Switch Loading:** plug every camera on the switch in, program them by MAC match; already-done cameras are checked and skipped, up to 4 finish in the background, a stalled run stops with a list of what is not done and where it plugs in, and one master list per run lists every camera
 - Built-in password list manager, tries known creds in bulk
 - Step-by-step programming wizard with live checklist and firmware capture
 - Additional-users bulk add during initial programming

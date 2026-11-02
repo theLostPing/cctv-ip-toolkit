@@ -6,15 +6,15 @@ one camera at a time, matched by MAC against the toolkit's programmed_cameras.cs
     python reprogram_by_mac.py check --csv MACs.xlsx --here 3    # who is still fine, who is gone (plugged into switch 3)
     python reprogram_by_mac.py run --password XXXX   # sit and wait, program each camera as it shows up
     python reprogram_by_mac.py ports [--switch IP]    # which switch port each MAC is on -> switch_ports.csv
-    python reprogram_by_mac.py stills --csv switch1.csv --here 10.20.48.64/27   # a JPEG from every camera + index.html
-        add --plan-base 10.20.48.0 to check ports against the numbering plan and to name
+    python reprogram_by_mac.py stills --csv switch1.csv --here 192.0.2.64/27   # a JPEG from every camera + index.html
+        add --plan-base 192.0.2.0 to check ports against the numbering plan and to name
         unlisted cameras from their port (-> proposed_cameras.csv, review, then run --csv it)
 
 What it does for every camera it finds that is in the list and not already right:
     1. sets the root password (factory camera has none)
     2. sets static IP / mask / gateway, DHCP off      (the camera reboots itself)
     3. waits for it at the new IP and checks the MAC is still the same camera
-    4. sets hostname + Bonjour name to the camera name (KBO-006)
+    4. sets hostname + Bonjour name to the camera name (e.g. CAM-006)
     5. adds the extra user (admin / admin by default)
     6. writes a row to reprogrammed_cameras.csv next to the input CSV
 
@@ -268,7 +268,7 @@ def cam_net(a, cam):
     return ipaddress.ip_network(f"{cam['ip']}/{cam_subnet(a, cam)}", strict=False)
 
 
-JOB_LOGINS = [('root', 'admin'), ('admin', 'admin'), ('root', 'pass')]
+JOB_LOGINS = []   # the job's own logins live in passwords.txt beside the list; nothing is shipped here
 MAX_LOGINS = 5
 
 
@@ -286,10 +286,9 @@ def load_password_candidates(explicit, beside=None):
         if not os.path.exists(txt):
             try:
                 with open(txt, 'w', encoding='utf-8') as f:
-                    f.write('# the job\'s own logins, user:password, one per line\n')
-                    for u, pw in JOB_LOGINS:
-                        f.write(f'{u}:{pw}\n')
-                log(f"login list created: {txt}")
+                    f.write('# the job\'s own logins, user:password, one per line (at most 5)\n')
+                    f.write('# example:  root:MyJobPassword\n')
+                log(f"login list template created: {txt} - put the job's logins in it")
             except Exception as e:
                 log(f"could not create {txt}: {e}")
         if os.path.exists(txt):
@@ -302,11 +301,11 @@ def load_password_candidates(explicit, beside=None):
                     if pw and (u, pw) not in cands:
                         cands.append((u, pw))
     if not cands:
-        cands = list(JOB_LOGINS)
+        raise SystemExit("No logins to try: give --password, or put the job's logins in passwords.txt "
+                         "beside the camera list (user:password, one per line).")
     if len(cands) > MAX_LOGINS:
         raise SystemExit(f"passwords.txt has {len(cands)} logins. It is for the job's own logins only "
-                         f"(at most {MAX_LOGINS}). Replace its contents with:\n" +
-                         '\n'.join(f'{u}:{pw}' for u, pw in JOB_LOGINS))
+                         f"(at most {MAX_LOGINS}). Trim it to the logins this job actually uses.")
     log("logins to try: " + ', '.join(f'{u}/{pw}' for u, pw in cands))
     return cands
 
@@ -2078,13 +2077,13 @@ def main():
     no_quickedit()
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('mode', nargs='?', default='run', choices=['check', 'run', 'ports', 'stills', 'switch', 'list', 'list-ifaces'])
-    p.add_argument('num', nargs='?', help='switch: the switch number (1-7)')
+    p.add_argument('num', nargs='?', help='switch: the switch number in the sheet (1, 2, ...)')
     p.add_argument('--csv', help='camera list: the Lenel programming sheet (.xlsx/.csv), the toolkit run log programmed_cameras.csv, or a camera-list export')
     p.add_argument('--log', help='toolkit run log to cross-reference MACs against (default: programmed_cameras.csv if found)')
-    p.add_argument('--here', help='the switch this laptop is plugged into: its number in the list (e.g. 3) or its camera subnet as CIDR (10.20.48.128/27)')
-    p.add_argument('--only-net', help='ignore list rows outside this network, e.g. 10.20.48.0/23')
+    p.add_argument('--here', help='the switch this laptop is plugged into: its number in the list (e.g. 3) or its camera subnet as CIDR (192.0.2.128/27)')
+    p.add_argument('--only-net', help='ignore list rows outside this network, e.g. 192.0.2.0/23')
     p.add_argument('--no-route', action='store_true', help="don't add temporary routes to the other camera subnets")
-    p.add_argument('--since', default='2026-05-05', help='ignore rows before this date (YYYY-MM-DD); "" for all')
+    p.add_argument('--since', default='', help='ignore rows before this date (YYYY-MM-DD); default: all rows')
     p.add_argument('--prefix', default='', help='only names starting with this, e.g. KB')
     p.add_argument('--password', help='root password to set on each camera')
     p.add_argument('--subnet', help='camera subnet mask when the list has none, e.g. 255.255.255.224')
@@ -2107,11 +2106,11 @@ def main():
     p.add_argument('--stills-dir', help='stills: folder to save JPEGs in (default: stills\\ next to the list)')
     p.add_argument('--stills-res', default='1280x720', help='stills: requested resolution (default 1280x720)')
     p.add_argument('--switch-number', type=int, help='ports: which switch of the plan this is (1 = cameras 1-24); guessed from the listed cameras on it if omitted')
-    p.add_argument('--plan-base', help='numbering plan: network base, e.g. 10.20.48.0 ("" = no plan)')
-    p.add_argument('--plan-first', type=int, default=67, help='numbering plan: host offset of camera 1 (default 67)')
+    p.add_argument('--plan-base', help='numbering plan: network base, e.g. 192.0.2.0 ("" = no plan)')
+    p.add_argument('--plan-first', type=int, default=1, help='numbering plan: host offset of camera 1 (default 1)')
     p.add_argument('--plan-per-switch', type=int, default=24, help='numbering plan: cameras per switch (default 24)')
     p.add_argument('--plan-block', type=int, default=32, help='numbering plan: addresses per switch block (default 32)')
-    p.add_argument('--plan-name', default='KBO-{n:03d}', help='numbering plan: name pattern for proposals (default KBO-{n:03d})')
+    p.add_argument('--plan-name', default='CAM-{n:03d}', help='numbering plan: name pattern for proposals (default CAM-{n:03d})')
     p.add_argument('--community', default='public', help='ports: SNMP read community')
     p.add_argument('--mac-table', help="ports: a text file with the switch's 'show mac-address-table' output, used instead of SNMP")
     p.add_argument('--telnet', help="ports: user:password to log in to the switch CLI over telnet and run 'show mac-address-table' (used instead of SNMP)")
