@@ -61,9 +61,12 @@ jobs:
             try {
               git fetch origin master --depth=200 2>&1 | Out-Null
               $count = (git rev-list --count origin/master..HEAD).Trim()
-              if (-not $count -or $count -eq '0') { $count = '?' }
+              # A beta branch that equals master (just merged) has count 0;
+              # never put a non-filename character here - Inno Setup rejects
+              # it (run 41430020019, OutputBaseFileName invalid).
+              if (-not $count) { $count = '0' }
             } catch {
-              $count = '?'
+              $count = '0'
             }
             $version = "${base}b${count}.${sha}"
             $is_prerelease = 'true'
